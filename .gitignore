@@ -60,3 +60,9 @@ node_modules/
 *.local.*
 .env
 .env.*
+
+# Autodesk Maya - Ignore Maya project files and binaries
+AutodeskMaya/
+
+# Unreal Engine - Ignore UE project files and generated content
+UnrealEngine/
