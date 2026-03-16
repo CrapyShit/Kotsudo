@@ -11,7 +11,7 @@ ROLE_ATTR = "Role"
 ROLE_ORDER = {"Start": 0, "Mid": 1, "End": 2}
 
 
-def read_asset_metadata(asset):
+def get_asset_metadata(asset):
     if not asset:
         return {}
 
@@ -19,8 +19,7 @@ def read_asset_metadata(asset):
     return {str(key): str(value) for key, value in raw_metadata.items()}
 
 
-
-def build_bone_attribute_map(metadata, wanted_attributes=None):
+def build_bone_attr_map(metadata, wanted_attributes=None):
     wanted_attributes = wanted_attributes or [MODULE_TYPE_ATTR, MODULE_NAME_ATTR, ROLE_ATTR]
     wanted_lookup = {attribute.lower(): attribute for attribute in wanted_attributes}
     bone_attribute_map = {}
@@ -47,35 +46,32 @@ def build_bone_attribute_map(metadata, wanted_attributes=None):
     return bone_attribute_map
 
 
+def get_bone_attr(bone_attrs, bone_name, attr_name):
+    if bone_name in bone_attrs and attr_name in bone_attrs[bone_name]:
+        return bone_attrs[bone_name][attr_name]
 
-def detect_modules_from_metadata(bone_names, bone_attribute_map, supported_module_types=None):
+    lowered_bone_name = bone_name.lower()
+    for mapped_bone_name, attrs in bone_attrs.items():
+        if mapped_bone_name.lower() == lowered_bone_name and attr_name in attrs:
+            return attrs[attr_name]
+
+    return ""
+
+
+def detect_ik_modules(bone_names, bone_attrs, supported_module_types=None):
     supported_module_types = set(supported_module_types or [])
     module_groups = {}
 
     for bone_name in bone_names:
-        attributes = bone_attribute_map.get(bone_name)
-        if not attributes:
-            attributes = next(
-                (
-                    values
-                    for mapped_bone_name, values in bone_attribute_map.items()
-                    if mapped_bone_name.lower() == bone_name.lower()
-                ),
-                None,
-            )
-
-        if not attributes:
-            continue
-
-        module_type = attributes.get(MODULE_TYPE_ATTR)
+        module_type = get_bone_attr(bone_attrs, bone_name, MODULE_TYPE_ATTR)
         if not module_type:
             continue
 
         if supported_module_types and module_type not in supported_module_types:
             continue
 
-        module_name = attributes.get(MODULE_NAME_ATTR) or module_type
-        role = attributes.get(ROLE_ATTR, "")
+        module_name = get_bone_attr(bone_attrs, bone_name, MODULE_NAME_ATTR) or module_type
+        role = get_bone_attr(bone_attrs, bone_name, ROLE_ATTR)
 
         module_entry = module_groups.setdefault(
             module_name,
@@ -108,3 +104,27 @@ def detect_modules_from_metadata(bone_names, bone_attribute_map, supported_modul
         )
 
     return detected_modules
+
+
+def detect_modules(bone_names, bone_attrs, supported_module_types=None):
+    return detect_ik_modules(
+        bone_names,
+        bone_attrs,
+        supported_module_types=supported_module_types,
+    )
+
+
+def read_asset_metadata(asset):
+    return get_asset_metadata(asset)
+
+
+def build_bone_attribute_map(metadata, wanted_attributes=None):
+    return build_bone_attr_map(metadata, wanted_attributes=wanted_attributes)
+
+
+def detect_modules_from_metadata(bone_names, bone_attribute_map, supported_module_types=None):
+    return detect_modules(
+        bone_names,
+        bone_attribute_map,
+        supported_module_types=supported_module_types,
+    )
