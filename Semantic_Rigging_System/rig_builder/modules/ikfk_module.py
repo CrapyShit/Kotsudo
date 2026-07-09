@@ -15,18 +15,32 @@ from .rig_module import RigModule
 #
 #   GetFK (GetControlTransform)
 #       |
-#       v                              SetTransform (bone)
-#   BlendFK ─────────────────────────►     Value  ◄──── BlendIK
-#                                              ^
-#   GetIK (GetControlTransform)           MathFloatLerp.Result
-#       |                                 /            \
-#       v                         Weight(0=FK)   Weight(1=IK)
-#   (feeds BlendIK)                       \            /
-#                                      IKFKBlend variable
+#       v                              SetTransform (bone, weight=1.0)
+#   [FK pose written for every bone in the chain, unconditionally]
 #
-# For chains of any length the IK side uses a RigUnit_FullbodyIK (FBIK) node
-# driven by an effector control + pole vector, exactly like IKModule does.
-# The FK side creates one FK control per bone, exactly like FKModule does.
+#   GetFK_tip.Transform ──────┐
+#                              v
+#                        MathTransformLerp ──► FABRIK.EffectorTransform
+#                              ^
+#   GetIK_effector.Transform ─┘
+#            (alpha = IKFKBlend variable, 0 = FK, 1 = IK)
+#
+#   FABRIK (StartBone = self.chain[0], EffectorBone = self.chain[-1] --
+#           solves every bone in between by walking the hierarchy)
+#
+# The FK phase always runs first and writes a full FK pose onto every bone.
+# FABRIK then runs afterwards and re-solves the whole chain toward a single
+# blended effector transform. Because FABRIK is iterative and converges from
+# whatever pose the chain currently holds, running it after the FK write
+# means that at IKFKBlend = 0 (target ≈ current FK tip position) the solve
+# settles back onto the existing FK pose almost exactly, and at
+# IKFKBlend = 1 the chain solves fully toward the IK control.
+#
+# FABRIK is a core Control Rig "Basic IK" chain solver (not a plugin, unlike
+# the Full Body IK / PBIK node this module used previously). It takes the
+# whole joint chain plus a single effector transform, which is a more direct
+# fit for an arbitrary-length IK/FK chain than routing through a full-body
+# solver.
 #
 # The IKFKBlend variable is a float (0 = full FK, 1 = full IK) added as a
 # rig variable so it appears in the CR detail panel and can be animated.
@@ -37,15 +51,16 @@ class IKFKModule(RigModule):
     """IK/FK switch module for any-length joint chain (2+ bones).
 
     Builds both an FK chain (one control per bone) and an IK setup from the
-    same joint chain, then blends between them via FBIK ``PositionAlpha`` /
-    ``RotationAlpha`` pins bound to the ``IKFKBlend`` variable.
+    same joint chain, then blends between them by feeding a lerp of the FK
+    tip transform and the IK effector transform into a FABRIK solver that
+    covers the whole chain.
 
-    Uses the Full Body IK (FBIK) solver (``RigUnit_FullbodyIK``) for all
-    chain lengths. Requires the **FullBodyIK** plugin to be enabled in the
-    project.
+    Uses Control Rig's core FABRIK node (``RigUnit_Fabrik``) for all chain
+    lengths. No extra plugin is required.
 
-    The blend is driven by a ``SetTransform`` node on the tip bone whose
-    ``Weight`` pin is bound to the ``IKFKBlend`` variable (0 = FK, 1 = IK).
+    The blend is driven by a transform lerp (FK tip ↔ IK effector) feeding
+    FABRIK's effector pin, with the lerp alpha bound to the ``IKFKBlend``
+    variable (0 = FK, 1 = IK).
 
     Attach points
     -------------
@@ -127,7 +142,6 @@ class IKFKModule(RigModule):
         # ------------------------------------------------------------------
         fk_controls = []
         fk_get_nodes = []
-        fk_set_nodes = []
         prev_fk_key = parent_key
 
         for idx, bone_name in enumerate(self.chain):
@@ -161,20 +175,24 @@ class IKFKModule(RigModule):
             fk_get_nodes.append(get_node)
 
         # ------------------------------------------------------------------
-        # 2. IK controls (effector only) + Full Body IK node
+        # 2. IK effector control + FABRIK node
         # ------------------------------------------------------------------
-        # FBIK blend design — avoids all array-element sub-pin link issues:
+        # Blend design:
         #
-        #   a) FK SetTransforms write every bone to the FK ctrl pose (weight=1).
-        #   b) A single "IK target" SetTransform writes the IK ctrl position
-        #      onto chain[-1] with Weight = IKFKBlend variable.
-        #        blend=0 → no change (chain[-1] stays at FK)
-        #        blend=1 → chain[-1] = IK ctrl position
-        #   c) FBIK (PositionAlpha=1 always) reads chain[-1]'s current position
-        #      as the effector target and solves the full chain toward it.
+        #   a) FK SetTransforms write every bone to the FK ctrl pose (weight=1),
+        #      unconditionally, first in the exec chain.
+        #   b) A MathTransformLerp blends [FK tip transform] <-> [IK ctrl
+        #      transform] using IKFKBlend as alpha, feeding FABRIK's
+        #      effector pin directly (no intermediate bone write/read-back
+        #      needed -- FABRIK takes an explicit effector transform input).
+        #   c) FABRIK solves the whole chain (root..tip) toward that target,
+        #      running after the FK write so it converges from the current
+        #      FK-posed chain rather than an arbitrary rest pose.
         #
-        # At blend=0: target == FK tip → FBIK preserves the FK pose exactly.
-        # At blend=1: target == IK ctrl → FBIK solves entire chain toward IK.
+        # At blend=0: target == FK tip transform -> FABRIK settles back onto
+        # the FK pose it started from almost exactly.
+        # At blend=1: target == IK ctrl transform -> FABRIK solves the chain
+        # fully toward the IK control.
 
         effector_pos = graph_utils.get_bone_global_position(hierarchy, self.chain[-1])
 
@@ -186,13 +204,13 @@ class IKFKModule(RigModule):
             (ik_scale, ik_scale, ik_scale),
         )
 
-        get_eff_node    = f"{module_prefix}_GetIKEff"
-        ik_target_node  = f"{module_prefix}_SetIKTarget"
-        ik_node         = f"{module_prefix}_IKSolve"
+        get_eff_node = f"{module_prefix}_GetIKEff"
+        lerp_node = f"{module_prefix}_IKFKLerp"
+        ik_node = f"{module_prefix}_IKSolve"
 
-        # IK nodes sit to the RIGHT of all FK columns.
+        # IK/blend nodes sit to the RIGHT of all FK columns.
         n_bones = len(self.chain)
-        ik_col  = x_origin + 500 + n_bones * 60 + 700
+        ik_col = x_origin + 500 + n_bones * 60 + 700
 
         # GetControlTransform for the IK effector control.
         graph_utils.create_unit_node(
@@ -203,89 +221,83 @@ class IKFKModule(RigModule):
         graph_utils.set_pin_default(controller, model, f"{get_eff_node}.Control", ik_effector_ctrl)
         graph_utils.set_pin_default(controller, model, f"{get_eff_node}.Space", "GlobalSpace")
 
-        # SetTransform for the IK target: writes IK ctrl position onto the tip
-        # bone with Weight = IKFKBlend.  This is the blend mechanism — no
-        # array-element sub-pin linking required.
+        # Transform lerp: FK tip <-> IK effector, alpha = IKFKBlend.
+        lerp_struct = _pick_transform_lerp_struct()
         graph_utils.create_unit_node(
-            controller, model, ik_target_node,
-            unreal.RigUnit_SetTransform,
+            controller, model, lerp_node,
+            lerp_struct,
             unreal.Vector2D(ik_col + 320, 100),
         )
-        graph_utils.set_key_pin(controller, model, ik_target_node,
-            ["Item", "Bone", "Child"], "Bone", self.chain[-1])
-        graph_utils.set_any_pin(controller, model, ik_target_node, ["Space"], "GlobalSpace")
-        graph_utils.set_any_pin(controller, model, ik_target_node, ["Initial"], "False")
-        graph_utils.set_any_pin(controller, model, ik_target_node,
-            ["bPropagateToChildren", "PropagateToChildren"], "False")
-        # Weight is set below when the variable is declared.
+        fk_tip_out = f"{fk_get_nodes[-1]}.Transform"
+        ik_eff_out = f"{get_eff_node}.Transform"
+        _connect_lerp_inputs(controller, model, lerp_node, fk_tip_out, ik_eff_out)
 
-        # Wire IK ctrl transform → ik_target_node.Value / .Transform
-        if not graph_utils.connect_pins(controller, model,
-                                        f"{get_eff_node}.Transform", f"{ik_target_node}.Value"):
-            graph_utils.connect_pins(controller, model,
-                                     f"{get_eff_node}.Transform", f"{ik_target_node}.Transform")
-
-        # PBIK node — /Script/PBIK.RigUnit_PBIK is the current non-deprecated
-        # Full Body IK solver in UE5.6.  Must use add_unit_node_from_struct_path
-        # because the struct lives in the PBIK plugin module, not unreal.*.
+        # FABRIK node -- core Control Rig "Basic IK" chain solver.
+        fabrik_struct = _pick_fabrik_struct()
+        _remove_stale_node_if_wrong_type(controller, model, ik_node, expected_title_contains="Fabrik")
         existing = model.find_node(ik_node)
         if not existing:
-            controller.add_unit_node_from_struct_path(
-                '/Script/PBIK.RigUnit_PBIK',
-                'Execute',
-                unreal.Vector2D(ik_col + 700, 100),
-                ik_node,
-            )
+            if fabrik_struct is not None:
+                graph_utils.create_unit_node(
+                    controller, model, ik_node,
+                    fabrik_struct,
+                    unreal.Vector2D(ik_col + 700, 100),
+                )
+            else:
+                # Core struct not found under a known name -- fall back to
+                # looking it up by struct path, same pattern used for
+                # plugin-provided units elsewhere in this codebase.
+                controller.add_unit_node_from_struct_path(
+                    '/Script/ControlRig.RigUnit_Fabrik',
+                    'Execute',
+                    unreal.Vector2D(ik_col + 700, 100),
+                    ik_node,
+                )
+            # Verify what actually got created -- if the struct path also
+            # resolves to something unexpected (e.g. this engine build has
+            # no core Fabrik struct at all), fail loudly instead of quietly
+            # building against the wrong node type.
+            created = model.find_node(ik_node)
+            if created and hasattr(created, "get_node_title"):
+                title = created.get_node_title()
+                if "fabrik" not in title.lower():
+                    raise RuntimeError(
+                        f"Node '{ik_node}' was created but its title is '{title}', "
+                        "not a Fabrik node. This engine build's Control Rig may not "
+                        "expose a core Fabrik unit under the names this module tries "
+                        "-- check the Control Rig node palette for the correct name "
+                        "and add it to _pick_fabrik_struct's candidate list."
+                    )
 
-        # Root — PBIK uses a plain bone name string, not a FRigElementKey struct.
-        controller.set_pin_default_value(f"{ik_node}.Root", self.chain[0])
+        # RigUnit_FABRIK solves everything between StartBone and
+        # EffectorBone by walking the hierarchy between them -- it does NOT
+        # take an explicit array of joints (that's a different node,
+        # RigUnit_FABRIKItemArray). Confirmed against the UE5 Python API:
+        #   RigUnit_FABRIK(start_bone, effector_bone, effector_transform,
+        #                  precision, weight, propagate_to_children,
+        #                  max_iterations, set_effector_transform)
+        graph_utils.set_any_pin(controller, model, ik_node, ["StartBone"], self.chain[0])
+        graph_utils.set_any_pin(controller, model, ik_node, ["EffectorBone"], self.chain[-1])
 
-        # One effector: the tip bone.
-        # The exact pin name for the bone field varies across PBIK versions.
-        # Probe all known candidates; if none match, log the actual sub-pins
-        # so the name can be hardcoded on the next run.
-        controller.insert_array_pin(f"{ik_node}.Effectors", -1, "")
-
-        _bone_set = False
-        for _field in ("Bone", "BoneName", "Item", "EffectorBone", "TargetBone", "EffectorItem"):
-            # Try as FRigElementKey struct (has .Type / .Name sub-pins)
-            try:
-                controller.set_pin_default_value(
-                    f"{ik_node}.Effectors.0.{_field}.Type", "Bone")
-                controller.set_pin_default_value(
-                    f"{ik_node}.Effectors.0.{_field}.Name", self.chain[-1])
-                _bone_set = True
-                break
-            except Exception:
-                pass
-            # Try as plain FName / string pin
-            try:
-                controller.set_pin_default_value(
-                    f"{ik_node}.Effectors.0.{_field}", self.chain[-1])
-                _bone_set = True
-                break
-            except Exception:
-                pass
-
-        if not _bone_set:
-            # Log the actual sub-pin names so we can hardcode the right one.
-            _pbik_node = model.find_node(ik_node)
-            if _pbik_node:
-                for _p in _pbik_node.get_pins():
-                    if _p.get_name() == "Effectors":
-                        for _elem in _p.get_sub_pins():
-                            for _sub in _elem.get_sub_pins():
-                                unreal.log(
-                                    f"[RigBuilder] PBIK Effectors.0 pin: "
-                                    f"'{_sub.get_name()}' cpp_type='{_sub.get_cpp_type()}'"
-                                )
+        # Effector transform input -- fed by the FK/IK lerp above.
+        lerp_out = f"{lerp_node}.Result"
+        if not graph_utils.connect_pins(controller, model, lerp_out, f"{ik_node}.EffectorTransform"):
+            _log_node_pins(ik_node, model)
             raise RuntimeError(
-                "Could not find bone field in PBIK Effectors.0. "
-                "Check the log above for the actual sub-pin names."
+                f"Could not connect the FK/IK lerp result to '{ik_node}.EffectorTransform'. "
+                "Check the log above for the actual pin name."
             )
 
-        controller.set_pin_default_value(f"{ik_node}.Effectors.0.PositionAlpha", "1.0")
-        controller.set_pin_default_value(f"{ik_node}.Effectors.0.RotationAlpha", "1.0")
+        # SetEffectorTransform gates whether the wired EffectorTransform pin
+        # is actually used by the solver. We're driving it explicitly via
+        # the lerp, so this needs to be true -- if the chain doesn't respond
+        # to EffectorTransform in-editor, this is the first thing to check.
+        graph_utils.set_any_pin(controller, model, ik_node, ["SetEffectorTransform"], "true")
+
+        graph_utils.set_any_pin(controller, model, ik_node, ["MaxIterations"], "16")
+        graph_utils.set_any_pin(controller, model, ik_node, ["Precision"], "0.01")
+        graph_utils.set_any_pin(controller, model, ik_node, ["Weight"], "1.0")
+        graph_utils.set_any_pin(controller, model, ik_node, ["PropagateToChildren"], "true")
 
         # ------------------------------------------------------------------
         # 3. IKFKBlend variable  (0 = full FK, 1 = full IK)
@@ -293,29 +305,45 @@ class IKFKModule(RigModule):
         blend_var = f"{module_prefix}_IKFKBlend"
         _ensure_float_variable(self.context.rig, blend_var, default_value=0.0)
 
-        # Bind the IK target SetTransform Weight directly to the blend variable.
-        try:
-            controller.bind_pin_to_variable(f"{ik_target_node}.Weight", blend_var)
-        except Exception:
-            get_blend_node = f"{module_prefix}_GetBlend"
-            _create_variable_getter(controller, model, get_blend_node, blend_var,
-                                    unreal.Vector2D(ik_col + 320, 500))
-            for _out_pin in (blend_var, "Value", "ReturnValue"):
-                try:
-                    controller.add_link(f"{get_blend_node}.{_out_pin}",
-                                        f"{ik_target_node}.Weight")
-                    break
-                except Exception:
-                    pass
+        # Bind the lerp's alpha pin directly to the blend variable.
+        alpha_pin = None
+        for candidate in ("Alpha", "T", "Blend"):
+            pin_path = f"{lerp_node}.{candidate}"
+            if graph_utils.pin_exists(model, pin_path):
+                alpha_pin = pin_path
+                break
+
+        if alpha_pin:
+            try:
+                controller.bind_pin_to_variable(alpha_pin, blend_var)
+            except Exception:
+                get_blend_node = f"{module_prefix}_GetBlend"
+                _create_variable_getter(controller, model, get_blend_node, blend_var,
+                                        unreal.Vector2D(ik_col + 320, 500))
+                for _out_pin in (blend_var, "Value", "ReturnValue"):
+                    try:
+                        controller.add_link(f"{get_blend_node}.{_out_pin}", alpha_pin)
+                        break
+                    except Exception:
+                        pass
+        else:
+            _log_node_pins(lerp_node, model)
+            raise RuntimeError(
+                f"Could not find an alpha/blend pin on lerp node '{lerp_node}'. "
+                "Check the log above for the actual sub-pin names."
+            )
 
         # ------------------------------------------------------------------
-        # 4. Execution chain: FK SetTransforms → IK target set → PBIK solver.
+        # 4. Execution chain: FK SetTransforms -> FABRIK.
         #
         #   a) Per-bone FK SetTransform(weight=1.0) writes the FK ctrl pose.
-        #   b) ik_target_node(chain[-1], weight=blend) overlays the IK position.
-        #   c) PBIK(PositionAlpha=1) solves the full chain toward the tip bone.
+        #   b) FABRIK (fed by the FK/IK lerp above) solves the full chain.
+        #
+        # The lerp node has no exec pin (pure data node) -- it just needs to
+        # sit upstream of FABRIK in the data graph, which it already does via
+        # the Result -> EffectorTransform link made above.
         # ------------------------------------------------------------------
-        all_nodes = [get_eff_node, ik_target_node, ik_node] + fk_get_nodes
+        all_nodes = [get_eff_node, lerp_node, ik_node] + fk_get_nodes
 
         exec_tail = self.context.get_exec_tail() or forwards_solve
 
@@ -345,9 +373,7 @@ class IKFKModule(RigModule):
             exec_tail = set_node
             all_nodes.append(set_node)
 
-        # IK phase: wire ik_target_node → FBIK into the exec chain.
-        _chain_exec(controller, model, exec_tail, ik_target_node)
-        exec_tail = ik_target_node
+        # IK phase: FABRIK runs after all FK writes are in place.
         _chain_exec(controller, model, exec_tail, ik_node)
         exec_tail = ik_node
 
@@ -431,6 +457,112 @@ def _chain_exec(controller, model, from_node, to_node):
     graph_utils.connect_pins(controller, model, src, dst)
 
 
+def _remove_stale_node_if_wrong_type(controller, model, node_name, expected_title_contains):
+    """If a node already exists under this name but isn't the type we expect
+    (e.g. an old PBIK node left over from a previous build of this module,
+    now sitting under the name this version wants to use for FABRIK), remove
+    it so the idempotent "only create if missing" check below doesn't
+    silently reuse the wrong node.
+    """
+    node = model.find_node(node_name)
+    if not node or not hasattr(node, "get_node_title"):
+        return
+
+    title = node.get_node_title()
+    if expected_title_contains.lower() in title.lower():
+        return  # already the right kind of node, leave it alone
+
+    if hasattr(unreal, "log"):
+        unreal.log(
+            f"[RigBuilder] Removing stale node '{node_name}' (title '{title}') "
+            f"-- expected a node containing '{expected_title_contains}'."
+        )
+
+    for remove_method in ("remove_node", "remove_node_by_name"):
+        if hasattr(controller, remove_method):
+            try:
+                arg = node if remove_method == "remove_node" else node_name
+                getattr(controller, remove_method)(arg)
+                return
+            except Exception:
+                continue
+
+
+def _pick_fabrik_struct():
+    """Return the FABRIK unit struct class, or None if not found under a
+    known name in the core `unreal` module.
+
+    FABRIK is a core Control Rig "Basic IK" unit, not a plugin -- unlike
+    PBIK it should not need a struct-path lookup, but the exact exposed
+    name has shifted across engine versions, so probe a short candidate
+    list before falling back to a struct-path add in the caller.
+    """
+    for candidate in ("RigUnit_Fabrik", "RigUnit_FABRIK", "RigUnit_BasicFabrik"):
+        if hasattr(unreal, candidate):
+            return getattr(unreal, candidate)
+    return None
+
+
+def _pick_transform_lerp_struct():
+    """Return a transform-lerp unit struct class for blending FK/IK targets.
+
+    Tries a few known math-unit names across engine versions. Raises if
+    none are found, since there is no safe silent fallback for a missing
+    blend node -- the module cannot function without it.
+    """
+    for candidate in (
+        "RigUnit_MathTransformLerp",
+        "RigVMFunction_MathTransformLerp",
+        "RigUnit_MathTransformInterpolate",
+    ):
+        if hasattr(unreal, candidate):
+            return getattr(unreal, candidate)
+    raise RuntimeError(
+        "Could not find a transform-lerp unit (tried RigUnit_MathTransformLerp "
+        "and known variants) in this Unreal Python API. Check the Control Rig "
+        "math function library for the correct struct name and add it to the "
+        "candidate list in _pick_transform_lerp_struct."
+    )
+
+
+def _connect_lerp_inputs(controller, model, lerp_node, a_pin, b_pin):
+    """Wire the two transform inputs of a transform-lerp node.
+
+    Different math-unit variants name their inputs differently (A/B vs
+    Min/Max vs From/To) -- probe candidate pairs together so a partial
+    mismatch (e.g. only 'A' exists but not 'B') doesn't leave the node
+    half-wired.
+    """
+    candidate_pairs = (("A", "B"), ("Min", "Max"), ("From", "To"))
+    for first, second in candidate_pairs:
+        first_pin = f"{lerp_node}.{first}"
+        second_pin = f"{lerp_node}.{second}"
+        if graph_utils.pin_exists(model, first_pin) and graph_utils.pin_exists(model, second_pin):
+            graph_utils.connect_pins(controller, model, a_pin, first_pin)
+            graph_utils.connect_pins(controller, model, b_pin, second_pin)
+            return
+
+    _log_node_pins(lerp_node, model)
+    raise RuntimeError(
+        f"Could not find a matching pair of transform-input pins on lerp node "
+        f"'{lerp_node}'. Check the log above for the actual sub-pin names."
+    )
+
+
+def _log_node_pins(node_name, model):
+    """Log every pin (and nested sub-pin) on a node, for diagnosing an
+    unknown UE version's API surface -- mirrors the diagnostic logging the
+    old PBIK code used when it couldn't find an expected pin.
+    """
+    node = model.find_node(node_name)
+    if not node or not hasattr(unreal, "log"):
+        return
+    for pin in node.get_pins():
+        unreal.log(f"[RigBuilder] '{node_name}' pin: '{pin.get_name()}' cpp_type='{pin.get_cpp_type()}'")
+        for sub in pin.get_sub_pins():
+            unreal.log(f"[RigBuilder]   sub-pin: '{sub.get_name()}' cpp_type='{sub.get_cpp_type()}'")
+
+
 def _ensure_float_variable(rig, var_name, default_value=0.0):
     """Declare a float member variable on the rig blueprint if not already present.
 
@@ -466,6 +598,3 @@ def _create_variable_setter(controller, model, node_name, var_name, position):
     controller.add_variable_node(
         var_name, "float", None, False, "0.0", position, node_name
     )
-
-
-
