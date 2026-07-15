@@ -17,6 +17,7 @@ from .metadata_reader import (
 from .modules.fk_module import FKModule
 from .modules.ik_module import IKModule
 from .modules.ikfk_module import IKFKModule
+from .modules.rig_module import RigModule
 from .modules.spline_ik_module import SplineIKModule
 
 MODULE_REGISTRY = {
@@ -25,6 +26,74 @@ MODULE_REGISTRY = {
     "IKFKSwitch": IKFKModule,
     "SplineIK": SplineIKModule,
 }
+
+
+class _MergedModuleRecipe:
+    """Recipe view seen by each RigModule instance.
+
+    Root-cause fix: instantiate_module() previously passed each module the
+    SHARED, per-module-TYPE recipe from self.recipe_map only -- the manifest's
+    per-instance "recipe" and "params" dicts (parsed correctly by
+    metadata_reader.py, DAG-path-stripped and all) were computed, carried all
+    the way through the pipeline, and then never read again. Every IKLimb
+    instance got the identical recipe regardless of what Maya actually
+    detected for that specific limb (primary_axis, pole_vector_world_position,
+    stretch_enabled, twist_mode, switch default_value, etc).
+
+    This wrapper merges, in priority order (highest first):
+        1. module_definition["recipe"]   (explicit per-instance overrides)
+        2. module_definition["params"]   (Maya's structural detection output)
+        3. the shared type-level recipe asset (self.recipe_map), as a fallback
+           for fields Maya doesn't detect per-instance (e.g. ControlShape)
+
+    RigModule.resolve_recipe_fields() only ever calls dir(self.recipe) and
+    get_editor_property()/getattr(self.recipe, name) -- both are implemented
+    here, so no change to rig_module.py or any module's read_recipe() is
+    required for this bridge to work. Existing fallback_names in each
+    module's read_recipe() (e.g. IKFKModule already listing "default_value"
+    as a fallback for a not-yet-existing "DefaultBlend" field) will pick up
+    the newly-available manifest data automatically once each module adds
+    the corresponding field.
+    """
+
+    def __init__(self, manifest_recipe=None, manifest_params=None, base_recipe=None):
+        merged = {}
+
+        if base_recipe is not None:
+            for prop_name in [n for n in dir(base_recipe) if not n.startswith("_")]:
+                try:
+                    merged[prop_name] = RigModule.read_unreal_property(base_recipe, prop_name)
+                except Exception:
+                    continue
+
+        # Per-instance manifest data overrides the shared type-level recipe.
+        # "params" (raw Maya detection output) is applied first, then
+        # "recipe" (explicit overrides) on top, so recipe always wins if both
+        # happen to define the same field.
+        merged.update(manifest_params or {})
+        merged.update(manifest_recipe or {})
+
+        self._data = merged
+
+    def __dir__(self):
+        return list(self._data.keys())
+
+    def __bool__(self):
+        return True
+
+    def get_editor_property(self, name):
+        if name in self._data:
+            return self._data[name]
+        lowered = name.lower()
+        for key, value in self._data.items():
+            if key.lower() == lowered:
+                return value
+        raise AttributeError(name)
+
+    def __getattr__(self, name):
+        # __getattr__ only fires for attributes not already found normally,
+        # so this never intercepts _data itself.
+        return self.get_editor_property(name)
 
 # Build order tiebreaker used within the same dependency depth level.
 # FK must execute before IK/IKFK so FK SetTransform with bPropagateToChildren=True
@@ -49,11 +118,17 @@ def _build_dependency_graph(module_defs):
     }
 
 
-def _module_depth(name, by_name, dep_graph, depths, visiting):
-    """Recursively compute build depth (root = 0) with cycle protection."""
+def _module_depth(name, by_name, dep_graph, depths, visiting, cycle_report):
+    """Recursively compute build depth (root = 0) with cycle protection.
+
+    cycle_report is a list the caller can inspect afterward -- a cycle is no
+    longer silently swallowed, the offending module names are recorded so
+    the builder can warn about it explicitly.
+    """
     if name in depths:
         return depths[name]
-    if name in visiting:          # cycle — treat as root
+    if name in visiting:          # cycle — treat as root, but report it
+        cycle_report.append(name)
         depths[name] = 0
         return 0
     visiting.add(name)
@@ -61,12 +136,12 @@ def _module_depth(name, by_name, dep_graph, depths, visiting):
     if parent is None or parent not in by_name:
         depths[name] = 0
     else:
-        depths[name] = _module_depth(parent, by_name, dep_graph, depths, visiting) + 1
+        depths[name] = _module_depth(parent, by_name, dep_graph, depths, visiting, cycle_report) + 1
     visiting.discard(name)
     return depths[name]
 
 
-def _topological_sort(module_defs):
+def _topological_sort(module_defs, warn=None):
     """
     Sort module_defs so every parent module is built before its children.
     Within the same depth level MODULE_BUILD_ORDER is used as a tiebreaker
@@ -75,8 +150,17 @@ def _topological_sort(module_defs):
     dep_graph = _build_dependency_graph(module_defs)
     by_name = {m["module_name"]: m for m in module_defs}
     depths = {}
+    cycle_report = []
     for m in module_defs:
-        _module_depth(m["module_name"], by_name, dep_graph, depths, set())
+        _module_depth(m["module_name"], by_name, dep_graph, depths, set(), cycle_report)
+
+    if cycle_report and warn:
+        warn(
+            "Parent-module cycle detected involving: " + ", ".join(sorted(set(cycle_report))) +
+            ". These modules were treated as roots (built at world space) to avoid an infinite "
+            "loop -- fix the connections.parent_module chain in the manifest."
+        )
+
     return sorted(
         module_defs,
         key=lambda m: (
@@ -84,6 +168,96 @@ def _topological_sort(module_defs):
             MODULE_BUILD_ORDER.get(m.get("module_type", ""), 99),
         ),
     )
+
+
+def _preflight_validate(module_defs, warn):
+    """Whole-manifest sanity pass, run once before any module is built.
+
+    Catches the class of bug that's easy to miss on a complex, multi-module
+    rig: two modules silently fighting over the same bone, a duplicated
+    module name silently shadowing an earlier module's build result, or a
+    parent reference that points at a module which doesn't exist anywhere
+    in this manifest. All of these previously either crashed deep inside a
+    module's build() with a confusing error, or -- worse -- built
+    "successfully" while producing a visibly wrong rig.
+
+    Returns a filtered list of module_defs with the offending duplicates/
+    bone-collisions already removed (each with a warning explaining why).
+    Dangling parent references are NOT removed here -- they're allowed
+    through so the module still gets built, just parented to world space
+    with a loud warning from RigContext.get_parent_control_key at build time.
+    """
+    seen_names = {}
+    deduped = []
+    for module_def in module_defs:
+        name = module_def.get("module_name")
+        if name in seen_names:
+            warn(
+                f"Duplicate module_name '{name}' found in the manifest "
+                f"(first seen as {seen_names[name]}, again as "
+                f"{module_def.get('module_type')}). Keeping the first occurrence "
+                "only -- rename one of them in Maya so each module has a unique name."
+            )
+            continue
+        seen_names[name] = module_def.get("module_type")
+        deduped.append(module_def)
+
+    all_names = {m["module_name"] for m in deduped}
+    for module_def in deduped:
+        parent = (module_def.get("connections") or {}).get("parent_module")
+        if parent and parent not in all_names:
+            warn(
+                f"Module '{module_def['module_name']}' declares parent_module "
+                f"'{parent}', which does not exist anywhere in this manifest. "
+                "It will be built parented to world space instead."
+            )
+
+    # Bone-ownership collision check: if two modules claim the same bone,
+    # both would silently write SetTransform to it in the same build with
+    # no error -- whichever happens to execute last in the topological
+    # sort wins, with zero indication anything was wrong. First-declared
+    # module (manifest order) keeps the bone; every later conflicting
+    # module is dropped entirely, since stripping just the conflicting
+    # bones out of its chain would usually break that module's own chain
+    # contract anyway (e.g. an exact-length-3 IKFKSwitch losing one bone).
+    bone_owner = {}
+    result = []
+    dropped_names = set()
+    for module_def in deduped:
+        chain = module_def.get("chain") or []
+        conflicts = [(b, bone_owner[b]) for b in chain if b in bone_owner]
+        if conflicts:
+            conflict_desc = ", ".join(f"'{b}' (owned by '{owner}')" for b, owner in conflicts)
+            warn(
+                f"Module '{module_def['module_name']}' ({module_def.get('module_type')}) "
+                f"claims bone(s) already owned by another module: {conflict_desc}. "
+                "Dropping this module entirely -- fix the overlapping chains in Maya. "
+                "First-declared module in the manifest always wins the conflicting bone(s)."
+            )
+            dropped_names.add(module_def["module_name"])
+            continue
+        for b in chain:
+            bone_owner[b] = module_def["module_name"]
+        result.append(module_def)
+
+    # A module that got dropped for a bone conflict might itself have been
+    # declared as someone else's parent_module -- if so, that declared
+    # parent no longer exists in `result`, and the dangling-parent warning
+    # above will apply to it naturally on the next pass. Re-check here so
+    # the warning fires even when the "missing" parent is a conflict
+    # casualty rather than a manifest typo.
+    if dropped_names:
+        remaining_names = {m["module_name"] for m in result}
+        for module_def in result:
+            parent = (module_def.get("connections") or {}).get("parent_module")
+            if parent in dropped_names:
+                warn(
+                    f"Module '{module_def['module_name']}' declares parent_module "
+                    f"'{parent}', which was dropped due to a bone-ownership conflict "
+                    "(see warning above). It will be built parented to world space instead."
+                )
+
+    return result
 
 
 class RigBuilder:
@@ -101,7 +275,7 @@ class RigBuilder:
         else:
             print(formatted_message)
 
-    def validate_module_definition(self, module_definition):
+    def validate_module_definition(self, module_definition, merged_recipe=None):
         module_type = module_definition.get("module_type")
         module_name = module_definition.get("module_name") or module_type or "<unknown>"
         chain = list(module_definition.get("chain") or [])
@@ -142,6 +316,29 @@ class RigBuilder:
             missing_roles = [role for role in expected_roles if role not in present_roles]
             if missing_roles:
                 issues.append("missing roles " + ", ".join(missing_roles))
+
+        # Required-recipe-field check. Every module's describe_contract()
+        # declares required_recipe_fields, but until now nothing actually
+        # checked them -- a module could silently build with a required
+        # field resolving to None and only fail (or worse, build with a
+        # wrong default) deep inside build(). Checked here, before any
+        # graph nodes exist, against the SAME merged per-instance recipe
+        # (manifest params/recipe + shared type-level asset) the module
+        # will actually receive.
+        required_recipe_fields = list(contract.get("required_recipe_fields") or [])
+        if required_recipe_fields and merged_recipe is not None:
+            missing_fields = []
+            for field_name in required_recipe_fields:
+                try:
+                    value = RigModule.read_unreal_property(merged_recipe, field_name)
+                except Exception:
+                    value = None
+                if value is None:
+                    missing_fields.append(field_name)
+            if missing_fields:
+                issues.append(
+                    "missing required recipe field(s): " + ", ".join(missing_fields)
+                )
 
         if issues:
             chain_summary = ", ".join(
@@ -308,9 +505,18 @@ class RigBuilder:
         if not self.rig:
             return None
 
-        return RigContext(self.rig)
+        return RigContext(self.rig, logger=self.logger)
 
-    def instantiate_module(self, module_definition, context):
+    def build_merged_recipe(self, module_definition):
+        module_type = module_definition["module_type"]
+        base_recipe = self.get_recipe_for_module(module_type)
+        return _MergedModuleRecipe(
+            manifest_recipe=module_definition.get("recipe"),
+            manifest_params=module_definition.get("params"),
+            base_recipe=base_recipe,
+        )
+
+    def instantiate_module(self, module_definition, context, merged_recipe=None):
         module_type = module_definition["module_type"]
         module_class = self.module_registry.get(module_type)
         if not module_class:
@@ -322,10 +528,12 @@ class RigBuilder:
             return None
 
         connections = module_definition.get("connections") or {}
+        if merged_recipe is None:
+            merged_recipe = self.build_merged_recipe(module_definition)
         return module_class(
             context=context,
             chain=module_definition["chain"],
-            recipe=self.get_recipe_for_module(module_type),
+            recipe=merged_recipe,
             name=module_definition["module_name"],
             logger=self.logger,
             parent_module_name=connections.get("parent_module"),
@@ -369,30 +577,58 @@ class RigBuilder:
         if detected_modules and not self.rig:
             raise RuntimeError("RigBuilder detected modules but no Control Rig instance was provided.")
 
+        # Whole-manifest sanity pass: duplicate module names, bone-ownership
+        # collisions between modules, and dangling parent references are all
+        # caught here, once, before any node is built -- rather than
+        # surfacing as a confusing per-module exception or, worse, building
+        # "successfully" into a visibly wrong rig.
+        detected_modules = _preflight_validate(detected_modules, self.warn)
+
         # Sort by dependency depth (parents always before children).
         # Within the same depth, MODULE_BUILD_ORDER is the tiebreaker (FK < IK).
-        detected_modules = _topological_sort(detected_modules)
+        detected_modules = _topological_sort(detected_modules, warn=self.warn)
 
         context = self.create_context()
         self.logger.push("[RigBuilder] Building modules")
         built_modules = []
         for module_definition in detected_modules:
-            if not self.validate_module_definition(module_definition):
+            module_name = module_definition["module_name"]
+
+            # Cascading skip: if this module's declared parent already failed
+            # or was skipped, don't build this module detached at world
+            # space -- skip it too, and record it as failed so ITS children
+            # cascade the same way. Modules are processed in topological
+            # order (parents before children) so the parent's outcome is
+            # always already known by the time we get here.
+            parent_name = (module_definition.get("connections") or {}).get("parent_module")
+            if parent_name and context.is_failed(parent_name):
+                self.warn(
+                    f"Skipping module '{module_name}' ({module_definition['module_type']}): "
+                    f"its parent module '{parent_name}' was skipped or failed to build."
+                )
+                context.mark_failed(module_name)
                 continue
 
-            module_instance = self.instantiate_module(module_definition, context)
+            merged_recipe = self.build_merged_recipe(module_definition)
+            if not self.validate_module_definition(module_definition, merged_recipe):
+                context.mark_failed(module_name)
+                continue
+
+            module_instance = self.instantiate_module(module_definition, context, merged_recipe)
             if not module_instance:
+                context.mark_failed(module_name)
                 continue
 
             try:
                 module_instance.validate()
                 result = module_instance.build()
-                context.register_result(module_definition["module_name"], result)
+                context.register_result(module_name, result)
                 built_modules.append(result)
             except Exception as exc:
                 self.warn(
-                    f"Skipping module '{module_definition['module_name']}' ({module_definition['module_type']}): {exc}"
+                    f"Skipping module '{module_name}' ({module_definition['module_type']}): {exc}"
                 )
+                context.mark_failed(module_name)
 
         self.logger.pop()
 

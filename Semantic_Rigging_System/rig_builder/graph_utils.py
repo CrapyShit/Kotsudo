@@ -401,3 +401,219 @@ def sanitize_name(name):
     for char in str(name):
         safe_chars.append(char if (char.isalnum() or char == "_") else "_")
     return "".join(safe_chars).strip("_") or "Module"
+
+
+# ---------------------------------------------------------------------------
+# Node-type-tolerant helpers, shared by IKModule and IKFKModule.
+#
+# UE 5.6 can create RigUnit_TwoBoneIKSimple while displaying the node's
+# title in the graph as "Basic IK" rather than "Two Bone IK" -- these
+# helpers were proven out in IKFKModule and are promoted here so both
+# modules use one implementation instead of two copies drifting apart.
+# ---------------------------------------------------------------------------
+
+def title_matches_expected(title, expected_title_contains) -> bool:
+    """Return True if a node title matches one accepted title pattern.
+
+    Accepted formats:
+        "fabrik"                         -> substring match
+        ("two", "ik")                    -> all words must be present
+        (("two", "ik"), ("basic", "ik")) -> any option may match
+    """
+    title_lower = str(title).lower()
+
+    if expected_title_contains is None:
+        return True
+
+    if isinstance(expected_title_contains, str):
+        return expected_title_contains.lower() in title_lower
+
+    try:
+        items = list(expected_title_contains)
+    except TypeError:
+        return str(expected_title_contains).lower() in title_lower
+
+    if not items:
+        return True
+
+    if all(isinstance(item, str) for item in items):
+        return all(item.lower() in title_lower for item in items)
+
+    for item in items:
+        if isinstance(item, str):
+            if item.lower() in title_lower:
+                return True
+            continue
+        try:
+            words = list(item)
+        except TypeError:
+            if str(item).lower() in title_lower:
+                return True
+            continue
+        if all(str(word).lower() in title_lower for word in words):
+            return True
+
+    return False
+
+
+def remove_stale_node_if_wrong_type(controller, model, node_name, expected_title_contains):
+    """Remove an existing node if it clearly has the wrong type/title.
+
+    Keeps rebuilds safe when the same module name changes solver type
+    (e.g. FABRIK <-> TwoBoneIK) between runs.
+    """
+    node = model.find_node(node_name)
+    if not node or not hasattr(node, "get_node_title"):
+        return
+
+    title = str(node.get_node_title())
+    if title_matches_expected(title, expected_title_contains):
+        return
+
+    if hasattr(unreal, "log_warning"):
+        unreal.log_warning(
+            f"[RigBuilder] Removing stale node '{node_name}' with title '{title}'. "
+            f"Expected {expected_title_contains!r}."
+        )
+
+    for remove_method in ("remove_node", "remove_node_by_name"):
+        if hasattr(controller, remove_method):
+            try:
+                arg = node if remove_method == "remove_node" else node_name
+                getattr(controller, remove_method)(arg)
+                return
+            except Exception:
+                continue
+
+
+def verify_node_title(node_name, model, expected_options=None) -> bool:
+    """Check a node's title without aborting the build; only logs a warning."""
+    node = model.find_node(node_name)
+    if not node or not hasattr(node, "get_node_title"):
+        return True
+
+    title = str(node.get_node_title())
+    if title_matches_expected(title, expected_options):
+        return True
+
+    if hasattr(unreal, "log_warning"):
+        unreal.log_warning(
+            f"[RigBuilder] Node '{node_name}' has title '{title}', expected "
+            f"{expected_options!r}. Continuing; pin wiring will fail later if "
+            "this is truly the wrong node type."
+        )
+    return False
+
+
+def pick_fabrik_struct():
+    """Return the FABRIK unit struct class, or None for struct-path fallback."""
+    for candidate in ("RigUnit_FABRIK", "RigUnit_Fabrik", "RigUnit_BasicFabrik"):
+        if hasattr(unreal, candidate):
+            return getattr(unreal, candidate)
+    return None
+
+
+def pick_two_bone_ik_struct():
+    """Return the Two Bone IK unit struct class for UE Control Rig.
+
+    May display in the graph as "Basic IK" -- see title_matches_expected.
+    """
+    for candidate in ("RigUnit_TwoBoneIKSimple",):
+        if hasattr(unreal, candidate):
+            return getattr(unreal, candidate)
+    raise RuntimeError(
+        "Could not find RigUnit_TwoBoneIKSimple in this Unreal Python API. "
+        "For UE 5.6 this class should exist in the ControlRig module."
+    )
+
+
+def connect_first_available(controller, model, source_pin, target_pins):
+    """Try connecting source_pin to each target_pin in order; stop at first success."""
+    for target_pin in target_pins:
+        if connect_pins(controller, model, source_pin, target_pin):
+            return True
+    return False
+
+
+def connect_transform_translation_to_vector_pin(controller, model, get_transform_node, vector_pin):
+    """Connect a GetControlTransform translation/location sub-pin to a vector pin."""
+    source_candidates = (
+        f"{get_transform_node}.Transform.Translation",
+        f"{get_transform_node}.Transform.Location",
+        f"{get_transform_node}.Transform.Position",
+    )
+    for source_pin in source_candidates:
+        if connect_pins(controller, model, source_pin, vector_pin):
+            return True
+    return False
+
+
+def set_vector_pin(controller, model, pin_path, vector):
+    """Set an FVector-style pin by sub-pins when possible, else compound default."""
+    values = {"X": float(vector.x), "Y": float(vector.y), "Z": float(vector.z)}
+
+    found_subpins = False
+    for axis, value in values.items():
+        sub_pin = f"{pin_path}.{axis}"
+        if pin_exists(model, sub_pin):
+            set_pin_default(controller, model, sub_pin, str(value))
+            found_subpins = True
+
+    if found_subpins:
+        return True
+
+    if pin_exists(model, pin_path):
+        set_pin_default(
+            controller, model, pin_path,
+            f"(X={values['X']},Y={values['Y']},Z={values['Z']})",
+        )
+        return True
+
+    return False
+
+
+def recipe_vector(value, fallback):
+    """Parse a vector from recipe data: Unreal Vector, list/tuple, dict, or string."""
+    if value is None:
+        return fallback
+
+    if hasattr(value, "x") and hasattr(value, "y") and hasattr(value, "z"):
+        return unreal.Vector(float(value.x), float(value.y), float(value.z))
+
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        return unreal.Vector(float(value[0]), float(value[1]), float(value[2]))
+
+    if isinstance(value, dict):
+        x = value.get("X", value.get("x", fallback.x))
+        y = value.get("Y", value.get("y", fallback.y))
+        z = value.get("Z", value.get("z", fallback.z))
+        return unreal.Vector(float(x), float(y), float(z))
+
+    if isinstance(value, str):
+        cleaned = value.strip().replace("(", "").replace(")", "")
+        if "=" in cleaned:
+            parts = {}
+            for item in cleaned.split(","):
+                if "=" in item:
+                    key, raw = item.split("=", 1)
+                    parts[key.strip().lower()] = float(raw.strip())
+            if {"x", "y", "z"}.issubset(parts.keys()):
+                return unreal.Vector(parts["x"], parts["y"], parts["z"])
+        else:
+            pieces = [p.strip() for p in cleaned.split(",")]
+            if len(pieces) >= 3:
+                return unreal.Vector(float(pieces[0]), float(pieces[1]), float(pieces[2]))
+
+    return fallback
+
+
+def recipe_bool(value, fallback=False):
+    if value is None:
+        return bool(fallback)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
+    return bool(fallback)

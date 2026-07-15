@@ -7,12 +7,13 @@ except ImportError:
 
 
 class RigContext:
-    def __init__(self, rig):
+    def __init__(self, rig, logger=None):
         self.rig = rig
         self.hierarchy = rig.hierarchy
         self.hierarchy_controller = rig.get_hierarchy_controller()
         self.graph_controller = unreal.ControlRigBlueprintLibrary.get_controller(rig)
         self.model = rig.get_model()
+        self.logger = logger
         # Global end of the exec chain.  Each module advances this after it builds
         # so the next module always chains onto the true last node.
         self._exec_tail = None
@@ -22,6 +23,28 @@ class RigContext:
         # Stores every module's build result keyed by module_name so child modules
         # can resolve their parent's attach points and control keys.
         self._module_results = {}
+        # Names of modules the builder decided NOT to build (failed, skipped by
+        # preflight, or skipped because their own parent was skipped). Tracked
+        # separately from _module_results so warnings can distinguish "parent
+        # never existed" from "parent existed but failed to build" from
+        # "parent built fine but doesn't have that attach point".
+        self._failed_module_names = set()
+
+    def _warn(self, message):
+        if self.logger and hasattr(self.logger, "log"):
+            self.logger.log(f"[RigContext] Warning: {message}")
+        else:
+            print(f"[RigContext] Warning: {message}")
+
+    def mark_failed(self, module_name):
+        """Record that a module was skipped or failed to build, so children
+        that declare it as their parent can be warned with a precise reason
+        instead of silently falling back to world space.
+        """
+        self._failed_module_names.add(module_name)
+
+    def is_failed(self, module_name):
+        return module_name in self._failed_module_names
 
     # ------------------------------------------------------------------
     # Exec chain API
@@ -74,18 +97,48 @@ class RigContext:
           - the attach point name maps to a bone (not a control)
           - the control does not exist in the hierarchy yet
 
-        Callers should fall back to get_world_parent_key() when this returns None.
+        Every None-returning path now warns with the specific reason, since
+        callers fall back to get_world_parent_key() -- previously this was a
+        silent fallback, which on a complex rig meant a mis-parented or
+        mistyped module would build fine but end up floating at world
+        origin with no indication anything was wrong.
         """
         if not parent_module_name:
             return None
-        ctrl_name = self.get_attach_point(
-            parent_module_name, parent_attach_point or "fk_tip_ctrl"
-        )
-        if not ctrl_name:
+
+        if parent_module_name not in self._module_results:
+            reason = (
+                "its build failed or was skipped"
+                if self.is_failed(parent_module_name)
+                else "no module with that name was found in this manifest"
+            )
+            self._warn(
+                f"Could not parent to module '{parent_module_name}' ({reason}). "
+                "Falling back to world space."
+            )
             return None
+
+        attach_point_name = parent_attach_point or "fk_tip_ctrl"
+        ctrl_name = self.get_attach_point(parent_module_name, attach_point_name)
+        if not ctrl_name:
+            available = list(
+                (self._module_results.get(parent_module_name) or {}).get("attach_points", {}).keys()
+            )
+            self._warn(
+                f"Parent module '{parent_module_name}' has no attach point "
+                f"'{attach_point_name}' (available: {available}). Falling back to world space."
+            )
+            return None
+
         ctrl_key = unreal.RigElementKey(
             type=unreal.RigElementType.CONTROL, name=str(ctrl_name)
         )
         if self.hierarchy.contains(ctrl_key):
             return ctrl_key
+
+        self._warn(
+            f"Parent module '{parent_module_name}' attach point '{attach_point_name}' "
+            f"resolves to control '{ctrl_name}', which does not exist in the hierarchy. "
+            "Falling back to world space."
+        )
         return None

@@ -8,6 +8,8 @@ except ImportError:
 from .. import graph_utils
 from .rig_module import RigModule
 
+IKFK_MODULE_VERSION = "2026-07-14-three-bone-only-v3"
+
 # ---------------------------------------------------------------------------
 # IKFKSwitch module
 # ---------------------------------------------------------------------------
@@ -19,38 +21,32 @@ from .rig_module import RigModule
 #     transform. The blend is driven by the module IKFKBlend variable.
 #   - The IK solver runs after the FK writes.
 #
-# Solver selection:
-#
-#   SolverType recipe field:
-#       Auto / None     -> len(chain) == 3 uses TwoBoneIKSimple,
-#                          every other length uses FABRIK.
-#       TwoBoneIK       -> force RigUnit_TwoBoneIKSimple, requires 3 joints.
-#       BasicIK         -> alias for TwoBoneIK.
-#       FABRIK          -> force RigUnit_FABRIK.
-#
-# Why:
-#   - RigUnit_TwoBoneIKSimple is the correct Control Rig unit for a classic
-#     3-joint limb: upper -> lower -> tip.
-#   - RigUnit_FABRIK remains the fallback for arbitrary-length chains such as
-#     4+ joint tests, tentacles, tails, or custom limbs.
+# Scope (as of 2026-07-14): IKFKSwitch is intentionally restricted to
+# exactly 3-bone chains, using RigUnit_TwoBoneIKSimple ("Basic IK" in the
+# UE 5.6 graph). Chains of 4+ bones are rejected at validate() rather than
+# silently routed through FABRIK -- this was previously supported but is
+# disabled for now to keep this module simple and predictable. IKModule
+# (the plain non-switch IKLimb) still supports arbitrary chain lengths via
+# FABRIK for spines/tails/tentacles; only the IKFKSwitch module is
+# restricted to 3 bones.
 # ---------------------------------------------------------------------------
 
 
 class IKFKModule(RigModule):
-    """IK/FK switch module for 2+ joint chains.
+    """IK/FK switch module for exactly 3-bone chains.
 
-    For a 3-joint chain the module automatically builds a Two Bone IK solver.
-    For all other chain lengths it builds a FABRIK solver unless the recipe
-    explicitly overrides ``SolverType``.
+    Builds Control Rig's native two-bone solver (RigUnit_TwoBoneIKSimple,
+    displays as "Basic IK" in UE 5.6). Chains of any other length are
+    rejected in validate() with a clear error.
 
     Attach points
     -------------
     root            - first bone
-    mid             - middle bone/index, for compatibility
+    mid             - middle bone
     tip             - last bone
     fk_ctrl_N       - FK control for bone index N (0-based)
     ik_effector     - IK effector control
-    ik_pole         - pole vector control, only created for TwoBoneIK mode
+    ik_pole         - pole vector control
     """
 
     module_type = "IKFKSwitch"
@@ -60,13 +56,16 @@ class IKFKModule(RigModule):
         return {
             "module_type": cls.module_type,
             "chain": {
-                "min_length": 2,
-                "roles": ["Start", "End"],
+                "min_length": 3,
+                "max_length": 3,
+                "exact_length": 3,
+                "roles": ["Start", "Mid", "End"],
             },
             "required_metadata": ["ModuleType", "ModuleName"],
             "required_recipe_fields": ["ControlScale"],
             "attachment_points": [
                 "root",
+                "mid",
                 "tip",
                 "ik_effector",
                 "ik_pole",
@@ -75,10 +74,13 @@ class IKFKModule(RigModule):
         }
 
     def validate(self):
-        if len(self.chain) < 2:
+        if len(self.chain) != 3:
             raise RuntimeError(
-                f"IKFKSwitch module '{self.name}' requires at least 2 bones, "
-                f"got {len(self.chain)}."
+                f"IKFKSwitch module '{self.name}' only supports exactly 3-bone "
+                f"chains (upper -> lower -> tip), got {len(self.chain)} bones: "
+                f"{self.chain}. 4+ joint IK/FK chains are not supported by this "
+                "module by design -- use IKLimb (plain IK, no switch) if you "
+                "need FABRIK on a longer chain."
             )
         if not self.context:
             raise RuntimeError(
@@ -96,7 +98,10 @@ class IKFKModule(RigModule):
             self.logger.push(f"[IKFKModule] Building {self.name}")
 
         recipe_data = self.read_recipe()
-        solver_mode = _choose_solver_mode(self.chain, recipe_data)
+        _log_info(
+            f"IKFKModule version: {IKFK_MODULE_VERSION}; "
+            f"module={self.name}; solver=TwoBoneIK; chain_length={len(self.chain)}"
+        )
 
         hierarchy = self.context.hierarchy
         hierarchy_controller = self.context.hierarchy_controller
@@ -217,46 +222,41 @@ class IKFKModule(RigModule):
         _connect_lerp_inputs(controller, model, lerp_node, fk_tip_out, ik_eff_out)
 
         # ------------------------------------------------------------------
-        # 3. IK solver node, auto-selected from chain length / recipe
+        # 3. IK solver node (always TwoBoneIK -- chain length is guaranteed
+        #    to be exactly 3 by validate() above)
         # ------------------------------------------------------------------
         all_nodes = [get_eff_node, lerp_node] + fk_get_nodes
         all_controls = list(fk_controls) + [ik_effector_ctrl]
-        ik_pole_ctrl = None
-        get_pole_node = None
 
-        if solver_mode == "TwoBoneIK":
-            ik_pole_ctrl, get_pole_node = self._build_two_bone_ik_solver(
-                controller=controller,
-                model=model,
-                hierarchy=hierarchy,
-                hierarchy_controller=hierarchy_controller,
-                parent_key=parent_key,
-                module_prefix=module_prefix,
-                ik_node=ik_node,
-                get_pole_node=f"{module_prefix}_GetIKPole",
-                ik_pole_ctrl=f"{module_prefix}_PV_CTRL",
-                ik_col=ik_col,
-                pv_scale=pv_scale,
-                recipe_data=recipe_data,
-                lerp_node=lerp_node,
-            )
-            all_controls.append(ik_pole_ctrl)
-            all_nodes.extend([get_pole_node, ik_node])
-        else:
-            self._build_fabrik_solver(
-                controller=controller,
-                model=model,
-                ik_node=ik_node,
-                ik_col=ik_col,
-                lerp_node=lerp_node,
-            )
-            all_nodes.append(ik_node)
+        ik_pole_ctrl, get_pole_node = self._build_two_bone_ik_solver(
+            controller=controller,
+            model=model,
+            hierarchy=hierarchy,
+            hierarchy_controller=hierarchy_controller,
+            parent_key=parent_key,
+            module_prefix=module_prefix,
+            ik_node=ik_node,
+            get_pole_node=f"{module_prefix}_GetIKPole",
+            ik_pole_ctrl=f"{module_prefix}_PV_CTRL",
+            ik_col=ik_col,
+            pv_scale=pv_scale,
+            recipe_data=recipe_data,
+            lerp_node=lerp_node,
+        )
+        all_controls.append(ik_pole_ctrl)
+        all_nodes.extend([get_pole_node, ik_node])
 
         # ------------------------------------------------------------------
         # 4. IKFKBlend variable  (0 = full FK, 1 = full IK)
+        #
+        # default_blend comes from Maya's detected switch attribute value
+        # (params.default_value in the manifest, via the DefaultBlend recipe
+        # field) so the UE5 rig opens in whatever FK/IK mix the rig was left
+        # in when exported, instead of always resetting to full FK.
         # ------------------------------------------------------------------
         blend_var = f"{module_prefix}_IKFKBlend"
-        _ensure_float_variable(self.context.rig, blend_var, default_value=0.0)
+        default_blend = float(recipe_data.get("DefaultBlend") or 0.0)
+        _ensure_float_variable(self.context.rig, blend_var, default_value=default_blend)
         _bind_lerp_alpha_to_variable(
             controller,
             model,
@@ -317,24 +317,19 @@ class IKFKModule(RigModule):
 
         attach_pts = {
             "root": self.chain[0],
+            "mid": self.chain[1],
             "tip": self.chain[-1],
             "ik_effector": ik_effector_ctrl,
+            "ik_pole": ik_pole_ctrl,
         }
-        if ik_pole_ctrl:
-            attach_pts["ik_pole"] = ik_pole_ctrl
 
         for _i, _ctrl in enumerate(fk_controls):
             attach_pts[f"fk_ctrl_{_i}"] = _ctrl
 
         # Legacy names / convenience aliases.
-        if len(self.chain) >= 2:
-            attach_pts["mid"] = self.chain[len(self.chain) // 2]
-        if len(fk_controls) >= 1:
-            attach_pts["fk_root_ctrl"] = fk_controls[0]
-        if len(fk_controls) >= 2:
-            attach_pts["fk_tip_ctrl"] = fk_controls[-1]
-        if len(fk_controls) == 3:
-            attach_pts["fk_mid_ctrl"] = fk_controls[1]
+        attach_pts["fk_root_ctrl"] = fk_controls[0]
+        attach_pts["fk_mid_ctrl"] = fk_controls[1]
+        attach_pts["fk_tip_ctrl"] = fk_controls[-1]
 
         return self.build_result(
             controls=all_controls,
@@ -346,14 +341,13 @@ class IKFKModule(RigModule):
                 "ik_pole_ctrl": ik_pole_ctrl,
                 "ik_node": ik_node,
                 "blend_variable": blend_var,
-                "solver_mode": solver_mode,
+                "solver_mode": "TwoBoneIK",
             },
             recipe_data=recipe_data,
             metadata={
                 "control_scale": recipe_data.get("ControlScale"),
-                "solver_type": recipe_data.get("SolverType"),
-                "resolved_solver_mode": solver_mode,
-                "default_blend": 0.0,
+                "resolved_solver_mode": "TwoBoneIK",
+                "default_blend": default_blend,
             },
         )
 
@@ -417,7 +411,7 @@ class IKFKModule(RigModule):
             controller,
             model,
             ik_node,
-            expected_title_contains=("two", "ik"),
+            expected_title_contains=(("two", "ik"), ("basic", "ik"), "basic ik"),
         )
 
         existing = model.find_node(ik_node)
@@ -429,7 +423,11 @@ class IKFKModule(RigModule):
                 two_bone_struct,
                 unreal.Vector2D(ik_col + 700, 100),
             )
-            _verify_node_title(ik_node, model, expected_words=("two", "ik"))
+            _verify_node_title(
+                ik_node,
+                model,
+                expected_options=(("two", "ik"), ("basic", "ik"), "basic ik"),
+            )
 
         graph_utils.set_any_pin(controller, model, ik_node, ["BoneA"], self.chain[0])
         graph_utils.set_any_pin(controller, model, ik_node, ["BoneB"], self.chain[1])
@@ -502,57 +500,6 @@ class IKFKModule(RigModule):
 
         return ik_pole_ctrl, get_pole_node
 
-    def _build_fabrik_solver(self, controller, model, ik_node, ik_col, lerp_node):
-        """Build RigUnit_FABRIK for arbitrary-length IK/FK chains."""
-        fabrik_struct = _pick_fabrik_struct()
-        _remove_stale_node_if_wrong_type(
-            controller,
-            model,
-            ik_node,
-            expected_title_contains="fabrik",
-        )
-
-        existing = model.find_node(ik_node)
-        if not existing:
-            if fabrik_struct is not None:
-                graph_utils.create_unit_node(
-                    controller,
-                    model,
-                    ik_node,
-                    fabrik_struct,
-                    unreal.Vector2D(ik_col + 700, 100),
-                )
-            else:
-                controller.add_unit_node_from_struct_path(
-                    "/Script/ControlRig.RigUnit_FABRIK",
-                    "Execute",
-                    unreal.Vector2D(ik_col + 700, 100),
-                    ik_node,
-                )
-            _verify_node_title(ik_node, model, expected_words=("fabrik",))
-
-        graph_utils.set_any_pin(controller, model, ik_node, ["StartBone"], self.chain[0])
-        graph_utils.set_any_pin(controller, model, ik_node, ["EffectorBone"], self.chain[-1])
-
-        lerp_out = f"{lerp_node}.Result"
-        if not _connect_first_available(
-            controller,
-            model,
-            lerp_out,
-            [f"{ik_node}.EffectorTransform", f"{ik_node}.Effector"],
-        ):
-            _log_node_pins(ik_node, model)
-            raise RuntimeError(
-                f"Could not connect FK/IK lerp result to the FABRIK effector pin "
-                f"on node '{ik_node}'."
-            )
-
-        graph_utils.set_any_pin(controller, model, ik_node, ["SetEffectorTransform"], "true")
-        graph_utils.set_any_pin(controller, model, ik_node, ["MaxIterations"], "16")
-        graph_utils.set_any_pin(controller, model, ik_node, ["Precision"], "0.01")
-        graph_utils.set_any_pin(controller, model, ik_node, ["Weight"], "1.0")
-        graph_utils.set_any_pin(controller, model, ik_node, ["PropagateToChildren"], "true")
-
     # ------------------------------------------------------------------
     # Recipe
     # ------------------------------------------------------------------
@@ -561,7 +508,6 @@ class IKFKModule(RigModule):
         recipe_fields = {
             "ModuleType": None,
             "ControlScale": 1.0,
-            "SolverType": "Auto",
             "PrimaryAxis": None,
             "SecondaryAxis": None,
             "PoleVectorKind": "Location",
@@ -569,11 +515,11 @@ class IKFKModule(RigModule):
             "EnableStretch": False,
             "StretchStartRatio": 1.0,
             "StretchMaximumRatio": 1.2,
+            "DefaultBlend": 0.0,
         }
         fallback_names = {
             "ModuleType": ["module_type"],
             "ControlScale": ["control_scale", "controlscale"],
-            "SolverType": ["solver_type", "solvertype"],
             "PrimaryAxis": ["primary_axis", "primaryaxis"],
             "SecondaryAxis": ["secondary_axis", "secondaryaxis"],
             "PoleVectorKind": ["pole_vector_kind", "polevectorkind"],
@@ -581,52 +527,9 @@ class IKFKModule(RigModule):
             "EnableStretch": ["enable_stretch", "enablestretch"],
             "StretchStartRatio": ["stretch_start_ratio", "stretchstartratio"],
             "StretchMaximumRatio": ["stretch_maximum_ratio", "stretchmaximumratio"],
+            "DefaultBlend": ["default_value", "defaultvalue", "default_blend"],
         }
         return self.resolve_recipe_fields(recipe_fields, fallback_names=fallback_names)
-
-
-# ---------------------------------------------------------------------------
-# Solver selection helpers
-# ---------------------------------------------------------------------------
-
-
-def _choose_solver_mode(chain: Sequence[str], recipe_data: dict) -> str:
-    raw_solver = str(recipe_data.get("SolverType") or "Auto").strip().lower()
-    aliases = {
-        "": "auto",
-        "auto": "auto",
-        "automatic": "auto",
-        "default": "auto",
-        "basicik": "twoboneik",
-        "basic_ik": "twoboneik",
-        "two bone ik": "twoboneik",
-        "two_bone_ik": "twoboneik",
-        "twoboneik": "twoboneik",
-        "twoboneiksimple": "twoboneik",
-        "two_bone_ik_simple": "twoboneik",
-        "fabrik": "fabrik",
-        "basicfabrik": "fabrik",
-        "basic_fabrik": "fabrik",
-    }
-
-    solver = aliases.get(raw_solver)
-    if solver is None:
-        raise RuntimeError(
-            f"Unsupported IKFK SolverType '{recipe_data.get('SolverType')}'. "
-            "Use Auto, TwoBoneIK/BasicIK, or FABRIK."
-        )
-
-    if solver == "auto":
-        return "TwoBoneIK" if len(chain) == 3 else "FABRIK"
-
-    if solver == "twoboneik":
-        if len(chain) != 3:
-            raise RuntimeError(
-                f"SolverType TwoBoneIK/BasicIK requires exactly 3 joints, got {len(chain)}."
-            )
-        return "TwoBoneIK"
-
-    return "FABRIK"
 
 
 # ---------------------------------------------------------------------------
@@ -649,25 +552,77 @@ def _chain_exec(controller, model, from_node, to_node):
     graph_utils.connect_pins(controller, model, src, dst)
 
 
+def _title_matches_expected(title, expected_title_contains) -> bool:
+    """Return True if a node title matches one accepted title pattern.
+
+    Accepted formats:
+        "fabrik"                         -> substring match
+        ("two", "ik")                    -> all words must be present
+        (("two", "ik"), ("basic", "ik")) -> any option may match
+
+    This matters in UE 5.6 because RigUnit_TwoBoneIKSimple can appear in the
+    Control Rig graph with the display title "Basic IK" instead of
+    "Two Bone IK".
+    """
+    title_lower = str(title).lower()
+
+    if expected_title_contains is None:
+        return True
+
+    if isinstance(expected_title_contains, str):
+        return expected_title_contains.lower() in title_lower
+
+    try:
+        items = list(expected_title_contains)
+    except TypeError:
+        return str(expected_title_contains).lower() in title_lower
+
+    if not items:
+        return True
+
+    # A flat tuple/list of strings means all words must be present.
+    # Example: ("two", "ik")
+    if all(isinstance(item, str) for item in items):
+        return all(item.lower() in title_lower for item in items)
+
+    # A nested tuple/list means any pattern may match.
+    # Example: (("two", "ik"), ("basic", "ik"), "basic ik")
+    for item in items:
+        if isinstance(item, str):
+            if item.lower() in title_lower:
+                return True
+            continue
+
+        try:
+            words = list(item)
+        except TypeError:
+            if str(item).lower() in title_lower:
+                return True
+            continue
+
+        if all(str(word).lower() in title_lower for word in words):
+            return True
+
+    return False
+
+
 def _remove_stale_node_if_wrong_type(controller, model, node_name, expected_title_contains):
-    """Remove an existing node if it has the wrong type/title.
+    """Remove an existing node if it clearly has the wrong type/title.
 
     This keeps rebuilds safe when the same module name changes from FABRIK to
     TwoBoneIK or the other way around.
+
+    Important UE 5.6 note:
+    RigUnit_TwoBoneIKSimple may display as "Basic IK". That is valid, so this
+    helper supports multiple accepted title patterns.
     """
     node = model.find_node(node_name)
     if not node or not hasattr(node, "get_node_title"):
         return
 
     title = str(node.get_node_title())
-    title_lower = title.lower()
 
-    if isinstance(expected_title_contains, str):
-        expected_ok = expected_title_contains.lower() in title_lower
-    else:
-        expected_ok = all(str(word).lower() in title_lower for word in expected_title_contains)
-
-    if expected_ok:
+    if _title_matches_expected(title, expected_title_contains):
         return
 
     _log_warning(
@@ -685,29 +640,35 @@ def _remove_stale_node_if_wrong_type(controller, model, node_name, expected_titl
                 continue
 
 
-def _verify_node_title(node_name, model, expected_words: Iterable[str]):
+def _verify_node_title(node_name, model, expected_words=None, expected_options=None) -> bool:
+    """Check node title without aborting the build.
+
+    Previous versions raised RuntimeError here. That was too fragile because
+    UE 5.6 can create RigUnit_TwoBoneIKSimple while displaying the node title
+    as "Basic IK". This function now only logs a warning and lets the later
+    pin connections prove whether the node is usable.
+    """
     node = model.find_node(node_name)
     if not node or not hasattr(node, "get_node_title"):
-        return
+        return True
 
     title = str(node.get_node_title())
-    title_lower = title.lower()
-    if all(str(word).lower() in title_lower for word in expected_words):
-        return
+    expected = expected_options if expected_options is not None else expected_words
 
-    raise RuntimeError(
-        f"Node '{node_name}' was created but its title is '{title}', which does "
-        f"not match expected words {tuple(expected_words)!r}. Check the Control "
-        "Rig node palette/API name for this Unreal build."
+    if _title_matches_expected(title, expected):
+        _log_info(
+            f"Node '{node_name}' title '{title}' accepted for expected pattern "
+            f"{expected!r}."
+        )
+        return True
+
+    _log_warning(
+        f"Node '{node_name}' has title '{title}', expected {expected!r}. "
+        "Continuing because Control Rig display titles can differ from the "
+        "Python struct name; pin wiring will fail later if this is truly the "
+        "wrong node type."
     )
-
-
-def _pick_fabrik_struct():
-    """Return the FABRIK unit struct class, or None for struct-path fallback."""
-    for candidate in ("RigUnit_FABRIK", "RigUnit_Fabrik", "RigUnit_BasicFabrik"):
-        if hasattr(unreal, candidate):
-            return getattr(unreal, candidate)
-    return None
+    return False
 
 
 def _pick_two_bone_ik_struct():
@@ -904,6 +865,11 @@ def _log_node_pins(node_name, model):
                 f"[RigBuilder]   sub-pin: '{sub.get_name()}' "
                 f"cpp_type='{sub.get_cpp_type()}'"
             )
+
+
+def _log_info(message):
+    if hasattr(unreal, "log"):
+        unreal.log(f"[RigBuilder] {message}")
 
 
 def _log_warning(message):
