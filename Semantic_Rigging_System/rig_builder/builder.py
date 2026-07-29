@@ -321,20 +321,36 @@ class RigBuilder:
         # declares required_recipe_fields, but until now nothing actually
         # checked them -- a module could silently build with a required
         # field resolving to None and only fail (or worse, build with a
-        # wrong default) deep inside build(). Checked here, before any
-        # graph nodes exist, against the SAME merged per-instance recipe
-        # (manifest params/recipe + shared type-level asset) the module
-        # will actually receive.
+        # wrong default) deep inside build().
+        #
+        # IMPORTANT: this must go through the module's own read_recipe()
+        # method, not a raw attribute lookup on merged_recipe. read_recipe()
+        # is where each module declares its own hardcoded defaults (e.g.
+        # IKFKModule defaults ControlScale to 1.0) and fallback field-name
+        # aliases -- checking merged_recipe directly bypasses all of that
+        # and flags a field as "missing" even when the module would have
+        # happily resolved it to a safe default at build time. This was
+        # exactly backwards in an earlier version of this check and caused
+        # IKFKSwitch modules to be skipped for "missing ControlScale" even
+        # though ControlScale always resolves to 1.0 by default.
         required_recipe_fields = list(contract.get("required_recipe_fields") or [])
         if required_recipe_fields and merged_recipe is not None:
             missing_fields = []
-            for field_name in required_recipe_fields:
-                try:
-                    value = RigModule.read_unreal_property(merged_recipe, field_name)
-                except Exception:
-                    value = None
-                if value is None:
-                    missing_fields.append(field_name)
+            try:
+                probe = module_class.__new__(module_class)
+                probe.recipe = merged_recipe
+                resolved_recipe = probe.read_recipe()
+            except Exception as exc:
+                resolved_recipe = None
+                self.warn(
+                    f"Could not resolve recipe for module '{module_name}' ({module_type}) "
+                    f"to check required fields: {exc}. Skipping the required-field check "
+                    "for this module (chain/role checks above still apply)."
+                )
+            if resolved_recipe is not None:
+                for field_name in required_recipe_fields:
+                    if resolved_recipe.get(field_name) is None:
+                        missing_fields.append(field_name)
             if missing_fields:
                 issues.append(
                     "missing required recipe field(s): " + ", ".join(missing_fields)

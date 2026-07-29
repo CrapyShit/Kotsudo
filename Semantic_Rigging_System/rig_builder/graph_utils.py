@@ -261,6 +261,36 @@ def euler_value(loc=(0.0, 0.0, 0.0), rot=(0.0, 0.0, 0.0), scl=(1.0, 1.0, 1.0)):
     return unreal.RigHierarchy.make_control_value_from_euler_transform(euler_transform)
 
 
+def global_to_parent_local_transform(
+    hierarchy, parent_key, desired_global_transform, translation_only=False
+):
+    """Convert a hierarchy-global transform to the control parent's local space.
+
+    Normal control creation supplies only a desired global position, so its local
+    rotation stays identity and continues to inherit the parent orientation. A
+    future caller may pass an explicit global transform to preserve full world
+    rotation/scale through ``make_relative``.
+    """
+    if not is_valid_key(hierarchy, parent_key):
+        return desired_global_transform
+
+    parent_global = hierarchy.get_global_transform(parent_key, initial=True)
+    if not translation_only and hasattr(desired_global_transform, "make_relative"):
+        try:
+            return desired_global_transform.make_relative(parent_global)
+        except Exception:
+            pass
+
+    desired_location = transform_to_location(desired_global_transform)
+    if hasattr(parent_global, "inverse_transform_location"):
+        local_location = parent_global.inverse_transform_location(desired_location)
+    elif hasattr(unreal, "MathLibrary"):
+        local_location = unreal.MathLibrary.inverse_transform_location(parent_global, desired_location)
+    else:
+        local_location = desired_location
+    return unreal.Transform(location=local_location)
+
+
 def create_control(
     hierarchy,
     hierarchy_controller,
@@ -271,6 +301,7 @@ def create_control(
     shape_scale,
     shape_name="Circle_Thick",
     shape_rotation=None,
+    global_transform=None,
 ):
     control_key = make_key(unreal.RigElementType.CONTROL, control_name)
     control_settings = unreal.RigControlSettings()
@@ -302,7 +333,17 @@ def create_control(
         if current_parent != parent_key:
             hierarchy_controller.set_parent(control_key, parent_key, True, False, False)
 
-    hierarchy.set_control_offset_transform(control_key, unreal.Transform(location=position), True, True)
+    desired_global_transform = global_transform or unreal.Transform(location=position)
+    local_offset = global_to_parent_local_transform(
+        hierarchy,
+        parent_key,
+        desired_global_transform,
+        translation_only=(global_transform is None),
+    )
+    # Control offsets are parent-local. Set both initial and current offsets so
+    # rebuilds do not retain a stale current offset from an earlier hierarchy.
+    hierarchy.set_control_offset_transform(control_key, local_offset, True, True)
+    hierarchy.set_control_offset_transform(control_key, local_offset, False, True)
     hierarchy.set_control_value(control_key, euler_value(), unreal.RigControlValueType.CURRENT)
     hierarchy.set_control_value(control_key, euler_value(), unreal.RigControlValueType.MINIMUM)
     hierarchy.set_control_value(control_key, euler_value(), unreal.RigControlValueType.MAXIMUM)

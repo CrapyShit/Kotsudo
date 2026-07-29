@@ -157,8 +157,18 @@ def _strip_dag_prefix(name):
 
 
 def _parse_modules_from_manifest_data(data):
-    """Shared helper: convert a parsed manifest dict to a list of module defs."""
+    """Shared helper: convert a parsed manifest dict to module definitions.
+
+    Schema v3 stores controller snapshots once in a top-level bone map. Each
+    module receives only the records linked to bones in its own chain, exposed
+    through params.controller_records for the normal recipe merge path.
+    """
     raw_modules = data.get("modules") or []
+    raw_controller_map = data.get("bone_controllers") or data.get("controllers_by_bone") or {}
+    controller_map = {
+        _strip_dag_prefix(bone_name): [dict(record) for record in (records or [])]
+        for bone_name, records in raw_controller_map.items()
+    }
     result = []
     for raw in raw_modules:
         module_def = {
@@ -177,8 +187,29 @@ def _parse_modules_from_manifest_data(data):
             module_def["connections"] = dict(raw["connections"])
         if raw.get("recipe"):
             module_def["recipe"] = dict(raw["recipe"])
-        if raw.get("params"):
-            module_def["params"] = dict(raw["params"])
+        params = dict(raw.get("params") or {})
+
+        controller_records = []
+        seen = set()
+        for bone_name in module_def["chain"]:
+            for record in controller_map.get(bone_name, []):
+                copied = dict(record)
+                for field in ("driven_bone", "anchor_bone", "parent", "source_node"):
+                    if copied.get(field):
+                        copied[field] = _strip_dag_prefix(copied[field])
+                identity = (
+                    copied.get("name"), copied.get("role"), copied.get("module_name"),
+                    copied.get("driven_bone"),
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                controller_records.append(copied)
+
+        if controller_records:
+            params["controller_records"] = controller_records
+        if params:
+            module_def["params"] = params
         result.append(module_def)
     return result
 

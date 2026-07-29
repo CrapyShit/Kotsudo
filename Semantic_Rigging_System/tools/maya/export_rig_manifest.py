@@ -30,6 +30,7 @@ import maya.mel as mel
 # ---------------------------------------------------------------------------
 ROOT_JOINT_NAME = "root"
 MANIFEST_ATTR = "rig_manifest_json"
+MANIFEST_SCHEMA_VERSION = 3
 
 # Tracks scriptJob IDs installed by register_auto_update()
 _AUTO_UPDATE_JOBS = []
@@ -159,6 +160,339 @@ def get_pole_vector_world_position(ik_handle):
     return get_world_position(node) if node else None
 
 
+def _round_vector(values, precision=6):
+    """Return a JSON-safe rounded 3D vector."""
+    if values is None:
+        return None
+    return [round(float(values[0]), precision), round(float(values[1]), precision), round(float(values[2]), precision)]
+
+
+def _vector_dot_list(lhs, rhs):
+    return sum(float(a) * float(b) for a, b in zip(lhs, rhs))
+
+
+def _vector_length_list(value):
+    return _vector_dot_list(value, value) ** 0.5
+
+
+def _vector_normalize_list(value, fallback=None):
+    length = _vector_length_list(value)
+    if length < 1e-8:
+        return list(fallback or [1.0, 0.0, 0.0])
+    return [float(component) / length for component in value]
+
+
+def _signed_primary_axis(chain):
+    """Return the signed dominant local translation axis of the first segment.
+
+    Keeping the sign is essential for mirrored limbs: a right leg authored with
+    a negative local X child translation must export [-1, 0, 0], not merely "X".
+    """
+    if len(chain) < 2:
+        return [1.0, 0.0, 0.0]
+    try:
+        translation = cmds.getAttr('{}.translate'.format(chain[1]))[0]
+        values = [float(translation[0]), float(translation[1]), float(translation[2])]
+    except Exception:
+        values = [1.0, 0.0, 0.0]
+
+    index = max(range(3), key=lambda idx: abs(values[idx]))
+    sign = -1.0 if values[index] < 0.0 else 1.0
+    result = [0.0, 0.0, 0.0]
+    result[index] = sign
+    return result
+
+
+def _world_point_to_node_local(world_position, node):
+    """Convert a Maya world-space point into *node* local coordinates."""
+    if not world_position or not node or not cmds.objExists(node):
+        return None
+    try:
+        import maya.api.OpenMaya as om2
+        world_matrix = om2.MMatrix(cmds.xform(node, query=True, worldSpace=True, matrix=True))
+        local_point = om2.MPoint(
+            float(world_position[0]),
+            float(world_position[1]),
+            float(world_position[2]),
+            1.0,
+        ) * world_matrix.inverse()
+        return _round_vector([local_point.x, local_point.y, local_point.z])
+    except Exception:
+        return None
+
+
+def _secondary_axis_from_pole(chain, pole_world_position, primary_axis):
+    """Derive a signed local secondary axis pointing toward the Maya PV."""
+    secondary = None
+    if chain and pole_world_position:
+        local_pole = _world_point_to_node_local(pole_world_position, chain[0])
+        if local_pole:
+            projection = _vector_dot_list(local_pole, primary_axis)
+            secondary = [
+                local_pole[i] - primary_axis[i] * projection
+                for i in range(3)
+            ]
+            if _vector_length_list(secondary) < 1e-6:
+                secondary = None
+
+    if secondary is None:
+        # Stable orthogonal fallback: choose the cardinal axis least aligned
+        # with the primary axis, then remove any residual projection.
+        candidates = ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0])
+        candidate = min(candidates, key=lambda axis: abs(_vector_dot_list(axis, primary_axis)))
+        projection = _vector_dot_list(candidate, primary_axis)
+        secondary = [candidate[i] - primary_axis[i] * projection for i in range(3)]
+
+    return _round_vector(_vector_normalize_list(secondary, fallback=[0.0, 1.0, 0.0]))
+
+
+def _short_node_name(node):
+    return node.split('|')[-1] if node else node
+
+
+def _has_controller_shape(node):
+    if not node or not cmds.objExists(node):
+        return False
+    try:
+        shapes = cmds.listRelatives(node, shapes=True, fullPath=True) or []
+        return any(cmds.nodeType(shape) in ('nurbsCurve', 'bezierCurve') for shape in shapes)
+    except Exception:
+        return False
+
+
+def _nearest_controller_transform(node):
+    """Walk up the DAG and return the first transform carrying a curve shape."""
+    if not node or not cmds.objExists(node):
+        return None
+    current = _full_dag_path(node)
+    visited = set()
+    while current and current not in visited:
+        visited.add(current)
+        try:
+            if cmds.nodeType(current) == 'transform' and _has_controller_shape(current):
+                return current
+        except Exception:
+            pass
+        parents = cmds.listRelatives(current, parent=True, fullPath=True) or []
+        current = parents[0] if parents else None
+    return None
+
+
+def _constraints_connected_to(node, constraint_types):
+    result = set()
+    for constraint_type in constraint_types:
+        try:
+            result.update(cmds.listConnections(node, type=constraint_type) or [])
+        except Exception:
+            pass
+    return sorted(result)
+
+
+def _find_ik_effector_controller(ik_handle):
+    """Find the animator-facing transform moving an IK handle."""
+    if not ik_handle or not cmds.objExists(ik_handle):
+        return None
+
+    parents = cmds.listRelatives(ik_handle, parent=True, fullPath=True) or []
+    if parents:
+        controller = _nearest_controller_transform(parents[0])
+        if controller:
+            return controller
+
+    for constraint in _constraints_connected_to(
+        ik_handle, ('parentConstraint', 'pointConstraint', 'orientConstraint')
+    ):
+        for target in _constraint_targets(constraint):
+            controller = _nearest_controller_transform(target)
+            if controller:
+                return controller
+            if cmds.objExists(target) and cmds.objectType(target, isAType='transform'):
+                return _full_dag_path(target)
+
+    # Last practical fallback: inspect incoming translate/rotate plugs.
+    for attribute in ('translate', 'rotate'):
+        try:
+            plugs = cmds.listConnections(
+                '{}.{}'.format(ik_handle, attribute),
+                source=True, destination=False, plugs=True,
+            ) or []
+        except Exception:
+            plugs = []
+        for plug in plugs:
+            source_node = plug.split('.', 1)[0]
+            controller = _nearest_controller_transform(source_node)
+            if controller:
+                return controller
+    return None
+
+
+def _controller_display_color(node):
+    shapes = cmds.listRelatives(node, shapes=True, fullPath=True) or []
+    for shape in shapes:
+        try:
+            if not cmds.getAttr('{}.overrideEnabled'.format(shape)):
+                continue
+            if cmds.attributeQuery('overrideRGBColors', node=shape, exists=True) and cmds.getAttr(
+                '{}.overrideRGBColors'.format(shape)
+            ):
+                color = cmds.getAttr('{}.overrideColorRGB'.format(shape))[0]
+                return _round_vector(color)
+            index = int(cmds.getAttr('{}.overrideColor'.format(shape)))
+            if index:
+                rgb = cmds.colorIndex(index, query=True)
+                if rgb:
+                    return _round_vector(rgb)
+        except Exception:
+            continue
+    return None
+
+
+def _locked_channels(node):
+    result = []
+    for channel in ('tx', 'ty', 'tz', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'):
+        try:
+            if cmds.getAttr('{}.{}'.format(node, channel), lock=True):
+                result.append(channel)
+        except Exception:
+            pass
+    return result
+
+
+def _query_transform_snapshot(node, role, module_name, driven_bone, anchor_bone, source_node=None):
+    """Capture compact controller data and a bone-local reconstruction offset."""
+    if not node or not cmds.objExists(node):
+        return None
+
+    node = _full_dag_path(node)
+    driven_bone = _full_dag_path(driven_bone) if driven_bone else None
+    anchor_bone = _full_dag_path(anchor_bone or driven_bone) if (anchor_bone or driven_bone) else None
+
+    try:
+        world_translation = cmds.xform(node, query=True, worldSpace=True, translation=True)
+    except Exception:
+        return None
+
+    def _query_vector(**kwargs):
+        try:
+            return _round_vector(cmds.xform(node, query=True, **kwargs))
+        except Exception:
+            return None
+
+    parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
+    shapes = cmds.listRelatives(node, shapes=True, fullPath=True) or []
+    try:
+        rotate_order = cmds.xform(node, query=True, rotateOrder=True)
+    except Exception:
+        rotate_order = None
+
+    return {
+        'name': _short_node_name(node),
+        'dag_path': node,
+        'node_type': cmds.nodeType(node),
+        'role': role,
+        'module_name': module_name,
+        'driven_bone': _short_node_name(driven_bone),
+        'anchor_bone': _short_node_name(anchor_bone),
+        'source_node': _short_node_name(source_node),
+        'parent': _short_node_name(parents[0]) if parents else None,
+        'bone_local_position': _world_point_to_node_local(world_translation, anchor_bone),
+        'world_transform': {
+            'translation': _round_vector(world_translation),
+            'rotation': _query_vector(worldSpace=True, rotation=True),
+            'scale': _query_vector(worldSpace=True, scale=True),
+        },
+        'local_transform': {
+            'translation': _query_vector(objectSpace=True, translation=True),
+            'rotation': _query_vector(objectSpace=True, rotation=True),
+            'scale': _query_vector(objectSpace=True, scale=True),
+        },
+        'rotate_order': rotate_order,
+        'shape_types': sorted(set(cmds.nodeType(shape) for shape in shapes)),
+        'display_color': _controller_display_color(node),
+        'locked_channels': _locked_channels(node),
+    }
+
+
+def _bone_driver_controllers(joint):
+    """Return curve controls directly targeting a joint through constraints."""
+    controllers = []
+    constraints = _constraints_connected_to(
+        joint, ('parentConstraint', 'orientConstraint', 'pointConstraint', 'scaleConstraint')
+    )
+    for constraint in constraints:
+        for target in _constraint_targets(constraint):
+            controller = _nearest_controller_transform(target)
+            if controller and controller not in controllers:
+                controllers.append(controller)
+    return controllers
+
+
+def collect_bone_controller_manifest(modules_config):
+    """Build bone -> controller snapshots stored once on the root manifest."""
+    by_bone = {}
+    seen = set()
+
+    def _append(bone, snapshot):
+        if not snapshot:
+            return
+        bone_name = _short_node_name(bone)
+        key = (bone_name, snapshot.get('name'), snapshot.get('role'), snapshot.get('module_name'))
+        if key in seen:
+            return
+        seen.add(key)
+        by_bone.setdefault(bone_name, []).append(snapshot)
+
+    for module in modules_config or []:
+        chain = list(module.get('chain') or [])
+        if not chain:
+            continue
+        module_name = module.get('module_name') or ''
+
+        # Generic FK/direct drivers.
+        for bone in chain:
+            for controller in _bone_driver_controllers(bone):
+                _append(
+                    bone,
+                    _query_transform_snapshot(
+                        controller, 'bone_driver', module_name,
+                        driven_bone=bone, anchor_bone=bone,
+                    ),
+                )
+
+        # IK-specific controls are not necessarily connected to the joints
+        # themselves, so capture them explicitly through the ikHandle.
+        if module.get('module_type') == 'IKLimb':
+            ik_handle = find_ik_handle_for_start_joint(chain[0])
+            if not ik_handle:
+                continue
+
+            effector_controller = _find_ik_effector_controller(ik_handle)
+            effector_node = effector_controller or ik_handle
+            _append(
+                chain[-1],
+                _query_transform_snapshot(
+                    effector_node, 'ik_effector', module_name,
+                    driven_bone=chain[-1], anchor_bone=chain[-1],
+                    source_node=ik_handle,
+                ),
+            )
+
+            pole_node = _get_pole_vector_node(ik_handle)
+            if pole_node and len(chain) >= 2:
+                _append(
+                    chain[1],
+                    _query_transform_snapshot(
+                        pole_node, 'pole_vector', module_name,
+                        driven_bone=chain[1], anchor_bone=chain[1],
+                        source_node=ik_handle,
+                    ),
+                )
+
+    for records in by_bone.values():
+        records.sort(key=lambda item: (item.get('module_name') or '', item.get('role') or '', item.get('name') or ''))
+    return dict(sorted(by_bone.items()))
+
+
 def _joints_driven_by_constraint(joint, constraint_types):
     """Return constraint nodes of given types that have *joint* as their target."""
     result = []
@@ -178,11 +512,18 @@ def _constraint_targets(constraint):
             source=True, destination=False, plugs=False,
         ) or []
         targets.extend(conns)
-        # Also check targetRotate for orient constraints
-        conns2 = cmds.listConnections(
-            '{}.target[{}].targetRotate'.format(constraint, idx),
-            source=True, destination=False, plugs=False,
-        ) or []
+        # Also check targetRotate for orient constraints. Not every
+        # constraint type exposes targetRotate as a connectable point
+        # (poleVectorConstraint notably doesn't -- it only drives
+        # targetTranslate), and querying it there can raise instead of
+        # just returning nothing, depending on Maya version. Guard it.
+        try:
+            conns2 = cmds.listConnections(
+                '{}.target[{}].targetRotate'.format(constraint, idx),
+                source=True, destination=False, plugs=False,
+            ) or []
+        except (ValueError, RuntimeError):
+            conns2 = []
         targets.extend(conns2)
     return list(set(targets))
 
@@ -224,6 +565,40 @@ def _upstream_float_control_attr(node, attr):
 # Structural detector 1: IKFKSwitch (composite -- must run first)
 # ---------------------------------------------------------------------------
 
+def _constraint_drives_joint(constraint, joint):
+    """True if *constraint*'s own output (constraintTranslate/constraintRotate)
+    is connected to *joint*'s translate/rotate -- i.e. *joint* is the
+    DRIVEN/bind object of this constraint, not one of its target drivers.
+
+    This is the only unambiguous way to tell the three IKFKSwitch chains
+    apart. A plain listConnections() in either direction is NOT enough:
+    Maya commonly wires pivot/jointOrient compensation attributes
+    (constraintRotatePivot, constraintJointOrient, etc.) FROM the bind
+    joint back INTO the constraint as auxiliary inputs, so the bind joint
+    shows up connected to the constraint in the same "destination"
+    direction as the actual IK/FK target-driver joints do. Without this
+    check, detect_ikfk_switch() below matches on all three chains
+    independently instead of only the true bind chain.
+    """
+    for out_attr in ('constraintTranslate', 'constraintRotate'):
+        plug = '{}.{}'.format(constraint, out_attr)
+        # poleVectorConstraint inherits from pointConstraint in Maya's node
+        # type hierarchy, so the type='pointConstraint' filter in the caller
+        # also matches poleVectorConstraint nodes -- which have no
+        # constraintRotate attribute at all (they only ever drive
+        # translation). Same class of issue as the earlier targetRotate fix:
+        # check the attribute exists before querying it, since Maya raises
+        # instead of just returning nothing for a genuinely absent attribute.
+        if not cmds.attributeQuery(out_attr, node=constraint, exists=True):
+            continue
+        conns = cmds.listConnections(
+            plug, source=False, destination=True, plugs=False
+        ) or []
+        if joint in conns:
+            return True
+    return False
+
+
 def detect_ikfk_switch(chain):
     """
     Structural detection of an IK/FK switch on a joint chain.
@@ -249,6 +624,11 @@ def detect_ikfk_switch(chain):
                 jnt, type=ct, source=False, destination=True
             ) or []
             for con in constraints:
+                if not _constraint_drives_joint(con, jnt):
+                    # jnt is a target/driver of this constraint (the IK or FK
+                    # chain), not the joint it actually drives -- skip. Only
+                    # the true bind chain should produce a module here.
+                    continue
                 targets = _constraint_targets(con)
                 if len(targets) >= 2:
                     # Confirm targets come from joints (not controls/locators alone)
@@ -432,37 +812,68 @@ def detect_ik_limb(chain):
     Structural detection of a two-bone (RP/SC) IK limb.
 
     Signal: an ikHandle whose solver is ikRPsolver or ikSCsolver and whose
-    startJoint is chain[0].  Explicitly excluded: ikSplineSolver (-> SplineIK).
+    startJoint is chain[0]. Explicitly excluded: ikSplineSolver (-> SplineIK).
 
-    Returns a module dict or None.
+    IMPORTANT: *chain* is a candidate from an unbroken parent-child joint
+    walk, which has no idea where the ikHandle's solver actually stops. A
+    common rig pattern -- IK leg (3 joints) with a separate FK toe chain
+    hanging off the ankle with no branch in between -- means the candidate
+    chain can extend well past the ikHandle's real end joint. This function
+    truncates to the ikHandle's own solved joint list (queried directly from
+    Maya, not inferred) and returns whatever trailing joints were cut off so
+    the caller can feed them back through detection as their own chain,
+    instead of them being silently absorbed into this IK module or dropped.
+
+    Returns (module_dict_or_None, leftover_tail_chain_or_None).
     """
     if len(chain) < 2:
-        return None
+        return None, None
 
     ik_handle = find_ik_handle_for_start_joint(chain[0])
     if not ik_handle:
-        return None
+        return None, None
 
     solver = _ik_solver_type(ik_handle)
     solver_lower = solver.lower()
     if 'spline' in solver_lower:
-        return None  # Belongs to SplineIK
+        return None, None  # Belongs to SplineIK
     if 'rp' not in solver_lower and 'sc' not in solver_lower and solver_lower:
         # Unknown solver -- still treat as IKLimb if it is not spline.
         pass
 
+    # Truncate to the joints the ikHandle actually solves, queried directly
+    # from Maya rather than inferred from the candidate chain's shape.
+    solved_joints = None
+    try:
+        solved_joints = cmds.ikHandle(ik_handle, query=True, jointList=True) or None
+    except Exception:
+        pass
+
+    leftover_tail = None
+    if solved_joints:
+        # jointList returns root..mid joints but NOT the end effector's own
+        # joint (Maya quirk) -- the end joint is chain[len(solved_joints)]
+        # relative to our candidate chain, provided the candidate actually
+        # starts at the same joint (it does, by construction).
+        end_index = len(solved_joints)  # inclusive index of the real end joint
+        if end_index < len(chain) - 1:
+            leftover_tail = chain[end_index + 1:]
+            chain = chain[:end_index + 1]
+        elif end_index >= len(chain):
+            # Defensive: jointList reported more joints than our candidate
+            # chain has (shouldn't normally happen) -- trust our own chain
+            # instead of over-truncating.
+            pass
+
     pv_node = _get_pole_vector_node(ik_handle)
     pv_pos = get_world_position(pv_node) if pv_node else None
 
-    # Primary axis: the axis with the largest local translation on chain[1]
-    primary_axis = 'X'
-    try:
-        tx = abs(cmds.getAttr('{}.translateX'.format(chain[1])))
-        ty = abs(cmds.getAttr('{}.translateY'.format(chain[1])))
-        tz = abs(cmds.getAttr('{}.translateZ'.format(chain[1])))
-        primary_axis = ['X', 'Y', 'Z'][[tx, ty, tz].index(max(tx, ty, tz))]
-    except Exception:
-        pass
+    # Signed local axes are exported as vectors so mirrored limbs retain their
+    # true forward direction instead of both collapsing to the same +X default.
+    primary_axis = _signed_primary_axis(chain)
+    secondary_axis = _secondary_axis_from_pole(chain, pv_pos, primary_axis)
+    pv_anchor_bone = chain[1] if len(chain) >= 2 else chain[0]
+    pv_local_position = _world_point_to_node_local(pv_pos, pv_anchor_bone) if pv_pos else None
 
     # Preferred angle per joint
     preferred_angles = {}
@@ -484,7 +895,10 @@ def detect_ik_limb(chain):
         ],
         'params': {
             'primary_axis': primary_axis,
+            'secondary_axis': secondary_axis,
             'pole_vector_world_position': pv_pos,
+            'pole_vector_local_position': pv_local_position,
+            'pole_vector_anchor_bone': _short_node_name(pv_anchor_bone),
             'pole_vector_node': pv_node,
             'ik_handle': ik_handle,
             'solver': solver,
@@ -495,7 +909,7 @@ def detect_ik_limb(chain):
     # Preserve legacy recipe field used by UE5 IKModule.
     if pv_pos:
         result['recipe'] = {'pole_vector_world_position': pv_pos}
-    return result
+    return result, leftover_tail
 
 
 # ---------------------------------------------------------------------------
@@ -727,14 +1141,32 @@ def run_detection_pipeline(root_joint=None):
       5. SquashStretch (additive -- attaches params, does not claim joints)
 
     Args:
-        root_joint: Optional joint name to scope detection.  If None, all
-                    scene root joints are used.
+        root_joint: Optional joint name to scope detection. If None,
+                    defaults to ROOT_JOINT_NAME (the actual exported game
+                    skeleton's root) when it exists in the scene, falling
+                    back to a full scene-wide scan only if it doesn't.
+
+                    This matters because a Maya scene can contain joints
+                    that are NOT part of the exported skeleton at all --
+                    e.g. helper joints parented under a NURBS control curve
+                    hierarchy (RootCtrl|...|SomeCtrl|HelperJoint) used to
+                    skin/drive a Spline IK curve from an animator control.
+                    Those joints have no joint parent, so a scene-wide scan
+                    picks them up as their own chain roots and happily
+                    classifies them as real modules -- but they were never
+                    exported to the Skeletal Mesh (only descendants of the
+                    real skeleton root are), so the UE5 builder correctly
+                    reports "Bone not found" for them. Scoping to
+                    ROOT_JOINT_NAME by default keeps detection to only the
+                    joints that will actually exist on the UE5 side.
 
     Returns:
         List of module dicts ready for build_manifest().
     """
     if root_joint:
         root_joints = [root_joint]
+    elif cmds.objExists(ROOT_JOINT_NAME) and cmds.nodeType(ROOT_JOINT_NAME) == 'joint':
+        root_joints = [ROOT_JOINT_NAME]
     else:
         root_joints = _get_scene_root_joints()
         # Remove the manifest root if it has no rig children.
@@ -793,10 +1225,23 @@ def run_detection_pipeline(root_joint=None):
     for chain in all_chains:
         if not _is_unclaimed(chain):
             continue
-        result = detect_ik_limb(chain)
+        result, leftover_tail = detect_ik_limb(chain)
         if result:
-            _claim(chain)
+            # Only claim the joints actually used by the IK module -- not
+            # the original candidate chain, which may have extended past
+            # the ikHandle's real end joint (e.g. an FK toe chain hanging
+            # off the ankle with no branch point in between).
+            used_chain = chain[:len(chain) - len(leftover_tail)] if leftover_tail else chain
+            _claim(used_chain)
             modules.append(result)
+            if leftover_tail:
+                # Feed the trailing joints back into detection as their own
+                # candidate chain (e.g. Toe_FK_1/Toe_FK_2) rather than
+                # silently dropping them. Pass 4 below will pick them up.
+                all_chains.append(leftover_tail)
+                print('[RigManifest] {} extends past its IK solver -- '
+                      're-queuing leftover joints as a separate chain: {}'.format(
+                          chain[0], leftover_tail))
 
     # --- Pass 4: FKChain (catch-all) ---
     for chain in all_chains:
@@ -852,69 +1297,397 @@ def collect_visible_mesh_transforms():
 
 
 # ---------------------------------------------------------------------------
-# Manifest building
+# Manifest building / module dependency graph
 # ---------------------------------------------------------------------------
 
-def _detect_connections(modules_config):
+def _short_joint_name(node):
+    """Return the UE-compatible bone name without Maya DAG path prefixes."""
+    return str(node).split("|")[-1]
+
+
+def _canonical_joint(node):
+    """Return a stable full DAG path for comparisons inside Maya."""
+    try:
+        matches = cmds.ls(node, long=True) or []
+        return matches[0] if matches else str(node)
+    except Exception:
+        return str(node)
+
+
+def _joint_parent(node):
+    """Return the full-path joint parent of *node*, or None."""
+    try:
+        parents = cmds.listRelatives(
+            node, parent=True, type="joint", fullPath=True
+        ) or []
+        return parents[0] if parents else None
+    except Exception:
+        return None
+
+
+def _append_graph_issue(module_issues, module_name, severity, message):
+    module_issues.setdefault(module_name, []).append({
+        "severity": severity,
+        "message": message,
+    })
+
+
+# Per module type, which control corresponds to roughly the root / middle /
+# tip of that module's own chain. Used to pick a control near WHERE the
+# child actually attaches, not just a fixed default regardless of position --
+# confirmed necessary from a real build where a leg attaching near a spine's
+# ROOT and a head attaching near its TIP both got the same fixed
+# "spline_tip_ctrl" default, yanking the leg control up to the wrong end.
+#
+# IKLimb has no root-only control (only an effector at the tip and,
+# for 3-bone chains, a pole vector roughly at the middle) -- "effector" is
+# used for both root and tip since it's the only control that always
+# exists, but this means a module attaching near an IKLimb's OWN root bone
+# currently has no truly correct control to attach to. Flagging this as a
+# real architecture gap, not silently papered over: IKLimb would need a
+# root-position control added to fully support this.
+_POSITION_ATTACH_POINTS_BY_TYPE = {
+    "SplineIK": {"root": "spline_root_ctrl", "mid": "spline_mid_ctrl", "tip": "spline_tip_ctrl"},
+    "FKChain": {"root": "fk_root_ctrl", "mid": "fk_mid_ctrl", "tip": "fk_tip_ctrl"},
+    "IKFKSwitch": {"root": "fk_root_ctrl", "mid": "fk_mid_ctrl", "tip": "fk_tip_ctrl"},
+    "IKLimb": {"root": "effector", "mid": "pole_vector", "tip": "effector"},
+}
+
+_DEFAULT_ATTACH_POINT_BY_MODULE_TYPE = {
+    "FKChain": "fk_tip_ctrl",
+    "IKLimb": "effector",
+    "IKFKSwitch": "ik_effector",
+    "SplineIK": "spline_tip_ctrl",
+}
+
+
+def _attach_point_for_bone_position(parent_module_name, parent_bone, modules_config):
+    """Resolve an attach point based on WHERE parent_bone sits in the parent
+    module's own chain (near the root, middle, or tip), instead of always
+    using a single fixed default regardless of position.
     """
-    Walk the Maya joint hierarchy to detect which module's root joint sits
-    inside another module's chain.  Returns {child_module_name: parent_module_name}.
+    parent_mod = next(
+        (mod for mod in modules_config if mod.get("module_name") == parent_module_name), None
+    )
+    if not parent_mod:
+        return "fk_tip_ctrl"
+
+    parent_type = parent_mod.get("module_type")
+    chain = [_short_joint_name(bone) for bone in (parent_mod.get("chain") or [])]
+    position_map = _POSITION_ATTACH_POINTS_BY_TYPE.get(parent_type)
+    fallback = _DEFAULT_ATTACH_POINT_BY_MODULE_TYPE.get(parent_type, "fk_tip_ctrl")
+
+    if not position_map or not chain:
+        return fallback
+
+    try:
+        index = chain.index(_short_joint_name(parent_bone))
+    except ValueError:
+        return fallback
+
+    if len(chain) == 1:
+        position = "root"
+    else:
+        ratio = index / (len(chain) - 1)
+        position = "root" if ratio < 0.34 else "tip" if ratio > 0.66 else "mid"
+
+    return position_map.get(position, fallback)
+
+
+def analyze_module_graph(modules_config):
+    """Analyze inter-module attachment and calculate a deterministic UE5 order.
+
+    The closest ancestor joint owned by another tagged module becomes the
+    parent connection. A stable topological sort then guarantees that every
+    parent module is constructed before its children.
+
+    Returns a JSON-serializable dictionary containing:
+      - connections: child module -> attachment metadata
+      - build_order: parent-before-child module names
+      - build_index / depth: convenient lookup tables
+      - module_issues / global_issues: green/orange/red validation support
+      - valid: False when a red graph error exists
     """
-    joint_to_module = {}
+    modules_config = list(modules_config or [])
+    module_issues = {}
+    global_issues = []
+
+    names = [mod.get("module_name", "") for mod in modules_config]
+    original_index = {}
+    for index, name in enumerate(names):
+        if name and name not in original_index:
+            original_index[name] = index
+
+    # Duplicate module names make dependency references ambiguous.
+    seen_names = set()
+    duplicate_names = set()
+    for name in names:
+        if not name:
+            continue
+        if name in seen_names:
+            duplicate_names.add(name)
+        seen_names.add(name)
+    for name in sorted(duplicate_names):
+        message = "duplicate module name '{}'".format(name)
+        global_issues.append({"severity": "red", "message": message})
+        _append_graph_issue(module_issues, name, "red", message)
+
+    # A skeleton joint should normally be owned by exactly one output module.
+    bone_to_modules = {}
+    bone_display_name = {}
     for mod in modules_config:
-        for bone in mod.get("chain", []):
-            joint_to_module[bone] = mod["module_name"]
+        module_name = mod.get("module_name", "")
+        for bone in mod.get("chain", []) or []:
+            key = _canonical_joint(bone)
+            bone_to_modules.setdefault(key, []).append(module_name)
+            bone_display_name[key] = _short_joint_name(bone)
+
+    for bone_key, owners in bone_to_modules.items():
+        unique_owners = sorted(set(owner for owner in owners if owner))
+        if len(unique_owners) <= 1:
+            continue
+        message = "bone '{}' is shared by modules {}".format(
+            bone_display_name.get(bone_key, _short_joint_name(bone_key)),
+            ", ".join(unique_owners),
+        )
+        global_issues.append({"severity": "red", "message": message})
+        for owner in unique_owners:
+            _append_graph_issue(module_issues, owner, "red", message)
 
     connections = {}
-    for mod in modules_config:
-        chain = mod.get("chain", [])
-        if not chain:
-            continue
-        parents = cmds.listRelatives(chain[0], parent=True, type="joint") or []
-        visited = set()
-        while parents:
-            parent = parents[0]
-            if parent in visited:
-                break
-            visited.add(parent)
-            if parent in joint_to_module:
-                parent_module = joint_to_module[parent]
-                if parent_module != mod["module_name"]:
-                    connections[mod["module_name"]] = parent_module
-                    break
-            parents = cmds.listRelatives(parent, parent=True, type="joint") or []
+    root_modules = []
 
-    return connections
+    for mod in modules_config:
+        module_name = mod.get("module_name", "")
+        chain = list(mod.get("chain", []) or [])
+        if not module_name or not chain:
+            if module_name:
+                _append_graph_issue(module_issues, module_name, "red", "module has an empty chain")
+            continue
+
+        start_bone = chain[0]
+        parent = _joint_parent(start_bone)
+        skipped_ancestors = []
+        connection = None
+
+        while parent:
+            parent_key = _canonical_joint(parent)
+            owners = sorted(set(
+                owner for owner in bone_to_modules.get(parent_key, [])
+                if owner and owner != module_name
+            ))
+
+            if len(owners) == 1:
+                connection = {
+                    "parent_module": owners[0],
+                    # Resolved from WHERE parent (the bone) sits in the
+                    # parent module's own chain -- not a fixed per-type
+                    # default. "root"/"tip"/"mid" bone names are still never
+                    # used directly here; those map to bones, not controls,
+                    # and can never resolve through
+                    # RigContext.get_parent_control_key.
+                    "parent_attach_point": _attach_point_for_bone_position(
+                        owners[0], parent, modules_config
+                    ),
+                    # New explicit semantic attachment data for the future UE5.6 builder.
+                    "parent_bone": _short_joint_name(parent),
+                    "child_attach_bone": _short_joint_name(start_bone),
+                    "relationship": "maya_joint_hierarchy",
+                    "skipped_ancestor_bones": [
+                        _short_joint_name(item) for item in skipped_ancestors
+                    ],
+                }
+                break
+
+            if len(owners) > 1:
+                message = "ambiguous parent bone '{}' belongs to {}".format(
+                    _short_joint_name(parent), ", ".join(owners)
+                )
+                _append_graph_issue(module_issues, module_name, "red", message)
+                break
+
+            skipped_ancestors.append(parent)
+            parent = _joint_parent(parent)
+
+        if connection:
+            connections[module_name] = connection
+        else:
+            root_modules.append(module_name)
+            # A single untagged skeleton root is expected. A deeper untagged
+            # joint region means the module can still build, but attachment is
+            # not semantically certain, so expose it as orange in the tool.
+            meaningful = [
+                item for item in skipped_ancestors
+                if _short_joint_name(item) != ROOT_JOINT_NAME
+            ]
+            if meaningful:
+                _append_graph_issue(
+                    module_issues,
+                    module_name,
+                    "orange",
+                    "no parent module found above '{}'; untagged ancestors: {}".format(
+                        _short_joint_name(start_bone),
+                        ", ".join(_short_joint_name(item) for item in meaningful),
+                    ),
+                )
+
+    # Parent-before-child topological sort. Siblings are stable and
+    # deterministic by original module order, then name.
+    unique_names = []
+    for name in names:
+        if name and name not in unique_names:
+            unique_names.append(name)
+
+    children = {name: [] for name in unique_names}
+    indegree = {name: 0 for name in unique_names}
+    for child_name, connection in connections.items():
+        parent_name = connection.get("parent_module")
+        if child_name not in indegree or parent_name not in indegree:
+            continue
+        children[parent_name].append(child_name)
+        indegree[child_name] += 1
+
+    sort_key = lambda name: (original_index.get(name, 10 ** 9), name.lower())
+    queue = sorted([name for name in unique_names if indegree[name] == 0], key=sort_key)
+    build_order = []
+
+    while queue:
+        current = queue.pop(0)
+        build_order.append(current)
+        for child in sorted(children.get(current, []), key=sort_key):
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                queue.append(child)
+                queue.sort(key=sort_key)
+
+    cyclic_modules = [name for name in unique_names if name not in build_order]
+    if cyclic_modules:
+        message = "cyclic module dependency: {}".format(
+            " -> ".join(sorted(cyclic_modules))
+        )
+        global_issues.append({"severity": "red", "message": message})
+        for name in cyclic_modules:
+            _append_graph_issue(module_issues, name, "red", message)
+        # Keep the manifest deterministic even when invalid, so the UI can
+        # display and diagnose it instead of crashing.
+        build_order.extend(sorted(cyclic_modules, key=sort_key))
+
+    build_index = {name: index for index, name in enumerate(build_order)}
+    depth = {}
+    for name in build_order:
+        parent_name = (connections.get(name) or {}).get("parent_module")
+        depth[name] = depth.get(parent_name, -1) + 1 if parent_name else 0
+
+    has_red = any(
+        issue.get("severity") == "red"
+        for issues in module_issues.values()
+        for issue in issues
+    ) or any(issue.get("severity") == "red" for issue in global_issues)
+
+    return {
+        "valid": not has_red,
+        "connections": connections,
+        "root_modules": root_modules,
+        "build_order": build_order,
+        "build_index": build_index,
+        "depth": depth,
+        "module_issues": module_issues,
+        "global_issues": global_issues,
+    }
+
+
+def _detect_connections(modules_config):
+    """Compatibility wrapper returning child -> parent module names."""
+    analysis = analyze_module_graph(modules_config)
+    return {
+        child: data.get("parent_module")
+        for child, data in analysis.get("connections", {}).items()
+    }
+
+
+def _merge_scene_detected_module_data(module):
+    """Reattach structural Maya data to the clean tagger module definition.
+
+    The tagger intentionally stores only ownership/endpoints on joints. This
+    enrichment step restores per-instance solver information immediately before
+    JSON creation, so the manifest remains clean while no IK data is lost.
+    """
+    enriched = dict(module)
+    enriched['chain'] = list(module.get('chain') or [])
+    enriched['chain_items'] = [dict(item) for item in (module.get('chain_items') or [])]
+
+    detected = None
+    if enriched.get('module_type') == 'IKLimb' and enriched['chain']:
+        detected, _ = detect_ik_limb(list(enriched['chain']))
+
+    if detected:
+        merged_params = dict(detected.get('params') or {})
+        merged_params.update(enriched.get('params') or {})
+        if merged_params:
+            enriched['params'] = merged_params
+
+        merged_recipe = dict(detected.get('recipe') or {})
+        merged_recipe.update(enriched.get('recipe') or {})
+        if merged_recipe:
+            enriched['recipe'] = merged_recipe
+
+    return enriched
 
 
 def build_manifest(rig_name, modules_config):
-    """
-    Build the manifest dict from modules_config, augmented with
-    scene-detected inter-module connections.
+    """Build a schema-v3 manifest with modules and bone-linked controllers."""
+    modules_config = [
+        _merge_scene_detected_module_data(module)
+        for module in (modules_config or [])
+    ]
+    graph = analyze_module_graph(modules_config)
+    build_index = graph.get("build_index", {})
 
-    modules_config items may come from run_detection_pipeline() (which already
-    embeds params) or from a hand-authored list.
-    """
-    connections = _detect_connections(modules_config)
+    indexed_modules = list(enumerate(modules_config))
+    indexed_modules.sort(key=lambda pair: (
+        build_index.get(pair[1].get("module_name"), 10 ** 9),
+        pair[0],
+    ))
+
     modules = []
+    for _, mod in indexed_modules:
+        raw_chain = list(mod.get("chain", []) or [])
+        chain = [_short_joint_name(bone) for bone in raw_chain]
 
-    for mod in modules_config:
+        raw_chain_items = list(mod.get("chain_items", []) or [])
+        if raw_chain_items:
+            chain_items = []
+            for item in raw_chain_items:
+                copied = dict(item)
+                copied["bone_name"] = _short_joint_name(copied.get("bone_name", ""))
+                chain_items.append(copied)
+        else:
+            roles = _chain_roles(len(chain))
+            chain_items = [
+                {"bone_name": bone, "role": role}
+                for bone, role in zip(chain, roles)
+            ]
+
+        module_name = mod["module_name"]
         module_def = {
             "module_type": mod["module_type"],
-            "module_name": mod["module_name"],
-            "chain": list(mod.get("chain", [])),
-            "chain_items": list(mod.get("chain_items", [])),
+            "module_name": module_name,
+            "chain": chain,
+            "chain_items": chain_items,
+            "start_bone": _short_joint_name(mod.get("start_bone") or (raw_chain[0] if raw_chain else "")),
+            "end_bone": _short_joint_name(mod.get("end_bone") or (raw_chain[-1] if raw_chain else "")),
+            "build_order": build_index.get(module_name),
+            "build_depth": graph.get("depth", {}).get(module_name, 0),
+            "depends_on": [],
         }
 
         if mod.get("params"):
             module_def["params"] = mod["params"]
 
-        parent_module = connections.get(mod["module_name"])
-        if parent_module:
-            module_def["connections"] = {
-                "parent_module": parent_module,
-                "parent_attach_point": "root",
-            }
+        connection = graph.get("connections", {}).get(module_name)
+        if connection:
+            module_def["connections"] = dict(connection)
+            module_def["depends_on"] = [connection.get("parent_module")]
 
         # Preserve legacy "recipe" field for IKLimb so the UE5 IKModule can
         # read pole_vector_world_position without touching the params dict.
@@ -927,7 +1700,23 @@ def build_manifest(rig_name, modules_config):
 
         modules.append(module_def)
 
-    return {"rig_name": rig_name, "modules": modules}
+    serializable_connections = {
+        name: dict(data) for name, data in graph.get("connections", {}).items()
+    }
+    return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "rig_name": rig_name,
+        "module_build_order": list(graph.get("build_order", [])),
+        "module_graph": {
+            "valid": graph.get("valid", True),
+            "root_modules": list(graph.get("root_modules", [])),
+            "connections": serializable_connections,
+            "issues": list(graph.get("global_issues", [])),
+            "module_issues": dict(graph.get("module_issues", {})),
+        },
+        "bone_controllers": collect_bone_controller_manifest(modules_config),
+        "modules": modules,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1124,12 +1913,19 @@ def export(export_dir, filename_base, rig_name, modules_config):
 # RIG_MODULES is built automatically from joints named {side}_{part}_{index:02d}_jnt
 # (e.g. L_leg_01_jnt, R_arm_02_jnt, spine_01_jnt).
 # You can override RIG_MODULES with an explicit list if needed.
+#
+# This block now only runs when the file is executed directly (e.g. from the
+# Script Editor), not on `import export_rig_manifest`. rig_tagger_tool.py
+# imports this module purely for its helper functions (build_manifest,
+# export, find_ik_handle_for_start_joint, etc.) and must not trigger the old
+# auto-discovery export as a side effect of that import.
 # ---------------------------------------------------------------------------
-EXPORT_DIR = r"C:\Users\jeanf\Desktop\DataAsset test\Export"
-FILENAME = "IKFKModuleTest"
-RIG_NAME = "IKFKModuleTest"
+if __name__ == "__main__":
+    EXPORT_DIR = r"C:\Users\jeanf\Desktop\DataAsset test\Export"
+    FILENAME = "MultiModule"
+    RIG_NAME = "MultiModule"
 
-RIG_MODULES = auto_discover_modules()
+    RIG_MODULES = auto_discover_modules()
 
-export(EXPORT_DIR, FILENAME, RIG_NAME, RIG_MODULES)
-register_auto_update(RIG_NAME, RIG_MODULES)
+    export(EXPORT_DIR, FILENAME, RIG_NAME, RIG_MODULES)
+    register_auto_update(RIG_NAME, RIG_MODULES)

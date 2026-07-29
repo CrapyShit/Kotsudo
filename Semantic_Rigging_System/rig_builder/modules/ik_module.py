@@ -8,6 +8,75 @@ except ImportError:
 from .. import graph_utils
 from .rig_module import RigModule
 
+def _controller_records(recipe_data):
+    records = recipe_data.get("ControllerRecords") or []
+    return records if isinstance(records, (list, tuple)) else []
+
+
+def _find_controller_record(recipe_data, *roles):
+    wanted = {str(role).strip().lower() for role in roles}
+    for record in _controller_records(recipe_data):
+        if str(record.get("role") or "").strip().lower() in wanted:
+            return record
+    return None
+
+
+def _source_control_name(record, fallback):
+    if not record or not record.get("name"):
+        return fallback
+    shape_types = {str(item).lower() for item in (record.get("shape_types") or [])}
+    if not ({"nurbscurve", "beziercurve"} & shape_types):
+        return fallback
+    source_name = str(record["name"]).split("|")[-1].split(":")[-1]
+    return graph_utils.sanitize_name(source_name) or fallback
+
+
+def _controller_color(record, fallback):
+    values = (record or {}).get("display_color")
+    if isinstance(values, (list, tuple)) and len(values) >= 3:
+        try:
+            return unreal.LinearColor(
+                float(values[0]), float(values[1]), float(values[2]), 1.0
+            )
+        except Exception:
+            pass
+    return fallback
+
+
+def _position_from_bone_local_record(hierarchy, record):
+    if not record:
+        return None
+    anchor_bone = record.get("anchor_bone") or record.get("driven_bone")
+    local_position = record.get("bone_local_position")
+    if not anchor_bone or not local_position:
+        return None
+    try:
+        local_vector = graph_utils.recipe_vector(local_position, None)
+        if local_vector is None:
+            return None
+        anchor_transform = graph_utils.get_bone_global_transform(hierarchy, anchor_bone)
+        if hasattr(anchor_transform, "transform_location"):
+            return anchor_transform.transform_location(local_vector)
+        return unreal.MathLibrary.transform_location(anchor_transform, local_vector)
+    except Exception:
+        return None
+
+
+def _position_from_recipe_local(hierarchy, local_position, anchor_bone):
+    if not local_position or not anchor_bone:
+        return None
+    try:
+        local_vector = graph_utils.recipe_vector(local_position, None)
+        if local_vector is None:
+            return None
+        anchor_transform = graph_utils.get_bone_global_transform(hierarchy, anchor_bone)
+        if hasattr(anchor_transform, "transform_location"):
+            return anchor_transform.transform_location(local_vector)
+        return unreal.MathLibrary.transform_location(anchor_transform, local_vector)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # IKLimb module
 # ---------------------------------------------------------------------------
@@ -83,9 +152,18 @@ class IKModule(RigModule):
             raise RuntimeError("No Forwards Solve node found in the Control Rig graph.")
 
         module_prefix = graph_utils.sanitize_name(self.name)
-        effector_control_name = f"{module_prefix}_IK_CTRL"
+        effector_record = _find_controller_record(recipe_data, "ik_effector", "effector")
+        effector_control_name = _source_control_name(
+            effector_record, f"{module_prefix}_IK_CTRL"
+        )
 
-        effector_position = graph_utils.get_bone_global_position(hierarchy, self.chain[-1])
+        effector_position = _position_from_bone_local_record(
+            hierarchy, effector_record
+        )
+        if effector_position is None:
+            effector_position = graph_utils.get_bone_global_position(
+                hierarchy, self.chain[-1]
+            )
         parent_key = (
             self.context.get_parent_control_key(self.parent_module_name, self.parent_attach_point)
             or graph_utils.get_world_parent_key(hierarchy, hierarchy_controller)
@@ -102,7 +180,9 @@ class IKModule(RigModule):
         graph_utils.create_control(
             hierarchy, hierarchy_controller,
             parent_key, effector_control_name, effector_position,
-            unreal.LinearColor(0.0, 0.7, 1.0, 1.0),
+            _controller_color(
+                effector_record, unreal.LinearColor(0.0, 0.7, 1.0, 1.0)
+            ),
             (effector_scale, effector_scale, effector_scale),
         )
 
@@ -203,14 +283,27 @@ class IKModule(RigModule):
             )
 
         pole_distance_scale = float(recipe_data.get("PoleDistanceScale") or 0.75)
-        pole_position = graph_utils.compute_pole_vector(
-            self.chain, hierarchy, pole_distance_scale=pole_distance_scale
+        pole_record = _find_controller_record(recipe_data, "pole_vector", "pv")
+        pole_position = _position_from_bone_local_record(hierarchy, pole_record)
+        if pole_position is None:
+            pole_position = _position_from_recipe_local(
+                hierarchy,
+                recipe_data.get("PoleVectorLocalPosition"),
+                recipe_data.get("PoleVectorAnchorBone") or self.chain[1],
+            )
+        if pole_position is None:
+            pole_position = graph_utils.compute_pole_vector(
+                self.chain, hierarchy, pole_distance_scale=pole_distance_scale
+            )
+        pole_control_name = _source_control_name(
+            pole_record, f"{module_prefix}_PV_CTRL"
         )
-        pole_control_name = f"{module_prefix}_PV_CTRL"
 
         graph_utils.create_control(
             hierarchy, hierarchy_controller, parent_key, pole_control_name, pole_position,
-            unreal.LinearColor(0.4, 1.0, 0.3, 1.0),
+            _controller_color(
+                pole_record, unreal.LinearColor(0.4, 1.0, 0.3, 1.0)
+            ),
             (pv_scale, pv_scale, pv_scale), shape_name=None,
         )
 
@@ -328,6 +421,9 @@ class IKModule(RigModule):
             "PrimaryAxis": None,
             "SecondaryAxis": None,
             "PoleVectorKind": "Location",
+            "PoleVectorLocalPosition": None,
+            "PoleVectorAnchorBone": None,
+            "ControllerRecords": [],
             "PoleDistanceScale": 0.75,
             "EnableStretch": False,
             "StretchStartRatio": 1.0,
@@ -340,6 +436,9 @@ class IKModule(RigModule):
             "PrimaryAxis": ["primary_axis", "primaryaxis"],
             "SecondaryAxis": ["secondary_axis", "secondaryaxis"],
             "PoleVectorKind": ["pole_vector_kind", "polevectorkind"],
+            "PoleVectorLocalPosition": ["pole_vector_local_position", "polevectorlocalposition"],
+            "PoleVectorAnchorBone": ["pole_vector_anchor_bone", "polevectoranchorbone"],
+            "ControllerRecords": ["controller_records", "controllerrecords"],
             "PoleDistanceScale": ["pole_distance_scale", "poledistancescale"],
             "EnableStretch": ["enable_stretch", "enablestretch"],
             "StretchStartRatio": ["stretch_start_ratio", "stretchstartratio"],
