@@ -146,31 +146,27 @@ class IKFKModule(RigModule):
             safe_bone = graph_utils.sanitize_name(bone_name)
 
             fk_ctrl = f"{module_prefix}_{safe_bone}_FK_CTRL"
-            fk_key = graph_utils.create_control(
-                hierarchy,
-                hierarchy_controller,
-                prev_fk_key,
-                fk_ctrl,
-                bone_position,
-                unreal.LinearColor(1.0, 0.65, 0.1, 1.0),
-                (fk_scale, fk_scale, fk_scale),
-                shape_name="Circle_Thick",
-                shape_rotation=shape_rot,
+            fk_color = unreal.LinearColor(1.0, 0.65, 0.1, 1.0)
+
+            # The Maya FK controller of this bone: origin, exact shape and
+            # custom attributes all come from its exported record.
+            record = graph_utils.find_controller_record(recipe_data, bone_name, ("bone_driver",))
+            fk_ctrl = self.context.control_name(record, fk_ctrl)
+            fk_key, driver_null = graph_utils.build_record_control(
+                self.context.rig, hierarchy, hierarchy_controller, recipe_data,
+                prev_fk_key, fk_ctrl, bone_name, bone_transform, record,
+                graph_utils.record_color(record, fk_color),
+                "Circle_Thick", (fk_scale, fk_scale, fk_scale), shape_rot,
             )
-            hierarchy.set_global_transform(fk_key, bone_transform, True, True)
             fk_controls.append(fk_ctrl)
             prev_fk_key = fk_key
 
             get_node = f"{module_prefix}_{safe_bone}_GetFK"
-            graph_utils.create_unit_node(
-                controller,
-                model,
-                get_node,
-                unreal.RigUnit_GetControlTransform,
+            graph_utils.create_transform_getter(
+                controller, model, get_node,
                 unreal.Vector2D(x_origin, 200 + idx * 260),
+                fk_ctrl, driver_null,
             )
-            graph_utils.set_pin_default(controller, model, f"{get_node}.Control", fk_ctrl)
-            graph_utils.set_pin_default(controller, model, f"{get_node}.Space", "GlobalSpace")
             fk_get_nodes.append(get_node)
 
         # ------------------------------------------------------------------
@@ -179,17 +175,17 @@ class IKFKModule(RigModule):
         tip_transform = graph_utils.get_bone_global_transform(hierarchy, self.chain[-1])
         effector_pos = graph_utils.transform_to_location(tip_transform)
 
-        ik_effector_ctrl = f"{module_prefix}_IK_CTRL"
-        ik_effector_key = graph_utils.create_control(
-            hierarchy,
-            hierarchy_controller,
-            parent_key,
-            ik_effector_ctrl,
-            effector_pos,
-            unreal.LinearColor(0.0, 0.7, 1.0, 1.0),
-            (ik_scale, ik_scale, ik_scale),
+        ik_color = unreal.LinearColor(0.0, 0.7, 1.0, 1.0)
+        effector_record = graph_utils.find_controller_record(
+            recipe_data, self.chain[-1], ("ik_effector", "effector")
         )
-        hierarchy.set_global_transform(ik_effector_key, tip_transform, True, True)
+        ik_effector_ctrl = self.context.control_name(effector_record, f"{module_prefix}_IK_CTRL")
+        ik_effector_key, effector_driver = graph_utils.build_record_control(
+            self.context.rig, hierarchy, hierarchy_controller, recipe_data,
+            parent_key, ik_effector_ctrl, self.chain[-1], tip_transform, effector_record,
+            graph_utils.record_color(effector_record, ik_color),
+            "Circle_Thick", (ik_scale, ik_scale, ik_scale),
+        )
 
         get_eff_node = f"{module_prefix}_GetIKEff"
         lerp_node = f"{module_prefix}_IKFKLerp"
@@ -199,15 +195,11 @@ class IKFKModule(RigModule):
         n_bones = len(self.chain)
         ik_col = x_origin + 500 + n_bones * 60 + 700
 
-        graph_utils.create_unit_node(
-            controller,
-            model,
-            get_eff_node,
-            unreal.RigUnit_GetControlTransform,
+        graph_utils.create_transform_getter(
+            controller, model, get_eff_node,
             unreal.Vector2D(ik_col, 100),
+            ik_effector_ctrl, effector_driver,
         )
-        graph_utils.set_pin_default(controller, model, f"{get_eff_node}.Control", ik_effector_ctrl)
-        graph_utils.set_pin_default(controller, model, f"{get_eff_node}.Space", "GlobalSpace")
 
         lerp_struct = _pick_transform_lerp_struct()
         graph_utils.create_unit_node(
@@ -219,7 +211,17 @@ class IKFKModule(RigModule):
         )
         fk_tip_out = f"{fk_get_nodes[-1]}.Transform"
         ik_eff_out = f"{get_eff_node}.Transform"
-        _connect_lerp_inputs(controller, model, lerp_node, fk_tip_out, ik_eff_out)
+
+        # The Maya switch control (if exported) drives the blend. Its
+        # polarity decides the input order: alpha weights the second input.
+        switch_control, invert_inputs = self._build_switch(
+            controller, model, hierarchy, hierarchy_controller, recipe_data,
+            parent_key, module_prefix, lerp_node, ik_col, fk_scale,
+        )
+        if invert_inputs:
+            _connect_lerp_inputs(controller, model, lerp_node, ik_eff_out, fk_tip_out)
+        else:
+            _connect_lerp_inputs(controller, model, lerp_node, fk_tip_out, ik_eff_out)
 
         # ------------------------------------------------------------------
         # 3. IK solver node (always TwoBoneIK -- chain length is guaranteed
@@ -245,6 +247,8 @@ class IKFKModule(RigModule):
         )
         all_controls.append(ik_pole_ctrl)
         all_nodes.extend([get_pole_node, ik_node])
+        if switch_control:
+            all_controls.append(switch_control)
 
         # ------------------------------------------------------------------
         # 4. IKFKBlend variable  (0 = full FK, 1 = full IK)
@@ -256,14 +260,18 @@ class IKFKModule(RigModule):
         # ------------------------------------------------------------------
         blend_var = f"{module_prefix}_IKFKBlend"
         default_blend = float(recipe_data.get("DefaultBlend") or 0.0)
-        _ensure_float_variable(self.context.rig, blend_var, default_value=default_blend)
-        _bind_lerp_alpha_to_variable(
-            controller,
-            model,
-            lerp_node,
-            blend_var,
-            unreal.Vector2D(ik_col + 320, 500),
-        )
+        if switch_control is None:
+            # No exported switch control: fall back to a plain rig variable.
+            _ensure_float_variable(self.context.rig, blend_var, default_value=default_blend)
+            _bind_lerp_alpha_to_variable(
+                controller,
+                model,
+                lerp_node,
+                blend_var,
+                unreal.Vector2D(ik_col + 320, 500),
+            )
+        else:
+            blend_var = switch_control
 
         # ------------------------------------------------------------------
         # 5. Execution chain: FK SetTransforms -> IK solver
@@ -310,6 +318,20 @@ class IKFKModule(RigModule):
 
         _chain_exec(controller, model, exec_tail, ik_node)
         exec_tail = ik_node
+
+        # Follow spaces: one null per chain bone, updated from the FINAL
+        # (post-solve) bone transform, so child modules (toes, fingers) track
+        # the limb in IK as well as in FK instead of the FK controls only.
+        follow_bones = {}
+        for idx, bone_name in enumerate(self.chain):
+            space_name, exec_tail = graph_utils.create_bone_follow_space(
+                hierarchy, hierarchy_controller, controller, model,
+                f"{module_prefix}_{graph_utils.sanitize_name(bone_name)}_Follow",
+                bone_name, graph_utils.get_bone_global_transform(hierarchy, bone_name),
+                unreal.Vector2D(ik_col + 700, 700 + idx * 220), exec_tail,
+            )
+            if space_name:
+                follow_bones[idx] = space_name
         self.context.set_exec_tail(exec_tail)
 
         if self.logger:
@@ -322,6 +344,8 @@ class IKFKModule(RigModule):
             "ik_effector": ik_effector_ctrl,
             "ik_pole": ik_pole_ctrl,
         }
+        if switch_control:
+            attach_pts["ik_fk_switch"] = switch_control
 
         for _i, _ctrl in enumerate(fk_controls):
             attach_pts[f"fk_ctrl_{_i}"] = _ctrl
@@ -331,7 +355,7 @@ class IKFKModule(RigModule):
         attach_pts["fk_mid_ctrl"] = fk_controls[1]
         attach_pts["fk_tip_ctrl"] = fk_controls[-1]
 
-        return self.build_result(
+        result = self.build_result(
             controls=all_controls,
             nodes=all_nodes,
             attach_points=attach_pts,
@@ -350,6 +374,136 @@ class IKFKModule(RigModule):
                 "default_blend": default_blend,
             },
         )
+        # attach-point name -> follow null, per chain index
+        aliases = {
+            0: ("root", "fk_root_ctrl", "fk_ctrl_0"),
+            1: ("mid", "fk_mid_ctrl", "fk_ctrl_1"),
+            2: ("tip", "fk_tip_ctrl", "fk_ctrl_2"),
+        }
+        result["follow_spaces"] = {
+            alias: follow_bones[idx]
+            for idx, names in aliases.items() if idx in follow_bones
+            for alias in names
+        }
+        return result
+
+    # ------------------------------------------------------------------
+    # IK/FK switch control
+    # ------------------------------------------------------------------
+
+    def _build_switch(
+        self, controller, model, hierarchy, hierarchy_controller, recipe_data,
+        parent_key, module_prefix, lerp_node, ik_col, scale,
+    ):
+        """Recreate the Maya IK/FK switch as a control that drives the blend.
+
+        The Maya controller (position, shape) becomes a Control Rig control
+        carrying one FLOAT slider per exported attribute; the IK/FK attribute's
+        slider feeds the lerp alpha. Returns (control_name_or_None,
+        invert_inputs). ``None`` means no switch was exported/buildable and the
+        caller falls back to a rig variable.
+
+        Polarity: alpha weights the lerp's SECOND input. With IK at attribute
+        value 1 the inputs stay (FK, IK); with IK at 0 (Maya enum "IK:FK") they
+        are swapped to (IK, FK), so the animator's numbers keep the meaning
+        they had in Maya. A range other than 0..1 is normalised to an
+        IK-weight slider.
+        """
+        switch = recipe_data.get("Switch")
+        if not isinstance(switch, dict):
+            return None, False
+        record = switch.get("control") or {}
+        attribute = switch.get("attribute")
+        info = dict(switch.get("attribute_info") or {})
+        if not record or not attribute or not info:
+            return None, False
+
+        try:
+            ik_value = float(switch.get("ik_value", 1.0))
+            fk_value = float(switch.get("fk_value", 0.0))
+            invert_inputs = False
+            if {round(ik_value, 6), round(fk_value, 6)} == {0.0, 1.0}:
+                invert_inputs = ik_value == 0.0
+            else:
+                # Normalise to a 0..1 "IK weight" slider.
+                info["min"], info["max"] = 0.0, 1.0
+                info["value"] = float(switch.get("default_ik_weight", 0.0))
+                _log_warning(
+                    f"Switch '{attribute}' of '{self.name}' uses values IK={ik_value}, "
+                    f"FK={fk_value}; exposing it as a 0..1 IK-weight slider."
+                )
+
+            # The switch is the Maya controller itself (L_Leg_IKFK_Switch):
+            # same name, place, orientation, shape and locked channels. Its
+            # attributes become animation channels on it -- select the control
+            # and IK_FK is in the Details panel / Anim Outliner / Sequencer,
+            # exactly like the attribute in Maya's channel box.
+            anchor = record.get("anchor_bone") or self.chain[0]
+            placement = graph_utils.record_transform(
+                hierarchy, record, anchor, label=f"{self.name} switch"
+            )
+            position = graph_utils.transform_to_location(placement)
+            host_name = self.context.control_name(record, f"{module_prefix}_Switch_CTRL")
+            color = graph_utils.record_color(record, unreal.LinearColor(1.0, 0.9, 0.2, 1.0))
+            shape_name, shape_rotation, shape_scale = graph_utils.control_shapes.resolve_control_shape(
+                self.context.rig, recipe_data, record,
+                graph_utils.get_transform_rotation(placement),
+                "Circle_Thick", (scale, scale, scale),
+            )
+            host_key = graph_utils.create_control(
+                hierarchy, hierarchy_controller, parent_key, host_name, position, color,
+                shape_scale, shape_name=shape_name, shape_rotation=shape_rotation,
+                global_transform=placement,
+                locked_channels=record.get("locked_channels"),
+            )
+
+            # The driving attribute first; other settings of the same Maya
+            # controller follow.
+            infos = [info] + [
+                item for item in (record.get("attributes") or [])
+                if item.get("name") != attribute
+            ]
+            created = graph_utils.attach_record_attributes(
+                hierarchy, hierarchy_controller, host_key, record, host_name,
+                position, color, infos=infos,
+            )
+            kind, key_name = created.get(attribute, (None, None))
+            if not key_name:
+                return None, False
+
+            if kind == "channel":
+                out_pin = graph_utils.create_channel_getter(
+                    controller, model, f"{lerp_node}_GetSwitch", host_name, attribute,
+                    key_name, unreal.Vector2D(ik_col + 320, 500),
+                )
+            else:
+                out_pin = graph_utils.create_float_control_getter(
+                    controller, model, f"{lerp_node}_GetSwitch", key_name,
+                    unreal.Vector2D(ik_col + 320, 500),
+                )
+            control_name = host_name
+            alpha_pin = next(
+                (f"{lerp_node}.{name}" for name in ("Alpha", "T", "Blend")
+                 if graph_utils.pin_exists(model, f"{lerp_node}.{name}")),
+                None,
+            )
+            if not out_pin or not alpha_pin or not graph_utils.connect_pins(
+                controller, model, out_pin, alpha_pin
+            ):
+                _log_warning(
+                    f"Switch control '{control_name}' could not be wired to '{lerp_node}'; "
+                    "using a rig variable instead."
+                )
+                return None, False
+            _log_info(
+                f"IK/FK switch: control '{control_name}', {kind} '{attribute}' drives "
+                f"'{lerp_node}' (IK={ik_value}, FK={fk_value}, "
+                f"inputs {'swapped' if invert_inputs else 'kept'})."
+            )
+            return control_name, invert_inputs
+        except Exception as exc:
+            _log_warning(f"Could not build the IK/FK switch control for '{self.name}': {exc}")
+            return None, False
 
     # ------------------------------------------------------------------
     # Solver builders
@@ -385,16 +539,23 @@ class IKFKModule(RigModule):
             pole_distance_scale=pole_distance_scale,
         )
 
-        pole_key = graph_utils.create_control(
-            hierarchy,
-            hierarchy_controller,
-            parent_key,
-            ik_pole_ctrl,
-            pole_pos,
-            unreal.LinearColor(0.0, 0.35, 1.0, 1.0),
+        # Use the Maya pole-vector controller's own position when the export
+        # captured one (any offset from the mid bone counts, so no minimum).
+        pole_record = graph_utils.find_controller_record(
+            recipe_data, self.chain[1], ("pole_vector", "pv")
+        )
+        recorded_pole = graph_utils.controller_origin_position(
+            hierarchy, pole_record, self.chain[1], min_offset=0.0, label=ik_pole_ctrl
+        )
+        if recorded_pole is not None:
+            pole_pos = recorded_pole
+
+        # Sphere sized like the Maya pole controller, under its Maya name.
+        ik_pole_ctrl, _pole_key = graph_utils.build_pole_control(
+            self.context, parent_key, ik_pole_ctrl, pole_pos, pole_record,
+            graph_utils.record_color(pole_record, unreal.LinearColor(0.0, 0.35, 1.0, 1.0)),
             (pv_scale, pv_scale, pv_scale),
         )
-        hierarchy.set_control_offset_transform(pole_key, unreal.Transform(location=pole_pos), True, True)
 
         graph_utils.create_unit_node(
             controller,
@@ -460,8 +621,24 @@ class IKFKModule(RigModule):
                 f"{ik_node}.PoleVector. A static pole vector default was set instead."
             )
 
-        primary_axis = _recipe_vector(recipe_data.get("PrimaryAxis"), unreal.Vector(1.0, 0.0, 0.0))
-        secondary_axis = _recipe_vector(recipe_data.get("SecondaryAxis"), unreal.Vector(0.0, 1.0, 0.0))
+        # Solver axes come from the imported skeleton (which local axis of the
+        # upper bone runs to the mid bone, and which points at the pole), not
+        # from a hard-coded X/Y: a limb whose joints run along another axis
+        # would otherwise be twisted the moment the solver writes its bones.
+        # Recipe values are only a fallback for degenerate (collinear) chains.
+        fallback_primary = graph_utils.recipe_vector(
+            recipe_data.get("PrimaryAxis"), unreal.Vector(1.0, 0.0, 0.0)
+        )
+        fallback_secondary = graph_utils.recipe_vector(
+            recipe_data.get("SecondaryAxis"), unreal.Vector(0.0, 1.0, 0.0)
+        )
+        primary_axis, secondary_axis = graph_utils.derive_two_bone_axes(
+            hierarchy,
+            self.chain,
+            pole_pos,
+            fallback_primary=fallback_primary,
+            fallback_secondary=fallback_secondary,
+        )
         pole_kind = str(recipe_data.get("PoleVectorKind") or "Location")
 
         _set_vector_pin(controller, model, f"{ik_node}.PrimaryAxis", primary_axis)
@@ -516,8 +693,14 @@ class IKFKModule(RigModule):
             "StretchStartRatio": 1.0,
             "StretchMaximumRatio": 1.2,
             "DefaultBlend": 0.0,
+            "ControllerRecords": None,
+            "ShapeTable": None,
+            "Switch": None,
         }
         fallback_names = {
+            "ControllerRecords": ["controller_records", "controllerrecords"],
+            "ShapeTable": ["shape_table", "shapetable"],
+            "Switch": ["switch"],
             "ModuleType": ["module_type"],
             "ControlScale": ["control_scale", "controlscale"],
             "PrimaryAxis": ["primary_axis", "primaryaxis"],

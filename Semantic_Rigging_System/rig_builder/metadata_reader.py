@@ -156,6 +156,19 @@ def _strip_dag_prefix(name):
     return name.split("|")[-1] if name else name
 
 
+def _collect_shape_ids(value, found):
+    """Recursively gather every ``shape_id`` referenced inside a params tree."""
+    if isinstance(value, dict):
+        shape_id = value.get("shape_id")
+        if shape_id:
+            found.add(shape_id)
+        for child in value.values():
+            _collect_shape_ids(child, found)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _collect_shape_ids(child, found)
+
+
 def _parse_modules_from_manifest_data(data):
     """Shared helper: convert a parsed manifest dict to module definitions.
 
@@ -164,6 +177,8 @@ def _parse_modules_from_manifest_data(data):
     through params.controller_records for the normal recipe merge path.
     """
     raw_modules = data.get("modules") or []
+    all_shapes = dict(data.get("control_shapes") or {})
+    coordinate_system = dict(data.get("coordinate_system") or {})
     raw_controller_map = data.get("bone_controllers") or data.get("controllers_by_bone") or {}
     controller_map = {
         _strip_dag_prefix(bone_name): [dict(record) for record in (records or [])]
@@ -188,6 +203,11 @@ def _parse_modules_from_manifest_data(data):
         if raw.get("recipe"):
             module_def["recipe"] = dict(raw["recipe"])
         params = dict(raw.get("params") or {})
+        if coordinate_system:
+            # Raw FBX custom metadata is not axis-converted alongside the
+            # skeleton. Expose the manifest's conversion description to each
+            # module through the normal recipe merge path.
+            params.setdefault("coordinate_system", coordinate_system)
 
         controller_records = []
         seen = set()
@@ -208,6 +228,17 @@ def _parse_modules_from_manifest_data(data):
 
         if controller_records:
             params["controller_records"] = controller_records
+
+        # Hand each module only the control shapes it references (the manifest
+        # stores every distinct shape once, at the top level).
+        if all_shapes:
+            wanted = set()
+            _collect_shape_ids(params, wanted)
+            module_shapes = {sid: all_shapes[sid] for sid in wanted if sid in all_shapes}
+            if module_shapes:
+                params["shape_table"] = module_shapes
+        if data.get("shapes_dir"):
+            params["shapes_dir"] = data["shapes_dir"]
         if params:
             module_def["params"] = params
         result.append(module_def)

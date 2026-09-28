@@ -5,6 +5,7 @@ try:
 except ImportError:
     unreal = cast(Any, None)
 
+from . import control_shapes, graph_utils
 from .context import RigContext
 from .logger import RigLogger
 from .metadata_reader import (
@@ -604,7 +605,34 @@ class RigBuilder:
         # Within the same depth, MODULE_BUILD_ORDER is the tiebreaker (FK < IK).
         detected_modules = _topological_sort(detected_modules, warn=self.warn)
 
+        # Controller shapes: import the per-shape FBXs exported from Maya and
+        # register them as a Control Rig shape library BEFORE any control is made.
+        if self.rig and detected_modules:
+            shape_ids, shapes_dir = set(), None
+            for module_definition in detected_modules:
+                params = module_definition.get("params") or {}
+                shape_ids.update((params.get("shape_table") or {}).keys())
+                shapes_dir = shapes_dir or params.get("shapes_dir")
+            if shape_ids:
+                preview_mesh = None
+                try:
+                    preview_mesh = self.rig.get_editor_property("preview_skeletal_mesh")
+                except Exception:
+                    pass
+                control_shapes.prepare_shape_library(
+                    self.rig, [skeletal_mesh, preview_mesh, skeleton], shape_ids, shapes_dir
+                )
+
         context = self.create_context()
+        if context:
+            removed_elements, removed_nodes = graph_utils.clear_generated_rig(
+                context.hierarchy, context.hierarchy_controller, context.graph_controller,
+                context.model, [m.get("module_name") for m in detected_modules],
+            )
+            self.logger.log(
+                f"[RigBuilder] Cleared previous build: {removed_elements} element(s), "
+                f"{removed_nodes} graph node(s)."
+            )
         self.logger.push("[RigBuilder] Building modules")
         built_modules = []
         for module_definition in detected_modules:

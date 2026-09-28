@@ -29,6 +29,40 @@ class RigContext:
         # never existed" from "parent existed but failed to build" from
         # "parent built fine but doesn't have that attach point".
         self._failed_module_names = set()
+        # Control names claimed in this build: name -> identity of the Maya
+        # controller (or the semantic name) that owns it.
+        self._claimed_names = {}
+        # Maya controller short name -> control key already built for it, so a
+        # controller used by several bones/modules becomes ONE control.
+        self.maya_controls = {}
+
+    def control_name(self, record, fallback):
+        """Control name for a Maya controller record: its Maya name when free.
+
+        Uses the record's ``ue_control_name`` or Maya ``name``. Falls back to
+        the semantic ``fallback`` when the Maya name is missing or already
+        taken by a different controller (Maya allows duplicate short names
+        under different groups; Control Rig does not).
+        """
+        from . import graph_utils
+
+        preferred = graph_utils.sanitize_name(
+            (record or {}).get("ue_control_name") or (record or {}).get("name") or ""
+        ) if record else ""
+        identity = (record or {}).get("dag_path") or (record or {}).get("name") or fallback
+        for candidate in (preferred, graph_utils.sanitize_name(fallback)):
+            if not candidate or candidate == "Module":
+                continue
+            owner = self._claimed_names.get(candidate)
+            if owner is None or owner == identity:
+                self._claimed_names[candidate] = identity
+                return candidate
+        # Both taken: make the fallback unique.
+        base, index = graph_utils.sanitize_name(fallback), 2
+        while f"{base}_{index}" in self._claimed_names:
+            index += 1
+        self._claimed_names[f"{base}_{index}"] = identity
+        return f"{base}_{index}"
 
     def _warn(self, message):
         if self.logger and hasattr(self.logger, "log"):
@@ -119,6 +153,21 @@ class RigContext:
             return None
 
         attach_point_name = parent_attach_point or "fk_tip_ctrl"
+
+        # A parent whose bones are moved by a solver (IK/FK limb) publishes
+        # "follow spaces": nulls tracking the FINAL bone transforms. Children
+        # parent to those so they follow whichever mode is active, instead of
+        # to a control that only reflects the FK pose.
+        follow_name = (
+            (self._module_results.get(parent_module_name) or {}).get("follow_spaces") or {}
+        ).get(attach_point_name)
+        if follow_name:
+            follow_key = unreal.RigElementKey(
+                type=unreal.RigElementType.NULL, name=str(follow_name)
+            )
+            if self.hierarchy.contains(follow_key):
+                return follow_key
+
         ctrl_name = self.get_attach_point(parent_module_name, attach_point_name)
         if not ctrl_name:
             available = list(

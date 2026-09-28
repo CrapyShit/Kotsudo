@@ -432,7 +432,7 @@ class SplineIKModule(RigModule):
         return {
             "module_type": cls.module_type,
             "chain": {
-                "min_length": 5,
+                "min_length": 4,
                 "max_length": None,
                 "exact_length": None,
                 "roles": [],
@@ -447,9 +447,9 @@ class SplineIKModule(RigModule):
         }
 
     def validate(self):
-        if len(self.chain) < 5:
+        if len(self.chain) < 4:
             raise RuntimeError(
-                f"SplineIK module '{self.name}' requires at least 5 bones, "
+                f"SplineIK module '{self.name}' requires at least 4 bones, "
                 f"got {len(self.chain)}."
             )
         if not self.context:
@@ -484,9 +484,28 @@ class SplineIKModule(RigModule):
             hierarchy, self.chain, fraction=0.35, multiplier=scale_multiplier
         )
         stretch_enabled = bool(recipe_data.get("StretchEnabled", True))
-        primary_axis = recipe_data.get("PrimaryAxis") or "X"
+        # The axis of each bone that runs along the chain is read from the
+        # imported skeleton. A hard-coded "X" twists every bone 90 degrees when
+        # the joints actually run along Y/Z (a Maya Y-up spine with no joint
+        # orient runs along +Y). An explicit recipe value still wins.
+        recipe_primary = recipe_data.get("PrimaryAxis")
+        derived_label, _derived_vector, derived_confidence = graph_utils.derive_chain_primary_axis(
+            hierarchy, self.chain
+        )
+        primary_axis = str(recipe_primary).upper() if recipe_primary else (derived_label or "X")
+        if recipe_primary and derived_label and str(recipe_primary).upper() != derived_label:
+            graph_utils._log_warning(
+                f"Spline '{self.name}': recipe PrimaryAxis {recipe_primary} disagrees with "
+                f"the skeleton's chain axis {derived_label}; the recipe value is used."
+            )
+        graph_utils._log_info(
+            f"Spline '{self.name}': primary axis {primary_axis} "
+            f"(skeleton {derived_label}, alignment {derived_confidence:.2f})."
+        )
         use_pole_vector = bool(recipe_data.get("UsePoleVector", False))
-        secondary_axis = recipe_data.get("SecondaryAxis") or "Y"
+        secondary_axis = graph_utils.pick_perpendicular_axis(
+            primary_axis, recipe_data.get("SecondaryAxis")
+        )
         sampling_precision = int(recipe_data.get("SamplingPrecision") or 16)
         squash_enabled = bool(recipe_data.get("SquashEnabled", False))
         squash_amount = max(0.0, min(1.0, float(recipe_data.get("SquashAmount") or 1.0)))
@@ -506,35 +525,60 @@ class SplineIKModule(RigModule):
         arc_lengths = _compute_arc_lengths(chain_positions)
         total_arc = arc_lengths[-1]
 
+        # If Maya's own spline controllers were exported, rebuild THOSE (same
+        # count, same places, same shapes) instead of evenly spaced stand-ins.
+        maya_plan = self._plan_maya_spline(hierarchy, recipe_data)
+
         ctrl_positions = []
-        for i in range(num_controls):
-            t = i / (num_controls - 1) if num_controls > 1 else 0.0
-            ctrl_positions.append(
-                _sample_arc_position(chain_positions, arc_lengths, t * total_arc)
-            )
+        if maya_plan:
+            ctrl_positions = list(maya_plan["positions"])
+            num_controls = len(ctrl_positions)
+        else:
+            for i in range(num_controls):
+                t = i / (num_controls - 1) if num_controls > 1 else 0.0
+                ctrl_positions.append(
+                    _sample_arc_position(chain_positions, arc_lengths, t * total_arc)
+                )
 
         # ------------------------------------------------------------------
         # 2. Create hierarchy controls
         # ------------------------------------------------------------------
         controls = []
+        control_keys = []
         attach_points = {
             "root": self.chain[0],
             "tip": self.chain[-1],
         }
 
         for i, position in enumerate(ctrl_positions):
-            ctrl_name = f"{module_prefix}_SplineCtrl{i:02d}_CTRL"
-            graph_utils.create_control(
+            record = maya_plan["records"][i] if maya_plan else None
+            ctrl_name = self.context.control_name(
+                record,
+                (record or {}).get("semantic_name") or f"{module_prefix}_SplineCtrl{i:02d}_CTRL",
+            )
+            ctrl_color = graph_utils.record_color(record, unreal.LinearColor(0.2, 0.8, 1.0, 1.0))
+            shape_name, shape_rotation, shape_scale = graph_utils.control_shapes.resolve_control_shape(
+                self.context.rig, recipe_data, record,
+                graph_utils.parent_global_rotation(hierarchy, parent_key),
+                "Circle_Thick", (control_scale, control_scale, control_scale),
+            )
+            control_key = graph_utils.create_control(
                 hierarchy,
                 hierarchy_controller,
                 parent_key,
                 ctrl_name,
                 position,
-                unreal.LinearColor(0.2, 0.8, 1.0, 1.0),
-                (control_scale, control_scale, control_scale),
-                shape_name="Circle_Thick",
+                ctrl_color,
+                shape_scale,
+                shape_name=shape_name,
+                shape_rotation=shape_rotation,
+            )
+            graph_utils.attach_record_attributes(
+                hierarchy, hierarchy_controller, control_key, record, ctrl_name,
+                position, ctrl_color,
             )
             controls.append(ctrl_name)
+            control_keys.append(control_key)
 
             if i == 0:
                 attach_points["spline_root_ctrl"] = ctrl_name
@@ -542,6 +586,22 @@ class SplineIKModule(RigModule):
                 attach_points["spline_tip_ctrl"] = ctrl_name
             if i == num_controls // 2:
                 attach_points["spline_mid_ctrl"] = ctrl_name
+
+        # Spline points that follow the controls. With Maya data each CV is a
+        # null riding on the control(s) that influence it, so the curve is
+        # driven exactly like the Maya one; otherwise the points are simply
+        # the control translations.
+        point_drivers = None
+        if maya_plan:
+            point_drivers = self._create_cv_drivers(
+                hierarchy, hierarchy_controller, module_prefix, maya_plan, control_keys
+            )
+            if point_drivers is None:
+                graph_utils._log_warning(
+                    f"Spline '{self.name}': CV drivers unavailable; the spline points "
+                    "will follow the control translations directly."
+                )
+        point_count = len(maya_plan["cvs"]) if point_drivers else num_controls
 
         # Optional pole-vector control, offset from the chain midpoint.
         pole_ctrl = None
@@ -573,29 +633,35 @@ class SplineIKModule(RigModule):
         spline_points_unit = _pick_spline_from_points_unit()
         fit_chain_unit = _pick_fit_chain_unit()
 
-        if spline_points_unit is not None and fit_chain_unit is not None and num_controls >= 4:
+        if spline_points_unit is not None and fit_chain_unit is not None and point_count >= 4:
             # ----- Node 1: Spline From Points (data-only, no exec pin) -----
             graph_utils.create_unit_node(
                 controller, model, spline_points_node, spline_points_unit,
                 unreal.Vector2D(x_origin, 100),
             )
 
-            get_ctrl_nodes = []
-            for i, ctrl_name in enumerate(controls):
-                get_node = f"{module_prefix}_GetSpCtrl{i:02d}"
-                graph_utils.create_unit_node(
-                    controller, model, get_node,
-                    unreal.RigUnit_GetControlTransform,
-                    unreal.Vector2D(x_origin - 350, 80 + i * 140),
+            if point_drivers:
+                source_pins = self._build_cv_sources(
+                    controller, model, module_prefix, maya_plan, point_drivers,
+                    x_origin, all_nodes,
                 )
-                graph_utils.set_pin_default(controller, model, f"{get_node}.Control", ctrl_name)
-                graph_utils.set_pin_default(controller, model, f"{get_node}.Space", "GlobalSpace")
-                get_ctrl_nodes.append(get_node)
-                all_nodes.append(get_node)
+            else:
+                get_ctrl_nodes = []
+                for i, ctrl_name in enumerate(controls):
+                    get_node = f"{module_prefix}_GetSpCtrl{i:02d}"
+                    graph_utils.create_unit_node(
+                        controller, model, get_node,
+                        unreal.RigUnit_GetControlTransform,
+                        unreal.Vector2D(x_origin - 350, 80 + i * 140),
+                    )
+                    graph_utils.set_pin_default(controller, model, f"{get_node}.Control", ctrl_name)
+                    graph_utils.set_pin_default(controller, model, f"{get_node}.Space", "GlobalSpace")
+                    get_ctrl_nodes.append(get_node)
+                    all_nodes.append(get_node)
+                source_pins = [f"{n}.Transform.Translation" for n in get_ctrl_nodes]
 
             points_pin = _find_pin_among(model, spline_points_node, ["Points"])
             if points_pin:
-                source_pins = [f"{n}.Transform.Translation" for n in get_ctrl_nodes]
                 _populate_vector_array_from_pins(
                     controller, model, spline_points_node, points_pin, source_pins
                 )
@@ -954,13 +1020,143 @@ class SplineIKModule(RigModule):
     # Recipe
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Maya spline data (exact controllers + CV influences)
+    # ------------------------------------------------------------------
+
+    def _plan_maya_spline(self, hierarchy, recipe_data):
+        """Resolve the exported Maya spline into UE positions, or None.
+
+        Returns {'records', 'positions', 'cvs'} where ``positions`` are the UE
+        world positions of the controllers and each cv entry gains 'position'.
+        Any position that cannot be resolved (missing data, axis mapping that
+        disagrees with the skeleton) abandons the whole plan so the module
+        falls back to evenly spaced controls instead of a half-Maya layout.
+        """
+        data = recipe_data.get("SplineData")
+        if not isinstance(data, dict):
+            return None
+        records = list(data.get("controls") or [])
+        cvs = [dict(cv) for cv in (data.get("cvs") or [])]
+        if not records or not cvs:
+            return None
+
+        positions = []
+        for record in records:
+            anchor = record.get("anchor_bone") or record.get("driven_bone") or self.chain[0]
+            position = graph_utils.controller_origin_position(
+                hierarchy, record, anchor, min_offset=0.0,
+                label=record.get("ue_control_name") or record.get("name"),
+            )
+            if position is None:
+                graph_utils._log_warning(
+                    f"Spline '{self.name}': could not place Maya controller "
+                    f"'{record.get('name')}'; using evenly spaced controls."
+                )
+                return None
+            positions.append(position)
+
+        for index, cv in enumerate(cvs):
+            position = graph_utils.controller_origin_position(
+                hierarchy, cv, cv.get("anchor_bone") or self.chain[0], min_offset=0.0,
+                label=f"{self.name} CV{index}",
+            )
+            if position is None:
+                graph_utils._log_warning(
+                    f"Spline '{self.name}': could not place curve CV {index}; "
+                    "using evenly spaced controls."
+                )
+                return None
+            cv["position"] = position
+            weights = list(cv.get("weights") or [])
+            if len(weights) != len(records):
+                return None
+
+        return {"records": records, "positions": positions, "cvs": cvs}
+
+    @staticmethod
+    def _influences_of(cv, limit=2, minimum=0.01):
+        """Indices of the controls influencing a CV, strongest first."""
+        weights = cv.get("weights") or []
+        order = sorted(range(len(weights)), key=lambda j: -float(weights[j]))
+        chosen = [j for j in order[:limit] if float(weights[j]) >= minimum]
+        return chosen or order[:1]
+
+    def _create_cv_drivers(self, hierarchy, hierarchy_controller, module_prefix, plan, control_keys):
+        """One null per (CV, influencing control), riding on that control.
+
+        Returns {(cv_index, control_index): null_name}, or None when nulls
+        cannot be created in this engine build.
+        """
+        drivers = {}
+        for cv_index, cv in enumerate(plan["cvs"]):
+            for control_index in self._influences_of(cv):
+                name = f"{module_prefix}_CV{cv_index:02d}_C{control_index:02d}_Pt"
+                created = graph_utils.create_offset_driver(
+                    hierarchy, hierarchy_controller, control_keys[control_index], name,
+                    unreal.Transform(location=cv["position"]),
+                )
+                if created is None:
+                    return None
+                drivers[(cv_index, control_index)] = created
+        return drivers
+
+    def _build_cv_sources(self, controller, model, module_prefix, plan, drivers, x_origin, all_nodes):
+        """Graph pins giving each spline point (one per Maya CV).
+
+        A CV influenced by two controls is a vector lerp between the two
+        driver nulls, weighted by the Maya skin weights.
+        """
+        lerp_unit = None
+        for candidate in ("RigUnit_MathVectorLerp", "RigUnit_MathVectorInterpolate", "RigUnit_MathVectorMix"):
+            if hasattr(unreal, candidate):
+                lerp_unit = getattr(unreal, candidate)
+                break
+
+        sources = []
+        for cv_index, cv in enumerate(plan["cvs"]):
+            influences = self._influences_of(cv)
+            pins = []
+            for slot, control_index in enumerate(influences):
+                node = f"{module_prefix}_CV{cv_index:02d}_C{control_index:02d}_Get"
+                graph_utils.create_transform_getter(
+                    controller, model, node,
+                    unreal.Vector2D(x_origin - 350, 60 + (cv_index * 2 + slot) * 100),
+                    None, drivers[(cv_index, control_index)],
+                )
+                all_nodes.append(node)
+                pins.append((f"{node}.Transform.Translation", float(cv["weights"][control_index])))
+
+            if len(pins) == 1 or lerp_unit is None:
+                sources.append(pins[0][0])
+                continue
+
+            lerp_node = f"{module_prefix}_CV{cv_index:02d}_Lerp"
+            graph_utils.create_unit_node(
+                controller, model, lerp_node, lerp_unit,
+                unreal.Vector2D(x_origin - 100, 60 + cv_index * 200),
+            )
+            graph_utils.connect_pins(controller, model, pins[0][0], f"{lerp_node}.A")
+            graph_utils.connect_pins(controller, model, pins[1][0], f"{lerp_node}.B")
+            total = pins[0][1] + pins[1][1]
+            graph_utils.set_any_pin(
+                controller, model, lerp_node, ["T", "Alpha", "Ratio", "W"],
+                str(round(pins[1][1] / total, 6) if total > 1e-9 else 0.0),
+            )
+            all_nodes.append(lerp_node)
+            result = _find_pin_among(model, lerp_node, ["Result", "Value", "ReturnValue"])
+            sources.append(f"{lerp_node}.{result}" if result else pins[0][0])
+        return sources
+
     def read_recipe(self):
         recipe_fields = {
             "ModuleType": None,
+            "SplineData": None,
+            "ShapeTable": None,
             "NumControls": 4,
             "ControlScale": 1.0,
             "StretchEnabled": True,
-            "PrimaryAxis": "X",
+            "PrimaryAxis": None,
             "UsePoleVector": False,
             "SecondaryAxis": "Y",
             "SamplingPrecision": 16,
@@ -969,6 +1165,8 @@ class SplineIKModule(RigModule):
         }
         fallback_names = {
             "ModuleType": ["module_type"],
+            "SplineData": ["spline", "spline_data", "splinedata"],
+            "ShapeTable": ["shape_table", "shapetable"],
             "NumControls": ["num_controls", "numcontrols", "ControlCount", "control_count"],
             "ControlScale": ["control_scale", "controlscale"],
             "StretchEnabled": ["stretch_enabled", "stretch", "Stretch"],

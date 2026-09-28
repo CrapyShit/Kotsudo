@@ -22,13 +22,28 @@ def _find_controller_record(recipe_data, *roles):
 
 
 def _source_control_name(record, fallback):
+    """Return a deterministic UE control name.
+
+    Maya permits duplicate short DAG names under different groups. Reusing the
+    source short name created one shared ``nurbsCircle1`` control for both legs,
+    so the second module silently reparented/repositioned the first module's
+    effector. Only an explicitly authored ``ue_control_name`` may override the
+    semantic module fallback.
+    """
+    explicit_name = (record or {}).get("ue_control_name")
+    if explicit_name:
+        return graph_utils.sanitize_name(explicit_name) or fallback
+    return fallback
+
+
+def _legacy_source_control_name(record):
     if not record or not record.get("name"):
-        return fallback
+        return None
     shape_types = {str(item).lower() for item in (record.get("shape_types") or [])}
     if not ({"nurbscurve", "beziercurve"} & shape_types):
-        return fallback
+        return None
     source_name = str(record["name"]).split("|")[-1].split(":")[-1]
-    return graph_utils.sanitize_name(source_name) or fallback
+    return graph_utils.sanitize_name(source_name) or None
 
 
 def _controller_color(record, fallback):
@@ -41,6 +56,33 @@ def _controller_color(record, fallback):
         except Exception:
             pass
     return fallback
+
+
+def _position_from_unreal_record(record):
+    """Read a controller position already converted to Unreal world space."""
+    if not record:
+        return None
+    value = record.get("unreal_world_position")
+    if value is None:
+        unreal_transform = record.get("unreal_world_transform") or {}
+        value = unreal_transform.get("translation")
+    return graph_utils.recipe_vector(value, None)
+
+
+def _position_from_recipe_world(recipe_data):
+    """Resolve a PV point in UE world space, including legacy Maya manifests."""
+    converted = recipe_data.get("PoleVectorUnrealWorldPosition")
+    if converted is not None:
+        return graph_utils.recipe_vector(converted, None)
+
+    raw = recipe_data.get("PoleVectorWorldPosition")
+    if raw is None:
+        return None
+    return graph_utils.source_vector_to_unreal(
+        raw,
+        coordinate_system=recipe_data.get("CoordinateSystem"),
+        apply_unit_scale=True,
+    )
 
 
 def _position_from_bone_local_record(hierarchy, record):
@@ -153,17 +195,20 @@ class IKModule(RigModule):
 
         module_prefix = graph_utils.sanitize_name(self.name)
         effector_record = _find_controller_record(recipe_data, "ik_effector", "effector")
-        effector_control_name = _source_control_name(
-            effector_record, f"{module_prefix}_IK_CTRL"
+        effector_control_name = self.context.control_name(
+            effector_record, _source_control_name(effector_record, f"{module_prefix}_IK_CTRL")
         )
 
-        effector_position = _position_from_bone_local_record(
-            hierarchy, effector_record
+        # The solver effector must start exactly on the imported end bone.
+        # Maya controller snapshots still provide display metadata, but their
+        # transform is not trusted as the solver target because offset groups
+        # and raw FBX metadata axes can place it away from the ankle/wrist.
+        effector_global_transform = graph_utils.get_bone_global_transform(
+            hierarchy, self.chain[-1]
         )
-        if effector_position is None:
-            effector_position = graph_utils.get_bone_global_position(
-                hierarchy, self.chain[-1]
-            )
+        effector_position = graph_utils.transform_to_location(
+            effector_global_transform
+        )
         parent_key = (
             self.context.get_parent_control_key(self.parent_module_name, self.parent_attach_point)
             or graph_utils.get_world_parent_key(hierarchy, hierarchy_controller)
@@ -177,13 +222,23 @@ class IKModule(RigModule):
             hierarchy, self.chain, fraction=0.12, multiplier=scale_multiplier
         )
 
-        graph_utils.create_control(
-            hierarchy, hierarchy_controller,
-            parent_key, effector_control_name, effector_position,
+        legacy_effector_name = _legacy_source_control_name(effector_record)
+        if legacy_effector_name and legacy_effector_name != effector_control_name:
+            graph_utils.remove_generated_control_if_present(
+                hierarchy, hierarchy_controller, legacy_effector_name
+            )
+
+        # Origin, exact shape and custom attributes of the Maya effector
+        # controller; the solver target stays the imported end bone, reached
+        # through a driver null when the controller sits away from it.
+        _effector_key, effector_driver = graph_utils.build_record_control(
+            self.context.rig, hierarchy, hierarchy_controller, recipe_data,
+            parent_key, effector_control_name, self.chain[-1], effector_global_transform,
+            effector_record,
             _controller_color(
                 effector_record, unreal.LinearColor(0.0, 0.7, 1.0, 1.0)
             ),
-            (effector_scale, effector_scale, effector_scale),
+            "Circle_Thick", (effector_scale, effector_scale, effector_scale),
         )
 
         get_effector_node = f"{module_prefix}_GetEffector"
@@ -191,13 +246,11 @@ class IKModule(RigModule):
 
         x_origin = self.context.claim_module_column()
 
-        graph_utils.create_unit_node(
+        graph_utils.create_transform_getter(
             controller, model, get_effector_node,
-            unreal.RigUnit_GetControlTransform,
             unreal.Vector2D(x_origin, 200),
+            effector_control_name, effector_driver,
         )
-        graph_utils.set_pin_default(controller, model, f"{get_effector_node}.Control", effector_control_name)
-        graph_utils.set_pin_default(controller, model, f"{get_effector_node}.Space", "GlobalSpace")
 
         all_controls = [effector_control_name]
         all_nodes = [get_effector_node]
@@ -234,7 +287,16 @@ class IKModule(RigModule):
             else f"{ik_node_name}.Execute"
         )
         graph_utils.connect_pins(controller, model, source_exec, target_exec)
-        self.context.set_exec_tail(ik_node_name)
+
+        # Follow space on the tip bone, updated after the solve, so children of
+        # the tip (toes, fingers) follow the solved limb.
+        tip_space, exec_tail = graph_utils.create_bone_follow_space(
+            hierarchy, hierarchy_controller, controller, model,
+            f"{module_prefix}_{graph_utils.sanitize_name(self.chain[-1])}_Follow",
+            self.chain[-1], graph_utils.get_bone_global_transform(hierarchy, self.chain[-1]),
+            unreal.Vector2D(x_origin + 1100, 200), ik_node_name,
+        )
+        self.context.set_exec_tail(exec_tail)
 
         if self.logger:
             self.logger.pop()
@@ -249,7 +311,7 @@ class IKModule(RigModule):
         if pole_ctrl:
             attach_points["pole_vector"] = pole_ctrl
 
-        return self.build_result(
+        return self._with_follow_spaces(self.build_result(
             controls=all_controls,
             nodes=all_nodes,
             attach_points=attach_points,
@@ -265,7 +327,13 @@ class IKModule(RigModule):
                 "resolved_solver_mode": solver_mode,
                 "create_pole_vector": bool(pole_ctrl),
             },
-        )
+        ), tip_space)
+
+    @staticmethod
+    def _with_follow_spaces(result, tip_space):
+        if tip_space:
+            result["follow_spaces"] = {"tip": tip_space, "fk_tip_ctrl": tip_space}
+        return result
 
     # ------------------------------------------------------------------
     # Solver builders
@@ -284,27 +352,55 @@ class IKModule(RigModule):
 
         pole_distance_scale = float(recipe_data.get("PoleDistanceScale") or 0.75)
         pole_record = _find_controller_record(recipe_data, "pole_vector", "pv")
-        pole_position = _position_from_bone_local_record(hierarchy, pole_record)
+
+        # Best: the controller's displacement from its anchor bone, re-added
+        # to the imported bone (immune to root/offset/unit differences and
+        # cross-checked against the skeleton). Then coordinates already
+        # converted by the Maya exporter -- raw Maya Y-up values cannot be
+        # consumed directly by a UE Z-up Control Rig.
+        pole_position = graph_utils.controller_origin_position(
+            hierarchy, pole_record, self.chain[1], min_offset=0.0,
+            label=f"{self.name} pole vector",
+        )
         if pole_position is None:
-            pole_position = _position_from_recipe_local(
-                hierarchy,
-                recipe_data.get("PoleVectorLocalPosition"),
-                recipe_data.get("PoleVectorAnchorBone") or self.chain[1],
-            )
+            pole_position = _position_from_unreal_record(pole_record)
+        if pole_position is None:
+            pole_position = _position_from_recipe_world(recipe_data)
+
+        # Compatibility fallbacks for schema-v3 manifests made before the
+        # explicit coordinate block was added.
+        if pole_position is None:
+            local_position = recipe_data.get("PoleVectorLocalPosition")
+            if local_position is not None:
+                converted_local = graph_utils.source_vector_to_unreal(
+                    local_position,
+                    coordinate_system=recipe_data.get("CoordinateSystem"),
+                    apply_unit_scale=True,
+                )
+                pole_position = _position_from_recipe_local(
+                    hierarchy,
+                    converted_local,
+                    recipe_data.get("PoleVectorAnchorBone") or self.chain[1],
+                )
         if pole_position is None:
             pole_position = graph_utils.compute_pole_vector(
                 self.chain, hierarchy, pole_distance_scale=pole_distance_scale
             )
+
         pole_control_name = _source_control_name(
             pole_record, f"{module_prefix}_PV_CTRL"
         )
+        legacy_pole_name = _legacy_source_control_name(pole_record)
+        if legacy_pole_name and legacy_pole_name != pole_control_name:
+            graph_utils.remove_generated_control_if_present(
+                hierarchy, hierarchy_controller, legacy_pole_name
+            )
 
-        graph_utils.create_control(
-            hierarchy, hierarchy_controller, parent_key, pole_control_name, pole_position,
-            _controller_color(
-                pole_record, unreal.LinearColor(0.4, 1.0, 0.3, 1.0)
-            ),
-            (pv_scale, pv_scale, pv_scale), shape_name=None,
+        # Sphere sized like the Maya pole controller, under its Maya name.
+        pole_control_name, _pole_key = graph_utils.build_pole_control(
+            self.context, parent_key, pole_control_name, pole_position, pole_record,
+            _controller_color(pole_record, unreal.LinearColor(0.4, 1.0, 0.3, 1.0)),
+            (pv_scale, pv_scale, pv_scale),
         )
 
         get_pole_node = f"{module_prefix}_GetPole"
@@ -346,15 +442,52 @@ class IKModule(RigModule):
         ):
             graph_utils.set_vector_pin(controller, model, f"{ik_node}.PoleVector", pole_position)
 
-        primary_axis = graph_utils.recipe_vector(recipe_data.get("PrimaryAxis"), unreal.Vector(1.0, 0.0, 0.0))
-        secondary_axis = graph_utils.recipe_vector(recipe_data.get("SecondaryAxis"), unreal.Vector(0.0, 1.0, 0.0))
+        coordinate_system = recipe_data.get("CoordinateSystem")
+        exported_primary = graph_utils.recipe_vector(
+            recipe_data.get("UnrealPrimaryAxis"), None
+        )
+        if exported_primary is None:
+            exported_primary = graph_utils.source_vector_to_unreal(
+                recipe_data.get("PrimaryAxis"),
+                coordinate_system=coordinate_system,
+                apply_unit_scale=False,
+            )
+        exported_secondary = graph_utils.recipe_vector(
+            recipe_data.get("UnrealSecondaryAxis"), None
+        )
+        if exported_secondary is None:
+            exported_secondary = graph_utils.source_vector_to_unreal(
+                recipe_data.get("SecondaryAxis"),
+                coordinate_system=coordinate_system,
+                apply_unit_scale=False,
+            )
+
+        fallback_primary = (
+            exported_primary
+            if exported_primary is not None
+            else unreal.Vector(1.0, 0.0, 0.0)
+        )
+        fallback_secondary = (
+            exported_secondary
+            if exported_secondary is not None
+            else unreal.Vector(0.0, 1.0, 0.0)
+        )
+        primary_axis, secondary_axis = graph_utils.derive_two_bone_axes(
+            hierarchy,
+            self.chain,
+            pole_position,
+            fallback_primary=fallback_primary,
+            fallback_secondary=fallback_secondary,
+        )
         pole_kind = str(recipe_data.get("PoleVectorKind") or "Location")
 
         graph_utils.set_vector_pin(controller, model, f"{ik_node}.PrimaryAxis", primary_axis)
         graph_utils.set_vector_pin(controller, model, f"{ik_node}.SecondaryAxis", secondary_axis)
         graph_utils.set_any_pin(controller, model, ik_node, ["SecondaryAxisWeight"], "1.0")
         graph_utils.set_any_pin(controller, model, ik_node, ["PoleVectorKind"], pole_kind)
-        graph_utils.set_any_pin(controller, model, ik_node, ["PoleVectorSpace"], "None")
+        # Leave PoleVectorSpace at its default empty RigElementKey. Basic IK
+        # operates in world space, so writing the string "None" into this
+        # struct pin is both unnecessary and version-fragile.
         graph_utils.set_any_pin(controller, model, ik_node, ["Weight"], "1.0")
         graph_utils.set_any_pin(controller, model, ik_node, ["PropagateToChildren"], "true")
         graph_utils.set_any_pin(controller, model, ik_node, ["BoneALength"], "0.0")
@@ -420,10 +553,16 @@ class IKModule(RigModule):
             "ControlScale": 1.0,
             "PrimaryAxis": None,
             "SecondaryAxis": None,
+            "UnrealPrimaryAxis": None,
+            "UnrealSecondaryAxis": None,
             "PoleVectorKind": "Location",
+            "PoleVectorWorldPosition": None,
+            "PoleVectorUnrealWorldPosition": None,
             "PoleVectorLocalPosition": None,
             "PoleVectorAnchorBone": None,
             "ControllerRecords": [],
+            "ShapeTable": None,
+            "CoordinateSystem": {},
             "PoleDistanceScale": 0.75,
             "EnableStretch": False,
             "StretchStartRatio": 1.0,
@@ -435,10 +574,18 @@ class IKModule(RigModule):
             "ControlScale": ["control_scale", "controlscale"],
             "PrimaryAxis": ["primary_axis", "primaryaxis"],
             "SecondaryAxis": ["secondary_axis", "secondaryaxis"],
+            "UnrealPrimaryAxis": ["unreal_primary_axis", "unrealprimaryaxis"],
+            "UnrealSecondaryAxis": ["unreal_secondary_axis", "unrealsecondaryaxis"],
             "PoleVectorKind": ["pole_vector_kind", "polevectorkind"],
+            "PoleVectorWorldPosition": ["pole_vector_world_position", "polevectorworldposition"],
+            "PoleVectorUnrealWorldPosition": [
+                "pole_vector_unreal_world_position", "polevectorunrealworldposition"
+            ],
             "PoleVectorLocalPosition": ["pole_vector_local_position", "polevectorlocalposition"],
             "PoleVectorAnchorBone": ["pole_vector_anchor_bone", "polevectoranchorbone"],
             "ControllerRecords": ["controller_records", "controllerrecords"],
+            "ShapeTable": ["shape_table", "shapetable"],
+            "CoordinateSystem": ["coordinate_system", "coordinatesystem"],
             "PoleDistanceScale": ["pole_distance_scale", "poledistancescale"],
             "EnableStretch": ["enable_stretch", "enablestretch"],
             "StretchStartRatio": ["stretch_start_ratio", "stretchstartratio"],
