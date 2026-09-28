@@ -8,12 +8,14 @@ except ImportError:
 from . import control_shapes, graph_utils
 from .context import RigContext
 from .logger import RigLogger
+from . import manifest_schema
 from .metadata_reader import (
     ROLE_ATTR,
     build_bone_attr_map,
     detect_modules,
     get_asset_metadata,
-    read_manifest_from_ue_metadata,
+    parse_manifest_modules,
+    read_manifest_document,
 )
 from .modules.fk_module import FKModule
 from .modules.ik_module import IKModule
@@ -95,6 +97,16 @@ class _MergedModuleRecipe:
         # __getattr__ only fires for attributes not already found normally,
         # so this never intercepts _data itself.
         return self.get_editor_property(name)
+
+# Solve stages, executed in this order every evaluation (one Sequence output
+# each). Within a stage, modules run in build order (parents first). A module
+# declares its stage with RigModule.solve_stage:
+#   spaces   -- global/COG controls and space switching
+#   primary  -- FK, IK, spline and constraint solvers (every module today)
+#   helpers  -- twist, half-rotation, pose readers: need final primary bones
+#   dynamics -- secondary motion on top of the animated pose
+#   curves   -- morph-target / curve drivers reading the final pose
+SOLVE_STAGES = ("spaces", "primary", "helpers", "dynamics", "curves")
 
 # Build order tiebreaker used within the same dependency depth level.
 # FK must execute before IK/IKFK so FK SetTransform with bPropagateToChildren=True
@@ -268,6 +280,7 @@ class RigBuilder:
         self.recipe_map = recipe_map or {}
         self.module_registry = module_registry or MODULE_REGISTRY
         self.logger = RigLogger()
+        self.manifest = None
 
     def warn(self, message):
         formatted_message = f"[RigBuilder] Warning: {message}"
@@ -555,6 +568,7 @@ class RigBuilder:
             logger=self.logger,
             parent_module_name=connections.get("parent_module"),
             parent_attach_point=connections.get("parent_attach_point"),
+            parent_bone=connections.get("parent_bone"),
         )
 
     def run(self):
@@ -570,7 +584,26 @@ class RigBuilder:
         # Primary: read the rich manifest embedded in the RIG_MANIFEST bone
         # (exported from Maya via tools/maya/export_rig_manifest.py).
         detected_modules = []
-        manifest_modules = read_manifest_from_ue_metadata(metadata)
+        manifest_modules = None
+        document = read_manifest_document(metadata)
+        if document is not None:
+            document, notes = manifest_schema.migrate(document)
+            for note in notes:
+                self.logger.log(f"[RigBuilder] Manifest migration: {note}")
+            errors, warnings = manifest_schema.validate_manifest(document)
+            for warning in warnings:
+                self.warn(f"Manifest: {warning}")
+            if errors:
+                raise RuntimeError(
+                    "Manifest failed validation; fix the Maya export and re-import:\n  "
+                    + "\n  ".join(errors[:25])
+                )
+            self.logger.log(
+                f"[RigBuilder] Manifest valid (schema v{document.get('schema_version')}, "
+                f"{len(warnings)} warning(s))."
+            )
+            self.manifest = document
+            manifest_modules = parse_manifest_modules(document)
         if manifest_modules is not None:
             detected_modules = [
                 m for m in manifest_modules
@@ -627,11 +660,25 @@ class RigBuilder:
         if context:
             removed_elements, removed_nodes = graph_utils.clear_generated_rig(
                 context.hierarchy, context.hierarchy_controller, context.graph_controller,
-                context.model, [m.get("module_name") for m in detected_modules],
+                context.model,
+                [m.get("module_name") for m in detected_modules] + [graph_utils.BUILDER_PREFIX],
             )
             self.logger.log(
                 f"[RigBuilder] Cleared previous build: {removed_elements} element(s), "
                 f"{removed_nodes} graph node(s)."
+            )
+            # Which module drives each bone: follow spaces emit their update
+            # right after that module (RigContext.follow_space).
+            context.bone_owner = {
+                bone: m["module_name"] for m in detected_modules for bone in (m.get("chain") or [])
+            }
+            stage_pins = graph_utils.create_solve_stages(
+                context.graph_controller, context.model,
+                graph_utils.find_forwards_solve_node_name(context.model), SOLVE_STAGES,
+            )
+            context.install_stages(stage_pins)
+            self.logger.log(
+                "[RigBuilder] Solve stages: " + (" > ".join(SOLVE_STAGES) if stage_pins else "single chain")
             )
         self.logger.push("[RigBuilder] Building modules")
         built_modules = []
@@ -663,6 +710,7 @@ class RigBuilder:
                 context.mark_failed(module_name)
                 continue
 
+            context.begin_stage(getattr(module_instance, "solve_stage", "primary"))
             try:
                 module_instance.validate()
                 result = module_instance.build()
@@ -673,7 +721,12 @@ class RigBuilder:
                     f"Skipping module '{module_name}' ({module_definition['module_type']}): {exc}"
                 )
                 context.mark_failed(module_name)
+            # Follow spaces waiting on this module's bones update now, after it.
+            context.module_finished(module_name)
 
+        if context:
+            context.begin_stage("primary")
+            context.flush_follow_spaces()
         self.logger.pop()
 
         if built_modules and self.rig:

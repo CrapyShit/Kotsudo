@@ -341,17 +341,7 @@ def _build_fallback_distributed_fk(
                     break
 
         # Wire execution.
-        source_exec = (
-            f"{prev_exec}.ExecuteContext"
-            if graph_utils.pin_exists(model, f"{prev_exec}.ExecuteContext")
-            else f"{prev_exec}.Execute"
-        )
-        target_exec = (
-            f"{set_node}.ExecuteContext"
-            if graph_utils.pin_exists(model, f"{set_node}.ExecuteContext")
-            else f"{set_node}.Execute"
-        )
-        graph_utils.connect_pins(controller, model, source_exec, target_exec)
+        graph_utils.connect_exec(controller, model, prev_exec, set_node)
         prev_exec = set_node
         nodes.append(set_node)
 
@@ -502,6 +492,7 @@ class SplineIKModule(RigModule):
             f"Spline '{self.name}': primary axis {primary_axis} "
             f"(skeleton {derived_label}, alignment {derived_confidence:.2f})."
         )
+        graph_utils.check_chain_axes(self.name, recipe_data.get("ChainAxes"), measured_aim=derived_label)
         use_pole_vector = bool(recipe_data.get("UsePoleVector", False))
         secondary_axis = graph_utils.pick_perpendicular_axis(
             primary_axis, recipe_data.get("SecondaryAxis")
@@ -510,10 +501,7 @@ class SplineIKModule(RigModule):
         squash_enabled = bool(recipe_data.get("SquashEnabled", False))
         squash_amount = max(0.0, min(1.0, float(recipe_data.get("SquashAmount") or 1.0)))
 
-        parent_key = (
-            self.context.get_parent_control_key(self.parent_module_name, self.parent_attach_point)
-            or graph_utils.get_world_parent_key(hierarchy, hierarchy_controller)
-        )
+        parent_key = self.default_parent_key()
 
         # ------------------------------------------------------------------
         # 1. Compute arc-length-distributed control positions along the chain
@@ -557,21 +545,34 @@ class SplineIKModule(RigModule):
                 (record or {}).get("semantic_name") or f"{module_prefix}_SplineCtrl{i:02d}_CTRL",
             )
             ctrl_color = graph_utils.record_color(record, unreal.LinearColor(0.2, 0.8, 1.0, 1.0))
+            # Maya hierarchy (e.g. chest_ctrl under Pelvis_IKctrl) and the
+            # animator control's own orientation when exported.
+            ctrl_parent = self.context.resolve_control_parent(record, parent_key)
+            maya_rotation = graph_utils.record_rotation(record)
+            placement = None
+            if maya_rotation is not None:
+                placement = unreal.Transform(location=position)
+                placement.rotation = maya_rotation
+            control_rotation = (
+                maya_rotation if maya_rotation is not None
+                else graph_utils.parent_global_rotation(hierarchy, ctrl_parent)
+            )
             shape_name, shape_rotation, shape_scale = graph_utils.control_shapes.resolve_control_shape(
-                self.context.rig, recipe_data, record,
-                graph_utils.parent_global_rotation(hierarchy, parent_key),
+                self.context.rig, recipe_data, record, control_rotation,
                 "Circle_Thick", (control_scale, control_scale, control_scale),
             )
             control_key = graph_utils.create_control(
                 hierarchy,
                 hierarchy_controller,
-                parent_key,
+                ctrl_parent,
                 ctrl_name,
                 position,
                 ctrl_color,
                 shape_scale,
                 shape_name=shape_name,
                 shape_rotation=shape_rotation,
+                global_transform=placement,
+                locked_channels=(record or {}).get("locked_channels"),
             )
             graph_utils.attach_record_attributes(
                 hierarchy, hierarchy_controller, control_key, record, ctrl_name,
@@ -744,18 +745,9 @@ class SplineIKModule(RigModule):
                 ["PropagateToChildren", "bPropagateToChildren"], "True"
             )
 
-            exec_tail = self.context.get_exec_tail() or forwards_solve
-            source_exec = (
-                f"{exec_tail}.ExecuteContext"
-                if graph_utils.pin_exists(model, f"{exec_tail}.ExecuteContext")
-                else f"{exec_tail}.Execute"
+            graph_utils.connect_exec(
+                controller, model, self.context.get_exec_tail() or forwards_solve, fit_chain_node
             )
-            target_exec = (
-                f"{fit_chain_node}.ExecuteContext"
-                if graph_utils.pin_exists(model, f"{fit_chain_node}.ExecuteContext")
-                else f"{fit_chain_node}.Execute"
-            )
-            graph_utils.connect_pins(controller, model, source_exec, target_exec)
             self.context.set_exec_tail(fit_chain_node)
             all_nodes.append(fit_chain_node)
             primary_node = fit_chain_node
@@ -1007,10 +999,7 @@ class SplineIKModule(RigModule):
                     f"{mul_node}.{mul_out}", f"{set_node}.{value_prefix}.Scale3D.{axis}")
                 nodes.append(mul_node)
 
-            graph_utils.connect_pins(controller, model,
-                f"{exec_tail}.ExecuteContext" if graph_utils.pin_exists(model, f"{exec_tail}.ExecuteContext") else f"{exec_tail}.Execute",
-                f"{set_node}.ExecuteContext" if graph_utils.pin_exists(model, f"{set_node}.ExecuteContext") else f"{set_node}.Execute",
-            )
+            graph_utils.connect_exec(controller, model, exec_tail, set_node)
             exec_tail = set_node
             nodes.append(set_node)
 
@@ -1153,6 +1142,7 @@ class SplineIKModule(RigModule):
             "ModuleType": None,
             "SplineData": None,
             "ShapeTable": None,
+            "ChainAxes": None,
             "NumControls": 4,
             "ControlScale": 1.0,
             "StretchEnabled": True,
@@ -1166,6 +1156,7 @@ class SplineIKModule(RigModule):
         fallback_names = {
             "ModuleType": ["module_type"],
             "SplineData": ["spline", "spline_data", "splinedata"],
+            "ChainAxes": ["chain_axes"],
             "ShapeTable": ["shape_table", "shapetable"],
             "NumControls": ["num_controls", "numcontrols", "ControlCount", "control_count"],
             "ControlScale": ["control_scale", "controlscale"],

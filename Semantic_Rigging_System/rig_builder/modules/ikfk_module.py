@@ -124,10 +124,7 @@ class IKFKModule(RigModule):
             hierarchy, self.chain, fraction=0.22, multiplier=scale_mult
         )
 
-        parent_key = (
-            self.context.get_parent_control_key(self.parent_module_name, self.parent_attach_point)
-            or graph_utils.get_world_parent_key(hierarchy, hierarchy_controller)
-        )
+        parent_key = self.default_parent_key()
 
         x_origin = self.context.claim_module_column(width=1600)
 
@@ -154,7 +151,8 @@ class IKFKModule(RigModule):
             fk_ctrl = self.context.control_name(record, fk_ctrl)
             fk_key, driver_null = graph_utils.build_record_control(
                 self.context.rig, hierarchy, hierarchy_controller, recipe_data,
-                prev_fk_key, fk_ctrl, bone_name, bone_transform, record,
+                self.context.resolve_control_parent(record, prev_fk_key),
+                fk_ctrl, bone_name, bone_transform, record,
                 graph_utils.record_color(record, fk_color),
                 "Circle_Thick", (fk_scale, fk_scale, fk_scale), shape_rot,
             )
@@ -182,7 +180,8 @@ class IKFKModule(RigModule):
         ik_effector_ctrl = self.context.control_name(effector_record, f"{module_prefix}_IK_CTRL")
         ik_effector_key, effector_driver = graph_utils.build_record_control(
             self.context.rig, hierarchy, hierarchy_controller, recipe_data,
-            parent_key, ik_effector_ctrl, self.chain[-1], tip_transform, effector_record,
+            self.context.resolve_control_parent(effector_record, parent_key),
+            ik_effector_ctrl, self.chain[-1], tip_transform, effector_record,
             graph_utils.record_color(effector_record, ik_color),
             "Circle_Thick", (ik_scale, ik_scale, ik_scale),
         )
@@ -319,19 +318,15 @@ class IKFKModule(RigModule):
         _chain_exec(controller, model, exec_tail, ik_node)
         exec_tail = ik_node
 
-        # Follow spaces: one null per chain bone, updated from the FINAL
-        # (post-solve) bone transform, so child modules (toes, fingers) track
-        # the limb in IK as well as in FK instead of the FK controls only.
-        follow_bones = {}
-        for idx, bone_name in enumerate(self.chain):
-            space_name, exec_tail = graph_utils.create_bone_follow_space(
-                hierarchy, hierarchy_controller, controller, model,
-                f"{module_prefix}_{graph_utils.sanitize_name(bone_name)}_Follow",
-                bone_name, graph_utils.get_bone_global_transform(hierarchy, bone_name),
-                unreal.Vector2D(ik_col + 700, 700 + idx * 220), exec_tail,
+        # Show only the controls of the active mode (IK controls hidden in
+        # full FK and vice versa); both sets while blending.
+        if switch_control and graph_utils.recipe_bool(recipe_data.get("SwitchDrivesVisibility"), True):
+            exec_tail = self._build_switch_visibility(
+                controller, model, module_prefix, exec_tail, ik_col,
+                fk_controls, [ik_effector_ctrl, ik_pole_ctrl],
             )
-            if space_name:
-                follow_bones[idx] = space_name
+        # Children of this limb (toes, fingers...) follow its solved bones
+        # through follow spaces the context creates on demand.
         self.context.set_exec_tail(exec_tail)
 
         if self.logger:
@@ -355,7 +350,7 @@ class IKFKModule(RigModule):
         attach_pts["fk_mid_ctrl"] = fk_controls[1]
         attach_pts["fk_tip_ctrl"] = fk_controls[-1]
 
-        result = self.build_result(
+        return self.build_result(
             controls=all_controls,
             nodes=all_nodes,
             attach_points=attach_pts,
@@ -374,18 +369,59 @@ class IKFKModule(RigModule):
                 "default_blend": default_blend,
             },
         )
-        # attach-point name -> follow null, per chain index
-        aliases = {
-            0: ("root", "fk_root_ctrl", "fk_ctrl_0"),
-            1: ("mid", "fk_mid_ctrl", "fk_ctrl_1"),
-            2: ("tip", "fk_tip_ctrl", "fk_ctrl_2"),
+
+    # ------------------------------------------------------------------
+    # Control visibility from the switch
+    # ------------------------------------------------------------------
+
+    def _build_switch_visibility(self, controller, model, prefix, exec_tail, ik_col,
+                                 fk_controls, ik_controls):
+        """Set Control Visibility on FK and IK controls from the switch value.
+
+        The switch channel holds the Maya attribute value (IK/FK polarity
+        taken from the export). FK controls are shown while the FK weight is
+        above zero, IK controls while the IK weight is above zero, so both
+        sets are visible mid-blend. Skipped with a warning when this engine
+        lacks the units.
+        """
+        out_pin = getattr(self, "_switch_out_pin", None)
+        visibility_unit = getattr(unreal, "RigUnit_SetControlVisibility", None)
+        greater = _pick_unit(("RigVMFunction_MathFloatGreater", "RigUnit_MathFloatGreater"))
+        less = _pick_unit(("RigVMFunction_MathFloatLess", "RigUnit_MathFloatLess"))
+        if not (out_pin and visibility_unit and greater and less):
+            _log_warning(f"{self.name}: switch-driven visibility unavailable in this engine build; skipped.")
+            return exec_tail
+
+        ik_value = float(getattr(self, "_switch_ik_value", 1.0))
+        fk_value = float(getattr(self, "_switch_fk_value", 0.0))
+        epsilon = 0.001 * max(abs(ik_value - fk_value), 1e-6)
+        # "IK weight > 0" means the value has left fk_value toward ik_value.
+        tests = {
+            "IK": (greater if ik_value > fk_value else less, fk_value + epsilon if ik_value > fk_value else fk_value - epsilon),
+            "FK": (less if ik_value > fk_value else greater, ik_value - epsilon if ik_value > fk_value else ik_value + epsilon),
         }
-        result["follow_spaces"] = {
-            alias: follow_bones[idx]
-            for idx, names in aliases.items() if idx in follow_bones
-            for alias in names
-        }
-        return result
+        compare_pins = {}
+        for mode, (unit, threshold) in tests.items():
+            node = f"{prefix}_{mode}Visible"
+            graph_utils.create_unit_node(controller, model, node, unit, unreal.Vector2D(ik_col + 700, 700 + len(compare_pins) * 160))
+            graph_utils.connect_pins(controller, model, out_pin, f"{node}.A")
+            graph_utils.set_pin_default(controller, model, f"{node}.B", str(threshold))
+            compare_pins[mode] = f"{node}.Result"
+
+        for index, (mode, names) in enumerate((("FK", fk_controls), ("IK", ik_controls))):
+            for offset, control_name in enumerate(n for n in names if n):
+                node = f"{prefix}_{graph_utils.sanitize_name(control_name)}_Vis"
+                graph_utils.create_unit_node(
+                    controller, model, node, visibility_unit,
+                    unreal.Vector2D(ik_col + 1000, 700 + (index * 4 + offset) * 160),
+                )
+                graph_utils.set_key_pin(controller, model, node, ["Item"], "Control", control_name)
+                for visible_pin in ("bVisible", "Visible"):
+                    if graph_utils.connect_pins(controller, model, compare_pins[mode], f"{node}.{visible_pin}"):
+                        break
+                graph_utils.connect_exec(controller, model, exec_tail, node)
+                exec_tail = node
+        return exec_tail
 
     # ------------------------------------------------------------------
     # IK/FK switch control
@@ -450,8 +486,13 @@ class IKFKModule(RigModule):
                 graph_utils.get_transform_rotation(placement),
                 "Circle_Thick", (scale, scale, scale),
             )
+            # Maya: the switch group is parent-constrained between the IK and
+            # FK controls by the switch itself, i.e. it follows the blended
+            # limb -- resolve_control_parent maps that to the follow space of
+            # the bone the group tracks.
+            host_parent = self.context.resolve_control_parent(record, parent_key)
             host_key = graph_utils.create_control(
-                hierarchy, hierarchy_controller, parent_key, host_name, position, color,
+                hierarchy, hierarchy_controller, host_parent, host_name, position, color,
                 shape_scale, shape_name=shape_name, shape_rotation=shape_rotation,
                 global_transform=placement,
                 locked_channels=record.get("locked_channels"),
@@ -500,6 +541,11 @@ class IKFKModule(RigModule):
                 f"'{lerp_node}' (IK={ik_value}, FK={fk_value}, "
                 f"inputs {'swapped' if invert_inputs else 'kept'})."
             )
+            self._switch_out_pin = out_pin
+            # The channel is 0..1 with IK at 0 when the inputs are swapped
+            # (Maya "IK:FK" enum), IK at 1 otherwise (incl. normalised sliders).
+            self._switch_ik_value = 0.0 if invert_inputs else 1.0
+            self._switch_fk_value = 1.0 - self._switch_ik_value
             return control_name, invert_inputs
         except Exception as exc:
             _log_warning(f"Could not build the IK/FK switch control for '{self.name}': {exc}")
@@ -639,6 +685,11 @@ class IKFKModule(RigModule):
             fallback_primary=fallback_primary,
             fallback_secondary=fallback_secondary,
         )
+        graph_utils.check_chain_axes(
+            self.name, recipe_data.get("ChainAxes"),
+            measured_aim=graph_utils.vector_axis_label(primary_axis),
+            measured_up=graph_utils.measure_chain_bend_label(hierarchy, self.chain),
+        )
         pole_kind = str(recipe_data.get("PoleVectorKind") or "Location")
 
         _set_vector_pin(controller, model, f"{ik_node}.PrimaryAxis", primary_axis)
@@ -696,11 +747,15 @@ class IKFKModule(RigModule):
             "ControllerRecords": None,
             "ShapeTable": None,
             "Switch": None,
+            "SwitchDrivesVisibility": True,
+            "ChainAxes": None,
         }
         fallback_names = {
             "ControllerRecords": ["controller_records", "controllerrecords"],
             "ShapeTable": ["shape_table", "shapetable"],
             "Switch": ["switch"],
+            "SwitchDrivesVisibility": ["switch_drives_visibility"],
+            "ChainAxes": ["chain_axes"],
             "ModuleType": ["module_type"],
             "ControlScale": ["control_scale", "controlscale"],
             "PrimaryAxis": ["primary_axis", "primaryaxis"],
@@ -721,18 +776,16 @@ class IKFKModule(RigModule):
 
 
 def _chain_exec(controller, model, from_node, to_node):
-    """Connect execution from from_node to to_node."""
-    src = (
-        f"{from_node}.ExecuteContext"
-        if graph_utils.pin_exists(model, f"{from_node}.ExecuteContext")
-        else f"{from_node}.Execute"
-    )
-    dst = (
-        f"{to_node}.ExecuteContext"
-        if graph_utils.pin_exists(model, f"{to_node}.ExecuteContext")
-        else f"{to_node}.Execute"
-    )
-    graph_utils.connect_pins(controller, model, src, dst)
+    """Connect execution from from_node (node or exec pin) to to_node."""
+    graph_utils.connect_exec(controller, model, from_node, to_node)
+
+
+def _pick_unit(candidates):
+    for name in candidates:
+        unit = getattr(unreal, name, None)
+        if unit is not None:
+            return unit
+    return None
 
 
 def _title_matches_expected(title, expected_title_contains) -> bool:

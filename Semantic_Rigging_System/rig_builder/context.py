@@ -35,6 +35,185 @@ class RigContext:
         # Maya controller short name -> control key already built for it, so a
         # controller used by several bones/modules becomes ONE control.
         self.maya_controls = {}
+        # Maya controller short name -> UE control name chosen for it.
+        self._maya_name_map = {}
+
+        # Follow spaces (see follow_space): bone -> null name, bones whose
+        # update waits for their owning module, and bone -> owning module.
+        self._follow_spaces = {}
+        self._pending_follow = {}
+        self.bone_owner = {}
+        self._finished_modules = set()
+
+        # Solve stages (see begin_stage). When the builder installs a stage
+        # Sequence node, each stage has its own exec tail; otherwise a single
+        # chain is used, as before.
+        self._stage_tails = {}
+        self._stage = None
+
+    # ------------------------------------------------------------------
+    # Parents: Maya hierarchy, driven spaces, follow spaces
+    # ------------------------------------------------------------------
+
+    def control_key_for_maya(self, maya_name):
+        """Key of the UE control built for a Maya controller, or None."""
+        if not maya_name:
+            return None
+        key = self.maya_controls.get(maya_name)
+        if key is not None and self.hierarchy.contains(key):
+            return key
+        name = self._maya_name_map.get(maya_name)
+        if name:
+            key = unreal.RigElementKey(type=unreal.RigElementType.CONTROL, name=str(name))
+            if self.hierarchy.contains(key):
+                return key
+        return None
+
+    def world_key(self):
+        from . import graph_utils
+        return graph_utils.get_world_parent_key(self.hierarchy, self.hierarchy_controller)
+
+    def resolve_control_parent(self, record, default_key):
+        """Parent for the UE control of a Maya controller record.
+
+        1. The nearest Maya parent controller (through static groups) that
+           exists in the rebuilt rig -- the Maya hierarchy, exactly.
+        2. A driven space (constraint/blend/driven-key group) between the
+           controller and its parent: follow the bone that group tracks, so
+           the control follows the solved result (e.g. a foot FK control
+           blended between the IK and FK controls, the IK/FK switch).
+        3. Maya parents exist but none was built: world, as in Maya's own
+           top-level controls.
+        Records without this data (older manifests) keep ``default_key``.
+        """
+        if not record or "parent_controllers" not in record:
+            return default_key
+        for name in record.get("parent_controllers") or []:
+            key = self.control_key_for_maya(name)
+            if key is not None:
+                return key
+        space_bone = self._acyclic_space_bone(record, record.get("parent_space_bone"))
+        if space_bone:
+            key = self.follow_space(space_bone)
+            if key is not None:
+                return key
+            return default_key
+        return self.world_key()
+
+    # Records whose transform does not move any bone (a settings control only
+    # carries channels), so following any bone is safe for them.
+    _NON_DRIVING_ROLES = ("settings",)
+
+    def _bone_parent(self, bone):
+        from . import graph_utils
+
+        key = graph_utils.make_key(unreal.RigElementType.BONE, bone)
+        try:
+            parent = self.hierarchy.get_first_parent(key)
+        except Exception:
+            try:
+                parents = self.hierarchy.get_parents(key) or []
+                parent = parents[0] if parents else None
+            except Exception:
+                parent = None
+        if parent is None or str(parent.name) in ("", "None"):
+            return None
+        if getattr(parent, "type", None) != unreal.RigElementType.BONE:
+            return None
+        return str(parent.name)
+
+    def _acyclic_space_bone(self, record, space_bone):
+        """``space_bone`` unless following it would make a control follow a
+        bone it drives itself (control -> bone -> follow space -> control, a
+        feedback loop that runs away as soon as anything moves).
+
+        Such a space is replaced by the parent of the control's driven bone:
+        the nearest space outside the control's own influence (a petal
+        control follows the head, a toe control the ankle).
+        """
+        if not space_bone:
+            return space_bone
+        space_bone = str(space_bone).split("|")[-1]
+        driven = str(record.get("driven_bone") or "").split("|")[-1]
+        if not driven or str(record.get("role") or "") in self._NON_DRIVING_ROLES:
+            return space_bone
+        current, depth = space_bone, 0
+        while current and depth < 256:
+            if current == driven:
+                replacement = self._bone_parent(driven)
+                print(
+                    f"[RigBuilder] Controller '{record.get('name')}': parent space bone "
+                    f"'{space_bone}' is driven by the control itself; following "
+                    f"'{replacement or 'world'}' instead."
+                )
+                return replacement
+            current, depth = self._bone_parent(current), depth + 1
+        return space_bone
+
+    def follow_space(self, bone):
+        """A null that tracks ``bone``'s FINAL transform every evaluation.
+
+        Created once per bone, on demand. Its update runs right after the
+        module that drives the bone: immediately when that module is already
+        built (or no module owns the bone), otherwise when it finishes
+        (module_finished). Returns the null's key, or None.
+        """
+        from . import graph_utils
+
+        bone = str(bone).split("|")[-1]
+        name = self._follow_spaces.get(bone)
+        if name is None:
+            bone_key = graph_utils.make_key(unreal.RigElementType.BONE, bone)
+            if not self.hierarchy.contains(bone_key):
+                return None
+            name = graph_utils.create_follow_null(
+                self.hierarchy, self.hierarchy_controller, f"RB_{graph_utils.sanitize_name(bone)}_Follow",
+                graph_utils.get_bone_global_transform(self.hierarchy, bone), self.world_key(),
+            )
+            if not name:
+                return None
+            self._follow_spaces[bone] = name
+            owner = self.bone_owner.get(bone)
+            if owner and owner not in self._finished_modules:
+                self._pending_follow.setdefault(owner, []).append(bone)
+            else:
+                self._emit_follow_update(bone)
+        return unreal.RigElementKey(type=unreal.RigElementType.NULL, name=str(name))
+
+    def _emit_follow_update(self, bone):
+        from . import graph_utils
+
+        name = self._follow_spaces[bone]
+        tail = self.get_exec_tail() or graph_utils.find_forwards_solve_node_name(self.model)
+        position = unreal.Vector2D(self.claim_module_column(width=700), -400)
+        self.set_exec_tail(graph_utils.add_follow_update(
+            self.graph_controller, self.model, name, bone, position, tail,
+        ))
+
+    def module_finished(self, module_name):
+        """Called by the builder after a module is built (or failed)."""
+        self._finished_modules.add(module_name)
+        for bone in self._pending_follow.pop(module_name, []):
+            self._emit_follow_update(bone)
+
+    def flush_follow_spaces(self):
+        """Emit every still-pending update (owner failed or never built)."""
+        for owner in list(self._pending_follow):
+            for bone in self._pending_follow.pop(owner):
+                self._warn(f"Follow space of '{bone}' updated without its module '{owner}'.")
+                self._emit_follow_update(bone)
+
+    # ------------------------------------------------------------------
+    # Solve stages
+    # ------------------------------------------------------------------
+
+    def install_stages(self, stage_pins):
+        """{stage: exec pin} from the builder's Sequence node."""
+        self._stage_tails = dict(stage_pins)
+
+    def begin_stage(self, stage):
+        """Route get/set_exec_tail to ``stage`` (no-op without stages)."""
+        self._stage = stage if stage in self._stage_tails else None
 
     def control_name(self, record, fallback):
         """Control name for a Maya controller record: its Maya name when free.
@@ -50,19 +229,29 @@ class RigContext:
             (record or {}).get("ue_control_name") or (record or {}).get("name") or ""
         ) if record else ""
         identity = (record or {}).get("dag_path") or (record or {}).get("name") or fallback
+        chosen = None
         for candidate in (preferred, graph_utils.sanitize_name(fallback)):
             if not candidate or candidate == "Module":
                 continue
             owner = self._claimed_names.get(candidate)
             if owner is None or owner == identity:
                 self._claimed_names[candidate] = identity
-                return candidate
-        # Both taken: make the fallback unique.
-        base, index = graph_utils.sanitize_name(fallback), 2
-        while f"{base}_{index}" in self._claimed_names:
-            index += 1
-        self._claimed_names[f"{base}_{index}"] = identity
-        return f"{base}_{index}"
+                chosen = candidate
+                break
+        if chosen is None:
+            # Both taken: make the fallback unique.
+            base, index = graph_utils.sanitize_name(fallback), 2
+            while f"{base}_{index}" in self._claimed_names:
+                index += 1
+            chosen = f"{base}_{index}"
+            self._claimed_names[chosen] = identity
+        for maya_name in (
+            (record or {}).get("name"), (record or {}).get("ue_control_name"),
+            (record or {}).get("shape_source"),
+        ):
+            if maya_name:
+                self._maya_name_map.setdefault(maya_name, chosen)
+        return chosen
 
     def _warn(self, message):
         if self.logger and hasattr(self.logger, "log"):
@@ -85,12 +274,18 @@ class RigContext:
     # ------------------------------------------------------------------
 
     def get_exec_tail(self):
-        """Return the current last node in the exec chain, or None (caller uses ForwardsSolve)."""
+        """Current last node (or stage exec pin) of the active chain, or None
+        (the caller then starts from Forwards Solve)."""
+        if self._stage is not None:
+            return self._stage_tails[self._stage]
         return self._exec_tail
 
     def set_exec_tail(self, node_name):
-        """Advance the exec chain tail after a module finishes building."""
-        self._exec_tail = node_name
+        """Advance the active chain after appending nodes."""
+        if self._stage is not None:
+            self._stage_tails[self._stage] = node_name
+        else:
+            self._exec_tail = node_name
 
     def claim_module_column(self, width=900):
         """Reserve a horizontal column for one module's nodes and advance the cursor.

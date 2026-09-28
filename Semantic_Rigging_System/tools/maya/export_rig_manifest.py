@@ -18,9 +18,11 @@ Detection principle: all module type decisions come from Maya node types,
 connections, and constraint queries -- never from joint/control names.
 """
 
+import importlib
 import json
 import os
 import re
+import sys
 
 import maya.cmds as cmds
 import maya.mel as mel
@@ -30,7 +32,9 @@ import maya.mel as mel
 # ---------------------------------------------------------------------------
 ROOT_JOINT_NAME = "root"
 MANIFEST_ATTR = "rig_manifest_json"
-MANIFEST_SCHEMA_VERSION = 5
+# 6: world mapping (X, Z, Y) fixed, joint-local offsets, per-chain axes,
+#    parent_controllers / parent_space_bone, schema + units blocks.
+MANIFEST_SCHEMA_VERSION = 6
 
 # Bypass flags for constraint detection (useful when a bone has constraints
 # for specific rigging reasons but shouldn't be analyzed for module detection)
@@ -332,6 +336,9 @@ def _coordinate_system_manifest():
         'target_handedness': 'LeftHanded',
         'target_linear_unit': 'cm',
         'vector_mapping': 'X,-Y,Z' if up_axis == 'z' else 'X,Z,Y',
+        # Joint-local vectors (offset_local, reference_local, axes *_unreal):
+        # the importer keeps joint frames and mirrors them to left-handed.
+        'joint_local_mapping': 'X,-Y,Z',
     }
 
 
@@ -372,19 +379,23 @@ def _signed_primary_axis(chain):
 
 
 def _world_point_to_node_local(world_position, node):
-    """Convert a Maya world-space point into *node* local coordinates."""
+    """A Maya world-space point on *node*'s local axes (Maya UI units).
+
+    See _joint_local_unreal for why the matrix translation is not used
+    (internal cm vs UI units).
+    """
     if not world_position or not node or not cmds.objExists(node):
         return None
     try:
-        import maya.api.OpenMaya as om2
-        world_matrix = om2.MMatrix(cmds.xform(node, query=True, worldSpace=True, matrix=True))
-        local_point = om2.MPoint(
-            float(world_position[0]),
-            float(world_position[1]),
-            float(world_position[2]),
-            1.0,
-        ) * world_matrix.inverse()
-        return _round_vector([local_point.x, local_point.y, local_point.z])
+        matrix = cmds.xform(node, query=True, worldSpace=True, matrix=True)
+        origin = cmds.xform(node, query=True, worldSpace=True, translation=True)
+        delta = [float(world_position[i]) - float(origin[i]) for i in range(3)]
+        local = []
+        for row in range(3):
+            axis = [matrix[row * 4 + i] for i in range(3)]
+            length = sum(c * c for c in axis) ** 0.5 or 1.0
+            local.append(sum(delta[i] * axis[i] for i in range(3)) / length)
+        return _round_vector(local)
     except Exception:
         return None
 
@@ -825,6 +836,151 @@ def _parent_controller(node):
     return _short_node_name(controller) if controller else None
 
 
+_DRIVEN_ATTRS = (
+    'translate', 'rotate', 'scale', 'offsetParentMatrix',
+    'translateX', 'translateY', 'translateZ',
+    'rotateX', 'rotateY', 'rotateZ',
+)
+
+
+def _space_drivers(node):
+    """What replaces a transform's parent space, or None if nothing does.
+
+    Only a CONSTRAINT (or a matrix wired into offsetParentMatrix) moves a
+    group into another object's space. Everything else feeding its channels
+    -- driven keys, multiply/plus nodes fed by custom attributes such as a
+    settings control's "Petal_Rotation", time-keyed curves -- is a LOCAL
+    offset: the group still lives in its Maya parent's space.
+
+    Returns None (static or locally offset), else the list of transforms the
+    space comes from (constraint targets; empty when unknown, e.g. a matrix
+    network).
+    """
+    drivers = None
+    for attribute in _DRIVEN_ATTRS:
+        if not cmds.attributeQuery(attribute.split('.')[0], node=node, exists=True):
+            continue
+        sources = cmds.listConnections(
+            '{}.{}'.format(node, attribute), source=True, destination=False,
+            skipConversionNodes=True,
+        ) or []
+        for source in sources:
+            if cmds.objectType(source, isAType='constraint'):
+                drivers = drivers if drivers is not None else []
+                targets = cmds.listConnections(
+                    '{}.target'.format(source), source=True, destination=False
+                ) or []
+                for target in targets:
+                    if (target not in drivers and target != _short_node_name(node)
+                            and cmds.objectType(target, isAType='transform')):
+                        drivers.append(target)
+            elif attribute == 'offsetParentMatrix':
+                drivers = drivers if drivers is not None else []
+    return drivers
+
+
+def _is_driven_space(node):
+    """True when a constraint or matrix input replaces the node's space."""
+    return _space_drivers(node) is not None
+
+
+def _parent_space(node):
+    """Where a controller really hangs in Maya.
+
+    Returns (parent_controllers, driven_bone):
+
+    * parent_controllers -- the controller ancestors reachable through STATIC
+      groups, nearest first. Unreal parents the control to the first of them
+      it has built (exactly Maya's hierarchy).
+    * driven_bone -- set when a driven group sits between the controller and
+      its first controller ancestor (e.g. a foot FK group parent-constrained
+      between the IK and FK controls, weighted by the IK/FK switch). The Maya
+      parent is then not the real driver; the group effectively follows a
+      skeleton bone: the exported joint nearest to the constraint TARGETS
+      (e.g. the ankle, where both the IK control and the last FK control
+      sit), not to the group itself -- the group usually sits on the very
+      bone the controller drives. Unreal follows that bone's final transform.
+
+    Groups offset by attribute networks (driven keys, math nodes) are not
+    spaces and are walked through like static groups.
+    """
+    controllers = []
+    current = (cmds.listRelatives(node, parent=True, fullPath=True) or [None])[0]
+    while current:
+        if cmds.objectType(current, isAType='transform') and _has_controller_shape(current):
+            controllers.append(_short_node_name(current))
+        else:
+            drivers = _space_drivers(current)
+            if drivers is not None:
+                if not controllers:
+                    points = [
+                        cmds.xform(target, query=True, worldSpace=True, rotatePivot=True)
+                        for target in drivers
+                    ] or [cmds.xform(current, query=True, worldSpace=True, rotatePivot=True)]
+                    centre = [sum(p[i] for p in points) / len(points) for i in range(3)]
+                    return controllers, _nearest_exported_joint(centre)
+                break
+        current = (cmds.listRelatives(current, parent=True, fullPath=True) or [None])[0]
+    return controllers, None
+
+
+def _exported_joints():
+    root = cmds.ls(ROOT_JOINT_NAME, long=True, type='joint') or []
+    if not root:
+        return []
+    return root + (cmds.listRelatives(root[0], allDescendents=True, type='joint', fullPath=True) or [])
+
+
+def _nearest_exported_joint(world_point):
+    best, best_distance = None, None
+    for joint in _exported_joints():
+        position = _world_translation(joint)
+        distance = sum((position[i] - world_point[i]) ** 2 for i in range(3))
+        if best_distance is None or distance < best_distance:
+            best, best_distance = joint, distance
+    return _short_node_name(best) if best else None
+
+
+def _joint_local_unreal(world_point, joint):
+    """A world point in ``joint``'s local frame, in Unreal's joint convention.
+
+    The FBX importer keeps joint-local frames and only mirrors them to go
+    left-handed, so a local vector (x, y, z) in Maya is (x, -y, z) on the
+    imported bone (e.g. a Maya spine running along +Y runs along -Y in UE).
+    No world axis conversion is involved -- this is the joint-relative
+    storage the schema asks for. Centimetres.
+
+    Units: ``xform -matrix`` returns its translation in Maya's INTERNAL unit
+    (always cm) while ``xform -translation/-rotatePivot`` answer in the UI
+    unit (m, dm, ...). Mixing them put every point hundreds of units off in
+    metre scenes. So only the matrix's axis rows are used here (unit-free
+    once normalised); the joint position comes from the same query family as
+    ``world_point``, and the result is world length expressed on the joint's
+    axes -- what the imported bone measures, whatever scale its parents carry.
+    """
+    matrix = cmds.xform(joint, query=True, worldSpace=True, matrix=True)
+    origin = _world_translation(joint)
+    delta = [float(world_point[i]) - float(origin[i]) for i in range(3)]
+    local = []
+    for row in range(3):
+        axis = [matrix[row * 4 + i] for i in range(3)]
+        length = sum(c * c for c in axis) ** 0.5 or 1.0
+        local.append(sum(delta[i] * axis[i] for i in range(3)) / length)
+    scale = _maya_linear_to_centimeters_scale()
+    return _round_vector([local[0] * scale, -local[1] * scale, local[2] * scale])
+
+
+def _local_offset_fields(world_point, anchor, neighbour):
+    """offset_local / reference_local for a point anchored on a joint."""
+    fields = {'offset_local': _joint_local_unreal(world_point, anchor)}
+    if neighbour and cmds.objExists(neighbour):
+        fields['reference_local'] = {
+            'bone': _short_node_name(neighbour),
+            'vector': _joint_local_unreal(_world_translation(neighbour), anchor),
+        }
+    return fields
+
+
 def _controller_origin_world(node):
     """Return (world_point, source) for where an animator perceives a control.
 
@@ -902,7 +1058,12 @@ def _query_transform_snapshot(node, role, module_name, driven_bone, anchor_bone,
 
     offset_from_anchor = None
     reference = None
+    local_fields = {}
     if anchor_bone and cmds.objExists(anchor_bone):
+        try:
+            local_fields = _local_offset_fields(origin_world, anchor_bone, reference_bone)
+        except Exception:
+            local_fields = {}
         try:
             anchor_world = cmds.xform(anchor_bone, query=True, worldSpace=True, translation=True)
             offset_from_anchor = _maya_vector_to_unreal(
@@ -934,7 +1095,13 @@ def _query_transform_snapshot(node, role, module_name, driven_bone, anchor_bone,
     except Exception:
         rotate_order = None
 
-    return {
+    parent_controllers, parent_space_bone = [], None
+    try:
+        parent_controllers, parent_space_bone = _parent_space(node)
+    except Exception:
+        pass
+
+    return dict(local_fields, **{
         'name': _short_node_name(node),
         'dag_path': node,
         'node_type': cmds.nodeType(node),
@@ -948,6 +1115,8 @@ def _query_transform_snapshot(node, role, module_name, driven_bone, anchor_bone,
         'world_axes_unreal': _safe_call(_world_axes_unreal, node),
         'size_unreal': _safe_call(_world_size_unreal, node),
         'parent_controller': _safe_call(_parent_controller, node),
+        'parent_controllers': parent_controllers,
+        'parent_space_bone': parent_space_bone,
         'shape_id': shape_id,
         'attributes': attributes,
         'offset_from_anchor_unreal': offset_from_anchor,
@@ -970,7 +1139,7 @@ def _query_transform_snapshot(node, role, module_name, driven_bone, anchor_bone,
         'shape_types': sorted(set(cmds.nodeType(shape) for shape in shapes)),
         'display_color': _controller_display_color(node),
         'locked_channels': _locked_channels(node),
-    }
+    })
 
 
 def _bone_driver_controllers(joint):
@@ -1205,6 +1374,60 @@ def _constraint_drives_joint(constraint, joint):
     return False
 
 
+def _ik_handle_for_joint(joint):
+    """The ikHandle whose solved chain contains ``joint`` (start..end), or None."""
+    short = _short_node_name(_full_dag_path(joint))
+    parent = (cmds.listRelatives(joint, parent=True) or [None])[0]
+    for handle in cmds.ls(type='ikHandle') or []:
+        try:
+            joints = [_short_node_name(j) for j in (cmds.ikHandle(handle, query=True, jointList=True) or [])]
+        except Exception:
+            continue
+        if short in joints or (parent and _short_node_name(parent) == (joints[-1] if joints else None)):
+            return handle
+    return None
+
+
+def _joint_depth_below(joint, ancestor):
+    depth, current = 0, _full_dag_path(joint)
+    target = _short_node_name(_full_dag_path(ancestor))
+    while current and _short_node_name(current) != target:
+        parents = cmds.listRelatives(current, parent=True, fullPath=True) or []
+        current = parents[0] if parents else None
+        depth += 1
+    return depth if current else None
+
+
+def _ancestor_at(joint, levels):
+    current = _full_dag_path(joint)
+    for _ in range(levels):
+        parents = cmds.listRelatives(current, parent=True, fullPath=True) or []
+        if not parents:
+            return None
+        current = parents[0]
+    return current
+
+
+def identify_ik_fk_roots(target_a, target_b):
+    """Tell the IK source chain from the FK one by the ikHandle driving it.
+
+    Constraint target order is arbitrary (it is whatever order the rigger
+    picked the targets in); the chain an ikHandle solves is the IK chain by
+    definition. Returns (ik_root, fk_root) as full paths, or (None, None) when
+    exactly one of the two targets is not IK-driven.
+    """
+    handles = [_ik_handle_for_joint(t) for t in (target_a, target_b)]
+    if bool(handles[0]) == bool(handles[1]):
+        return None, None
+    ik_target, fk_target, handle = (
+        (target_a, target_b, handles[0]) if handles[0] else (target_b, target_a, handles[1])
+    )
+    ik_root = _full_dag_path(cmds.ikHandle(handle, query=True, startJoint=True))
+    depth = _joint_depth_below(ik_target, ik_root)
+    fk_root = _ancestor_at(fk_target, depth) if depth is not None else None
+    return ik_root, fk_root
+
+
 def detect_ikfk_switch(chain):
     """
     Structural detection of an IK/FK switch on a joint chain.
@@ -1257,13 +1480,18 @@ def detect_ikfk_switch(chain):
                             if sc:
                                 switch_ctrl, switch_attr = sc, sa
                                 break
+                        ik_root, fk_root = identify_ik_fk_roots(tgt_joints[0], tgt_joints[1])
+                        if not ik_root:
+                            print('[RigManifest] IK/FK on {}: cannot tell the IK chain by its '
+                                  'ikHandle; falling back to constraint target order.'.format(jnt))
+                            ik_root, fk_root = tgt_joints[0], tgt_joints[1]
                         blend_details.append({
                             'blend_node_type': 'constraint',
                             'blend_node': con,
                             'switch_control': switch_ctrl,
                             'switch_attr': switch_attr,
-                            'ik_chain_root': tgt_joints[0],
-                            'fk_chain_root': tgt_joints[1],
+                            'ik_chain_root': ik_root,
+                            'fk_chain_root': fk_root,
                         })
 
         # --- pairBlend ---
@@ -2269,6 +2497,7 @@ def _point_offset_record(chain, world_point):
     anchor_world = _world_translation(anchor)
     record = {
         'anchor_bone': _short_node_name(anchor),
+        **_local_offset_fields(world_point, anchor, neighbour),
         'offset_from_anchor_unreal': _maya_vector_to_unreal(
             [world_point[i] - anchor_world[i] for i in range(3)], apply_unit_scale=True
         ),
@@ -2399,6 +2628,15 @@ def _spline_ik_export(module):
                     snapshot['shape_source'] = _short_node_name(holder)
                 except Exception:
                     pass
+            if holder:
+                # The UE control stands for the holder: take its hierarchy,
+                # orientation and locks, not the influence joint's.
+                try:
+                    snapshot['parent_controllers'], snapshot['parent_space_bone'] = _parent_space(holder)
+                    snapshot['world_axes_unreal'] = _world_axes_unreal(holder)
+                    snapshot['locked_channels'] = _locked_channels(holder)
+                except Exception:
+                    pass
         records.append(snapshot)
 
     cvs = []
@@ -2502,6 +2740,8 @@ def _ikfk_switch_export(module):
     weight = max(0.0, min(1.0, weight))
 
     snapshot = _snapshot_for_chain(control, 'settings', module_name, chain)
+    if not snapshot:
+        return {}
     return {
         'switch': {
             'control': snapshot,
@@ -2593,9 +2833,14 @@ def _constraint_record(constraint, joint, module_name, chain):
                 pass
         target_path = _full_dag_path(target)
         controller = _nearest_controller_transform(target_path) or target_path
+        snapshot = _snapshot_for_chain(controller, 'constraint_driver', module_name, chain)
+        if not snapshot:
+            print('[RigManifest] {}: target {} of {} could not be captured; skipped.'.format(
+                module_name, target, constraint))
+            continue
         entry = {
             'weight': weight,
-            'controller': _snapshot_for_chain(controller, 'constraint_driver', module_name, chain),
+            'controller': snapshot,
             'target': None,
         }
         if _short_node_name(controller) != _short_node_name(target_path):
@@ -2644,6 +2889,94 @@ def _bone_constraints_export(module):
     return records
 
 
+_AXIS_LABELS = (
+    ('+X', (1.0, 0.0, 0.0)), ('-X', (-1.0, 0.0, 0.0)),
+    ('+Y', (0.0, 1.0, 0.0)), ('-Y', (0.0, -1.0, 0.0)),
+    ('+Z', (0.0, 0.0, 1.0)), ('-Z', (0.0, 0.0, -1.0)),
+)
+
+
+def _axis_label(vector, min_alignment=0.8):
+    length = sum(c * c for c in vector) ** 0.5
+    if length < 1e-9:
+        return None
+    unit = [c / length for c in vector]
+    label, dot = max(((name, sum(a * b for a, b in zip(unit, axis))) for name, axis in _AXIS_LABELS),
+                     key=lambda item: item[1])
+    return label if dot >= min_alignment else None
+
+
+def _mirror_label_to_unreal(label):
+    """Maya joint-local axis label -> Unreal joint-local label (Y mirrored)."""
+    if not label:
+        return None
+    if label[1] == 'Y':
+        return ('-' if label[0] == '+' else '+') + 'Y'
+    return label
+
+
+def _chain_axes(chain):
+    """Per-chain axis convention: aim axis and bend (up) axis.
+
+    aim_axis: the local axis of each joint pointing at the next one
+    (majority over the chain). up_axis: the local axis of the first joint
+    pointing toward the bend (the mid joint's side of the start->end line),
+    i.e. where a pole vector goes; None for straight or 2-joint chains. Both
+    as Maya labels and as Unreal labels (joint-local Y mirrored).
+    """
+    if len(chain) < 2:
+        return None
+    votes = {}
+    for parent, child in zip(chain[:-1], chain[1:]):
+        local = _joint_local_unreal(_world_translation(child), parent)
+        maya_local = [local[0], -local[1], local[2]]
+        label = _axis_label(maya_local)
+        if label:
+            votes[label] = votes.get(label, 0) + 1
+    aim = max(votes, key=votes.get) if votes else None
+
+    up = None
+    if len(chain) >= 3:
+        p0, p1, p2 = (_world_translation(j) for j in chain[:3])
+        line = [p2[i] - p0[i] for i in range(3)]
+        length_sq = sum(c * c for c in line)
+        if length_sq > 1e-12:
+            t = sum((p1[i] - p0[i]) * line[i] for i in range(3)) / length_sq
+            foot = [p0[i] + t * line[i] for i in range(3)]   # mid joint projected on the line
+            local_bend = _joint_local_unreal(p1, chain[0])
+            local_foot = _joint_local_unreal(foot, chain[0])
+            direction = [local_bend[i] - local_foot[i] for i in range(3)]
+            if sum(c * c for c in direction) > 1e-6:
+                up = _axis_label([direction[0], -direction[1], direction[2]])
+    return {
+        'aim_axis': aim,
+        'up_axis': up,
+        'aim_axis_unreal': _mirror_label_to_unreal(aim),
+        'up_axis_unreal': _mirror_label_to_unreal(up),
+    }
+
+
+def _verify_ikfk_roots(module):
+    """Make params.ik_chain_root the chain an ikHandle actually solves.
+
+    Tagged roots are trusted only when they agree with the scene; a swapped
+    pair is corrected (and reported) rather than silently exported.
+    """
+    params = module.setdefault('params', {})
+    ik_root, fk_root = params.get('ik_chain_root'), params.get('fk_chain_root')
+    if not ik_root or not fk_root or not cmds.objExists(ik_root) or not cmds.objExists(fk_root):
+        return
+    ik_driven = bool(_ik_handle_for_joint(ik_root))
+    fk_driven = bool(_ik_handle_for_joint(fk_root))
+    if fk_driven and not ik_driven:
+        print('[RigManifest] {}: ik_chain_root/fk_chain_root were swapped (ikHandle drives {}); '
+              'corrected.'.format(module.get('module_name'), fk_root))
+        params['ik_chain_root'], params['fk_chain_root'] = fk_root, ik_root
+    elif not ik_driven:
+        print('[RigManifest] {}: no ikHandle drives ik_chain_root {}; check the tags.'.format(
+            module.get('module_name'), ik_root))
+
+
 def _merge_scene_detected_module_data(module):
     """Reattach structural Maya data to the clean tagger module definition.
 
@@ -2673,6 +3006,7 @@ def _merge_scene_detected_module_data(module):
     extra = {}
     try:
         if enriched.get('module_type') == 'IKFKSwitch':
+            _verify_ikfk_roots(enriched)
             extra = _ikfk_switch_export(enriched)
         elif enriched.get('module_type') == 'SplineIK':
             spline = _spline_ik_export(enriched)
@@ -2741,6 +3075,9 @@ def build_manifest(rig_name, modules_config):
             "build_depth": graph.get("depth", {}).get(module_name, 0),
             "depends_on": [],
         }
+        axes = _safe_call(_chain_axes, [_full_dag_path(b) for b in raw_chain])
+        if axes:
+            module_def["axes"] = axes
 
         if mod.get("params"):
             module_def["params"] = mod["params"]
@@ -2764,9 +3101,25 @@ def build_manifest(rig_name, modules_config):
     serializable_connections = {
         name: dict(data) for name, data in graph.get("connections", {}).items()
     }
+    try:
+        scene = cmds.file(query=True, sceneName=True) or ""
+        dcc_version = cmds.about(version=True)
+    except Exception:
+        scene, dcc_version = "", ""
     return {
+        "schema": "kotsudo.rig",
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "rig_name": rig_name,
+        "source": {
+            "dcc": "maya",
+            "dcc_version": dcc_version,
+            "scene": os.path.basename(scene),
+            "exporter": "export_rig_manifest.py",
+        },
+        # Every value named *_unreal, offset_local, size_unreal and the shape
+        # points is already in Unreal centimetres; rotations are axes or
+        # degrees. Source units are kept for reference only.
+        "units": {"linear": "cm", "angular": "deg"},
         "coordinate_system": _coordinate_system_manifest(),
         "module_build_order": list(graph.get("build_order", [])),
         "module_graph": {
@@ -2956,6 +3309,31 @@ def verify_exported_fbx(fbx_path, manifest):
           .format(len(names)))
 
 
+def _manifest_schema_module():
+    """rig_builder.manifest_schema, shared with the Unreal builder."""
+    import sys
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    import importlib
+    from rig_builder import manifest_schema
+    return importlib.reload(manifest_schema)
+
+
+def validate_manifest_or_raise(manifest):
+    """Validate against schema/kotsudo_manifest.schema.json before anything is written."""
+    errors, warnings = _manifest_schema_module().validate_manifest(manifest)
+    for warning in warnings:
+        print("[RigManifest] Manifest warning: {}".format(warning))
+    if errors:
+        raise RuntimeError(
+            "Manifest failed validation ({} error(s)); nothing was exported:\n  {}".format(
+                len(errors), "\n  ".join(errors[:25]))
+        )
+    print("[RigManifest] Manifest valid (schema v{}, {} warning(s)).".format(
+        manifest.get("schema_version"), len(warnings)))
+
+
 def _tube_mesh_data(strands, radius):
     """Square-section tube around each polyline. Returns (points, counts, connects)."""
     points, counts, connects = [], [], []
@@ -3102,10 +3480,12 @@ def export(export_dir, filename_base, rig_name, modules_config):
     fbx_path = os.path.join(export_dir, "{}.fbx".format(filename_base))
 
     manifest = build_manifest(rig_name, modules_config)
+    validate_manifest_or_raise(manifest)
     shapes_dir = os.path.join(export_dir, "{}_shapes".format(filename_base))
     if _SHAPE_RAW:
         # Unreal finds this folder (RB_<shape_id>.fbx files) next to the rig FBX.
         manifest["shapes_dir"] = os.path.basename(shapes_dir)
+    manifest["poses_file"] = "{}.poses.json".format(filename_base)
     compact_json = json.dumps(manifest, separators=(",", ":"))
     write_manifest_to_joint(ROOT_JOINT_NAME, compact_json)
 
@@ -3173,6 +3553,25 @@ def export(export_dir, filename_base, rig_name, modules_config):
         except Exception as exc:
             print("[RigManifest] Shapes FBX export failed ({}). The rig FBX is unaffected; "
                   "Unreal will use built-in shapes.".format(exc))
+
+    # Test poses for the pose-match harness (scene is at bind pose here).
+    # A failure is reported but never loses the rig export.
+    try:
+        # Sibling module: importable whether this file was loaded from the repo
+        # (tools/maya on sys.path) or by path.
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import export_test_poses
+        importlib.reload(export_test_poses)
+        export_test_poses.export_test_poses(
+            os.path.join(export_dir, manifest["poses_file"]), manifest
+        )
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        cmds.warning("[RigManifest] Test-pose export failed ({}: {}); the harness will have "
+                     "nothing to replay. Traceback in the Script Editor.".format(type(exc).__name__, exc))
 
     print("[RigManifest] Export complete -> {}".format(fbx_path))
     return fbx_path

@@ -209,10 +209,7 @@ class IKModule(RigModule):
         effector_position = graph_utils.transform_to_location(
             effector_global_transform
         )
-        parent_key = (
-            self.context.get_parent_control_key(self.parent_module_name, self.parent_attach_point)
-            or graph_utils.get_world_parent_key(hierarchy, hierarchy_controller)
-        )
+        parent_key = self.default_parent_key()
 
         scale_multiplier = float(recipe_data.get("ControlScale") or 1.0)
         effector_scale = graph_utils.compute_chain_scale(
@@ -233,7 +230,8 @@ class IKModule(RigModule):
         # through a driver null when the controller sits away from it.
         _effector_key, effector_driver = graph_utils.build_record_control(
             self.context.rig, hierarchy, hierarchy_controller, recipe_data,
-            parent_key, effector_control_name, self.chain[-1], effector_global_transform,
+            self.context.resolve_control_parent(effector_record, parent_key),
+            effector_control_name, self.chain[-1], effector_global_transform,
             effector_record,
             _controller_color(
                 effector_record, unreal.LinearColor(0.0, 0.7, 1.0, 1.0)
@@ -275,28 +273,12 @@ class IKModule(RigModule):
 
         all_nodes.append(ik_node_name)
 
-        chain_start = self.context.get_exec_tail() or forwards_solve
-        source_exec = (
-            f"{chain_start}.ExecuteContext"
-            if graph_utils.pin_exists(model, f"{chain_start}.ExecuteContext")
-            else f"{chain_start}.Execute"
+        graph_utils.connect_exec(
+            controller, model, self.context.get_exec_tail() or forwards_solve, ik_node_name
         )
-        target_exec = (
-            f"{ik_node_name}.ExecuteContext"
-            if graph_utils.pin_exists(model, f"{ik_node_name}.ExecuteContext")
-            else f"{ik_node_name}.Execute"
-        )
-        graph_utils.connect_pins(controller, model, source_exec, target_exec)
-
-        # Follow space on the tip bone, updated after the solve, so children of
-        # the tip (toes, fingers) follow the solved limb.
-        tip_space, exec_tail = graph_utils.create_bone_follow_space(
-            hierarchy, hierarchy_controller, controller, model,
-            f"{module_prefix}_{graph_utils.sanitize_name(self.chain[-1])}_Follow",
-            self.chain[-1], graph_utils.get_bone_global_transform(hierarchy, self.chain[-1]),
-            unreal.Vector2D(x_origin + 1100, 200), ik_node_name,
-        )
-        self.context.set_exec_tail(exec_tail)
+        # Children of this limb follow its solved bones through follow spaces
+        # the context creates on demand (RigContext.follow_space).
+        self.context.set_exec_tail(ik_node_name)
 
         if self.logger:
             self.logger.pop()
@@ -311,7 +293,7 @@ class IKModule(RigModule):
         if pole_ctrl:
             attach_points["pole_vector"] = pole_ctrl
 
-        return self._with_follow_spaces(self.build_result(
+        return self.build_result(
             controls=all_controls,
             nodes=all_nodes,
             attach_points=attach_points,
@@ -327,13 +309,7 @@ class IKModule(RigModule):
                 "resolved_solver_mode": solver_mode,
                 "create_pole_vector": bool(pole_ctrl),
             },
-        ), tip_space)
-
-    @staticmethod
-    def _with_follow_spaces(result, tip_space):
-        if tip_space:
-            result["follow_spaces"] = {"tip": tip_space, "fk_tip_ctrl": tip_space}
-        return result
+        )
 
     # ------------------------------------------------------------------
     # Solver builders

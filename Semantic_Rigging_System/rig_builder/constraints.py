@@ -155,7 +155,10 @@ class ConstraintBuilder:
         if existing is not None and self.hierarchy.contains(existing):
             return existing
 
-        parent = self._existing_control(record.get("parent_controller")) or self.parent_key
+        if "parent_controllers" in record:
+            parent = self.context.resolve_control_parent(record, self.parent_key)
+        else:   # older manifests: single parent_controller field
+            parent = self._existing_control(record.get("parent_controller")) or self.parent_key
         anchor = record.get("anchor_bone") or record.get("driven_bone") or self.module.chain[0]
         placement = graph_utils.record_transform(self.hierarchy, record, anchor, label=maya_name)
         name = self.context.control_name(record, f"{self.prefix}_{graph_utils.sanitize_name(maya_name)}")
@@ -228,8 +231,7 @@ class ConstraintBuilder:
             _set_axes(self.controller, self.model, f"{node}.Filter", channels.get(group) or [])
 
         wired = 0
-        for target in record["targets"]:
-            item_type, item_name = self.target_item(target)
+        for target, (item_type, item_name) in zip(record["targets"], record["_items"]):
             if not _insert_array_element(self.controller, self.model, f"{node}.Parents"):
                 break
             base = f"{node}.Parents.{wired}"
@@ -243,17 +245,14 @@ class ConstraintBuilder:
                 "(Parents pin not found in this engine build)."
             )
 
-        graph_utils.connect_pins(
-            self.controller, self.model,
-            f"{exec_tail}.ExecuteContext" if graph_utils.pin_exists(self.model, f"{exec_tail}.ExecuteContext") else f"{exec_tail}.Execute",
-            f"{node}.ExecuteContext" if graph_utils.pin_exists(self.model, f"{node}.ExecuteContext") else f"{node}.Execute",
-        )
+        graph_utils.connect_exec(self.controller, self.model, exec_tail, node)
         self.nodes.append(node)
         return node
 
-    def build(self, records, exec_tail, x_origin):
+    def build(self, records, forwards_solve, x_origin):
         # Controls first, Maya parents before their children, so each control
-        # can be parented to its Maya parent controller.
+        # can be parented to its Maya parent controller. The exec tail is read
+        # only afterwards: resolving parents may append follow-space updates.
         pending = {}
         for record in records:
             for target in record["targets"]:
@@ -266,6 +265,10 @@ class ConstraintBuilder:
             ] or list(pending)[:1]   # cycle guard
             for name in ready:
                 self.control_for(pending.pop(name))
+        # Target nulls too, before any exec wiring.
+        items = [[self.target_item(target) for target in record["targets"]] for record in records]
+        exec_tail = self.context.get_exec_tail() or forwards_solve
         for index, record in enumerate(records):
+            record = dict(record, _items=items[index])
             exec_tail = self.constraint_node(index, record, exec_tail, x_origin)
         return exec_tail

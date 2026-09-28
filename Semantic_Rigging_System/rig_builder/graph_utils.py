@@ -562,6 +562,23 @@ def pin_exists(model, pin_path):
     return model.find_pin(pin_path) is not None
 
 
+def exec_pin(model, node_or_pin):
+    """Execution pin of a node, or ``node_or_pin`` itself when it already names
+    a pin (e.g. a Sequence output such as "RB_SolveStages.B")."""
+    if "." in str(node_or_pin) and pin_exists(model, node_or_pin):
+        return node_or_pin
+    for name in ("ExecuteContext", "Execute"):
+        path = f"{node_or_pin}.{name}"
+        if pin_exists(model, path):
+            return path
+    return f"{node_or_pin}.ExecuteContext"
+
+
+def connect_exec(controller, model, source, target):
+    """Chain execution from ``source`` (node or exec pin) into node ``target``."""
+    return connect_pins(controller, model, exec_pin(model, source), exec_pin(model, target))
+
+
 def set_pin_default(controller, model, pin_path, value):
     if pin_exists(model, pin_path):
         controller.set_pin_default_value(pin_path, value, True)
@@ -1076,6 +1093,69 @@ def derive_chain_primary_axis(hierarchy, chain):
     return winner, axis_label_to_vector(winner), confidence
 
 
+def vector_axis_label(vector):
+    """Signed axis label ('+X', '-Y'...) within ~37 degrees of a local vector, or None."""
+    best, best_dot = None, 0.8
+    for name, values in _SIGNED_AXES:
+        dot = vector_dot(normalize_vector(vector), unreal.Vector(*values))
+        if dot > best_dot:
+            best, best_dot = name, dot
+    return None if best is None else (best if best.startswith("-") else "+" + best)
+
+
+def measure_chain_bend_label(hierarchy, chain):
+    """Local axis of the first bone pointing toward the bend (mid joint side
+    of the start->end line), measured on the imported skeleton, or None."""
+    if len(chain) < 3:
+        return None
+    start = get_bone_global_transform(hierarchy, chain[0])
+    p0 = transform_to_location(start)
+    p1 = get_bone_global_position(hierarchy, chain[1])
+    p2 = get_bone_global_position(hierarchy, chain[2])
+    line = vector_sub(p2, p0)
+    length_sq = vector_dot(line, line)
+    if length_sq < 1e-9:
+        return None
+    foot = vector_add(p0, vector_scale(line, vector_dot(vector_sub(p1, p0), line) / length_sq))
+    bend = vector_sub(inverse_transform_location(start, p1), inverse_transform_location(start, foot))
+    if vector_length(bend) < 1e-4:
+        return None
+    return vector_axis_label(bend)
+
+
+def check_chain_axes(module_name, chain_axes, measured_aim=None, measured_up=None):
+    """Compare the manifest's per-chain axes with the imported skeleton.
+
+    The manifest declares, from Maya, which joint-local axis runs down the
+    chain and toward the bend, already mirrored to Unreal's joint convention.
+    Agreement confirms the Maya->Unreal joint-frame mapping for this chain;
+    a mismatch means the transport assumption is wrong for this rig and is
+    reported (the builder keeps using the measured axes).
+    """
+    if not chain_axes:
+        return None
+    normalise = lambda label: None if not label else (label if label[0] in "+-" else "+" + label)
+    results = []
+    for kind, declared, measured in (
+        ("aim", chain_axes.get("aim_axis_unreal"), measured_aim),
+        ("up", chain_axes.get("up_axis_unreal"), measured_up),
+    ):
+        declared, measured = normalise(declared), normalise(measured)
+        if not declared or not measured:
+            continue
+        if declared == measured:
+            results.append(f"{kind} {declared} ok")
+        else:
+            _log_warning(
+                f"{module_name}: {kind} axis mismatch -- manifest says {declared} "
+                f"(Maya {chain_axes.get(kind + '_axis')}), skeleton says {measured}."
+            )
+            results.append(f"{kind} MISMATCH")
+    if results:
+        _log_info(f"{module_name}: chain axes " + ", ".join(results) + ".")
+    return results
+
+
 def pick_perpendicular_axis(primary_label, preferred_label=None):
     """Return an axis label perpendicular to ``primary_label``.
 
@@ -1111,6 +1191,7 @@ ORIGIN_OFFSET_TOLERANCE = 0.5
 # Maya->UE mapping is accepted when the reference bone direction agrees within
 # this angle (degrees).
 ORIGIN_MAPPING_ANGLE_TOLERANCE = 10.0
+ORIGIN_LOCAL_LENGTH_TOLERANCE = 0.05   # joint-local reference length vs real bone distance
 
 
 def controller_records(recipe_data):
@@ -1147,6 +1228,94 @@ def controller_origin_position(hierarchy, record, anchor_bone, min_offset=None, 
     if not record:
         return None
     label = label or str(record.get("name") or anchor_bone)
+    threshold = ORIGIN_OFFSET_TOLERANCE if min_offset is None else float(min_offset)
+
+    # Preferred (schema 6): the offset in the anchor bone's OWN frame. No
+    # world-axis conversion is involved, so a wrong world mapping cannot
+    # affect it; it is validated the same way against a neighbour bone.
+    local_result = _local_origin_position(hierarchy, record, anchor_bone, label)
+    world_result = _world_origin_position(hierarchy, record, anchor_bone, label)
+    result = local_result or world_result
+    if local_result is not None and world_result is not None:
+        # Two independent encodings of the same point. When they agree the
+        # joint-local one is used (no world mapping involved). When they do
+        # not, one is corrupt and nothing here can prove which, so the
+        # long-standing world path wins and the disagreement is reported --
+        # a bad joint-local export can never move a control on its own.
+        disagreement = vector_length(vector_sub(local_result[0], world_result[0]))
+        if disagreement > max(1.0, 0.02 * vector_length(world_result[1])):
+            _log_warning(
+                f"Controller '{label}': joint-local and world offsets disagree by "
+                f"{disagreement:.2f} cm; using the world one (re-export from Maya)."
+            )
+            result = world_result
+    if result is None:
+        return None
+    position, offset_length = result[0], vector_length(result[1])
+    # A zero threshold means "always use the record" -- including when the
+    # controller sits exactly on the bone (offset 0), which is a valid answer.
+    if threshold > 0.0 and offset_length <= threshold:
+        return None
+    return position
+
+
+def _local_origin_position(hierarchy, record, anchor_bone, label):
+    """(world position, world offset) from offset_local, or None."""
+    offset = recipe_vector(record.get("offset_local"), None)
+    if offset is None:
+        return None
+    anchor = get_bone_global_transform(hierarchy, anchor_bone)
+    reference = record.get("reference_local") or {}
+    expected = recipe_vector(reference.get("vector"), None)
+    reference_bone = reference.get("bone")
+    if reference_bone and expected is not None:
+        key = make_key(unreal.RigElementType.BONE, str(reference_bone).split("|")[-1])
+        if hierarchy.contains(key):
+            actual = inverse_transform_location(
+                anchor, transform_to_location(hierarchy.get_global_transform(key, initial=True))
+            )
+            expected_length, actual_length = vector_length(expected), vector_length(actual)
+            if expected_length > 1e-6 and actual_length > 1e-6:
+                cosine = vector_dot(normalize_vector(expected), normalize_vector(actual))
+                angle = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+                if angle > ORIGIN_MAPPING_ANGLE_TOLERANCE:
+                    _log_warning(
+                        f"Controller '{label}': joint-local mapping disagrees with the imported "
+                        f"skeleton by {angle:.1f} deg (bone '{anchor_bone}'); not using it."
+                    )
+                    return None
+                # Length too: a joint-local vector is world length on rotated
+                # axes, so the bone-to-bone distance must match. A mismatch
+                # means a unit error in the export, not a mapping error.
+                ratio = expected_length / actual_length
+                if abs(ratio - 1.0) > ORIGIN_LOCAL_LENGTH_TOLERANCE:
+                    _log_warning(
+                        f"Controller '{label}': joint-local reference is {ratio:.3g}x the real "
+                        f"distance to '{reference_bone}' (unit error in the export); not using it."
+                    )
+                    return None
+    position = transform_location(anchor, offset)
+    return position, vector_sub(position, transform_to_location(anchor))
+
+
+def inverse_transform_location(transform, location):
+    """Transform-local coordinates of a world location."""
+    method = getattr(transform, "inverse_transform_location", None)
+    if method:
+        return method(location)
+    return unreal.MathLibrary.inverse_transform_location(transform, location)
+
+
+def transform_location(transform, local):
+    """World location of a transform-local point."""
+    method = getattr(transform, "transform_location", None)
+    if method:
+        return method(local)
+    return unreal.MathLibrary.transform_location(transform, local)
+
+
+def _world_origin_position(hierarchy, record, anchor_bone, label):
+    """(world position, world offset) from offset_from_anchor_unreal, or None."""
     offset = recipe_vector(record.get("offset_from_anchor_unreal"), None)
     if offset is None:
         return None
@@ -1179,12 +1348,7 @@ def controller_origin_position(hierarchy, record, anchor_bone, min_offset=None, 
                 scale = actual_length / expected_length
 
     scaled = vector_scale(offset, scale)
-    threshold = ORIGIN_OFFSET_TOLERANCE if min_offset is None else float(min_offset)
-    # A zero threshold means "always use the record" -- including when the
-    # controller sits exactly on the bone (offset 0), which is a valid answer.
-    if threshold > 0.0 and vector_length(scaled) <= threshold:
-        return None
-    return vector_add(anchor_position, scaled)
+    return vector_add(anchor_position, scaled), scaled
 
 
 def bone_aligned_transform_at(bone_transform, position):
@@ -1431,7 +1595,8 @@ def build_pole_control(context, parent_key, fallback_name, position, record, col
         shape, (record or {}).get("size_unreal"), fallback_scale
     )
     key = create_control(
-        hierarchy, hierarchy_controller, parent_key, name, position, color, scale,
+        hierarchy, hierarchy_controller, context.resolve_control_parent(record, parent_key),
+        name, position, color, scale,
         shape_name=shape, locked_channels=(record or {}).get("locked_channels"),
     )
     attach_record_attributes(hierarchy, hierarchy_controller, key, record, name, position, color)
@@ -1490,6 +1655,27 @@ def create_float_control_getter(controller, model, node_name, control_name, posi
 # mode is active.
 # ---------------------------------------------------------------------------
 
+def create_follow_null(hierarchy, hierarchy_controller, space_name, bone_transform, parent_key=None):
+    """The null half of a follow space (placed on the bone's bind pose). Returns its name or None."""
+    if not (hasattr(unreal, "RigUnit_GetTransform") and hasattr(unreal, "RigUnit_SetTransform")):
+        return None
+    null_key = make_key(unreal.RigElementType.NULL, space_name)
+    if hierarchy.contains(null_key):
+        try:
+            hierarchy_controller.remove_element(null_key, False, False)
+        except Exception:
+            pass
+    try:
+        hierarchy_controller.add_null(
+            space_name, parent_key if parent_key is not None else invalid_key(),
+            unit_scale_transform(bone_transform), True, False, False,
+        )
+    except Exception as exc:
+        _log_warning(f"Could not create follow space '{space_name}': {exc}")
+        return None
+    return space_name if hierarchy.contains(null_key) else None
+
+
 def create_bone_follow_space(
     hierarchy, hierarchy_controller, controller, model, space_name, bone_name,
     bone_transform, position, exec_source,
@@ -1500,25 +1686,13 @@ def create_bone_follow_space(
     module's IK solve). On any failure the original ``exec_source`` is
     returned with a None name, so the module keeps working without the space.
     """
-    if not (hasattr(unreal, "RigUnit_GetTransform") and hasattr(unreal, "RigUnit_SetTransform")):
+    if not create_follow_null(hierarchy, hierarchy_controller, space_name, bone_transform):
         return None, exec_source
+    return space_name, add_follow_update(controller, model, space_name, bone_name, position, exec_source)
 
-    null_key = make_key(unreal.RigElementType.NULL, space_name)
-    if hierarchy.contains(null_key):
-        try:
-            hierarchy_controller.remove_element(null_key, False, False)
-        except Exception:
-            pass
-    try:
-        hierarchy_controller.add_null(
-            space_name, invalid_key(), unit_scale_transform(bone_transform), True, False, False
-        )
-    except Exception as exc:
-        _log_warning(f"Could not create follow space '{space_name}': {exc}")
-        return None, exec_source
-    if not hierarchy.contains(null_key):
-        return None, exec_source
 
+def add_follow_update(controller, model, space_name, bone_name, position, exec_source):
+    """The update half: copy the bone's current global onto the null. Returns the new exec tail."""
     get_node = f"{space_name}_GetBone"
     set_node = f"{space_name}_Update"
     create_unit_node(controller, model, get_node, unreal.RigUnit_GetTransform, position)
@@ -1540,17 +1714,8 @@ def create_bone_follow_space(
     )
     if not connect_pins(controller, model, f"{get_node}.Transform", f"{set_node}.Value"):
         connect_pins(controller, model, f"{get_node}.Transform", f"{set_node}.Transform")
-
-    source = (
-        f"{exec_source}.ExecuteContext" if pin_exists(model, f"{exec_source}.ExecuteContext")
-        else f"{exec_source}.Execute"
-    )
-    target = (
-        f"{set_node}.ExecuteContext" if pin_exists(model, f"{set_node}.ExecuteContext")
-        else f"{set_node}.Execute"
-    )
-    connect_pins(controller, model, source, target)
-    return space_name, set_node
+    connect_exec(controller, model, exec_source, set_node)
+    return set_node
 
 
 def record_rotation(record):
@@ -1682,6 +1847,53 @@ def record_color(record, fallback):
 
 
 GENERATED_ROOT_NAME = "PythonWorldControls"
+# Prefix of builder-owned graph nodes/elements that belong to no module
+# (solve-stage sequence, follow spaces); cleared with the module prefixes.
+BUILDER_PREFIX = "RB"
+SOLVE_STAGE_NODE = "RB_SolveStages"
+
+
+def create_solve_stages(controller, model, forwards_solve, stage_names):
+    """Sequence node after Forwards Solve with one exec output per stage.
+
+    Stages run top to bottom (Sequence executes A, then B, ...), so a module
+    in a later stage always sees the results of every earlier stage,
+    whatever order modules were built in. Returns {stage: exec_pin}, or {}
+    when the Sequence unit is unavailable (the caller then keeps one chain).
+    """
+    unit = None
+    for name in ("RigVMFunction_Sequence", "RigUnit_SequenceExecution", "RigUnit_SequenceAggregate"):
+        unit = getattr(unreal, name, None)
+        if unit is not None:
+            break
+    if unit is None or not forwards_solve:
+        return {}
+    try:
+        create_unit_node(controller, model, SOLVE_STAGE_NODE, unit, unreal.Vector2D(250, -300))
+    except Exception as exc:
+        _log_warning(f"Could not create the solve-stage Sequence node ({exc}); using one chain.")
+        return {}
+
+    letters = [chr(ord("A") + i) for i in range(26)]
+
+    def outputs():
+        return [f"{SOLVE_STAGE_NODE}.{l}" for l in letters if pin_exists(model, f"{SOLVE_STAGE_NODE}.{l}")]
+
+    guard = 0
+    while len(outputs()) < len(stage_names) and guard < len(stage_names):
+        guard += 1
+        try:
+            controller.add_aggregate_pin(SOLVE_STAGE_NODE, "", "")
+        except Exception:
+            break
+    pins = outputs()
+    if len(pins) < len(stage_names):
+        _log_warning(
+            f"Solve-stage Sequence has {len(pins)} output(s) for {len(stage_names)} stages; using one chain."
+        )
+        return {}
+    connect_exec(controller, model, forwards_solve, SOLVE_STAGE_NODE)
+    return dict(zip(stage_names, pins))
 
 
 def _element_children(hierarchy, key):
@@ -1723,14 +1935,15 @@ def clear_generated_rig(hierarchy, hierarchy_controller, graph_controller, model
             _remove_subtree(child)
 
     if prefixes:
-        for element_type in (unreal.RigElementType.CONTROL, unreal.RigElementType.NULL):
+        keys = []
+        for getter in ("get_controls", "get_nulls"):
             try:
-                keys = list(hierarchy.get_all_keys(False, element_type) or [])
+                keys.extend(getattr(hierarchy, getter)() or [])
             except Exception:
-                keys = []
-            for key in keys:
-                if str(key.name).startswith(prefixes) and hierarchy.contains(key):
-                    _remove_subtree(key)
+                pass
+        for key in keys:
+            if str(key.name).startswith(prefixes) and hierarchy.contains(key):
+                _remove_subtree(key)
 
     removed_nodes = 0
     if prefixes and model is not None:
