@@ -15,9 +15,9 @@ This module turns that into, per record:
 * the matching node, with maintain offset:
 
       parentConstraint -> Parent Constraint   (RigUnit_ParentConstraint)
-      pointConstraint  -> Position Constraint (RigUnit_PositionConstraint)
-      orientConstraint -> Rotation Constraint (RigUnit_RotationConstraint)
-      scaleConstraint  -> Scale Constraint    (RigUnit_ScaleConstraint)
+      pointConstraint  -> Position Constraint (Local Space Offset)
+      orientConstraint -> Rotation Constraint (Local Space Offset)
+      scaleConstraint  -> Scale Constraint    (Local Space Offset)
 
   Maintain offset reproduces Maya exactly at rest: the exported pose is the
   pose Maya's constraints produced, so the offset Unreal measures between
@@ -35,11 +35,18 @@ except ImportError:
 
 from . import control_shapes, graph_utils
 
+# Maya keeps a constraint's maintained offset in the CONSTRAINED node's parent
+# space: a petal point-constrained to its control still turns with the head
+# its joint hangs under. The plain Position/Rotation/Scale Constraint units
+# keep the offset in WORLD space, so any rotation of the child's parent makes
+# the bone drift and turn on its own. The "Local Space Offset" variants store
+# it in the child's parent space -- Maya's behaviour -- and are preferred.
+# (The Parent Constraint is always relative to its parents already.)
 _UNITS = {
     "parent": ("RigUnit_ParentConstraint",),
-    "point": ("RigUnit_PositionConstraint",),
-    "orient": ("RigUnit_RotationConstraint",),
-    "scale": ("RigUnit_ScaleConstraint",),
+    "point": ("RigUnit_PositionConstraintLocalSpaceOffset", "RigUnit_PositionConstraint"),
+    "orient": ("RigUnit_RotationConstraintLocalSpaceOffset", "RigUnit_RotationConstraint"),
+    "scale": ("RigUnit_ScaleConstraintLocalSpaceOffset", "RigUnit_ScaleConstraint"),
 }
 
 FULL = ["x", "y", "z"]
@@ -88,9 +95,15 @@ def needs_constraint_mode(records):
 
 
 def _pick_unit(kind):
-    for name in _UNITS.get(kind, ()):
+    names = _UNITS.get(kind, ())
+    for name in names:
         unit = getattr(unreal, name, None)
         if unit is not None:
+            if name != names[0]:
+                graph_utils._log_warning(
+                    f"{names[0]} is not available; using {name}, whose maintained offset is in "
+                    f"world space (the bone will drift when its parent rotates)."
+                )
             return unit
     return None
 

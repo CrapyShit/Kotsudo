@@ -986,10 +986,9 @@ def _controller_origin_world(node):
 
     The transform's rotate pivot is what the animator rotates around, and is
     correct for controls whose pivot was moved onto the joint (or whose curve
-    CVs were frozen around a pivot). When the pivot lies clearly outside the
-    control's own bounding box -- typically a frozen control whose pivot is
-    left at the world origin while the curve sits elsewhere -- the bounding-box
-    centre is the meaningful origin instead.
+    CVs were frozen around a pivot), and for custom pivots far from the
+    curve. Only a frozen control whose pivot was left at the world origin
+    while the curve sits elsewhere uses the bounding-box centre instead.
     """
     pivot = cmds.xform(node, query=True, worldSpace=True, rotatePivot=True)
     # Only nodes that actually carry geometry have a meaningful bounding box.
@@ -1009,7 +1008,13 @@ def _controller_origin_world(node):
     pivot_outside = any(
         pivot[i] < box[i] - margin or pivot[i] > box[i + 3] + margin for i in range(3)
     )
-    if pivot_outside:
+    # A pivot far from the curve is usually DELIBERATE (a petal control drawn
+    # at the petal tip but pivoting at the head centre). Only the frozen-
+    # control signature -- pivot left at the world origin while the curve
+    # sits elsewhere -- means "no meaningful pivot"; then the shape centre is
+    # the origin the animator perceives.
+    pivot_at_world_origin = all(abs(c) <= 1e-4 for c in pivot)
+    if pivot_outside and pivot_at_world_origin:
         return center, 'bounding_box_center'
     return pivot, 'rotate_pivot'
 
