@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kotsudo.rig",
+  "title": "Kotsudo rig manifest",
+  "description": "Semantic description of a Maya rig carried to Unreal through the root joint's rig_manifest_json attribute. Unknown properties are allowed everywhere and must be preserved (older builders ignore newer data). Validated on export (Maya) and on read (Unreal) by rig_builder/manifest_schema.py.",
+  "type": "object",
+  "required": ["schema_version", "rig_name", "coordinate_system", "modules"],
+  "properties": {
+    "schema": {"const": "kotsudo.rig"},
+    "schema_version": {"type": "integer", "minimum": 3},
+    "rig_name": {"type": "string", "minLength": 1},
+    "source": {"type": "object"},
+    "units": {
+      "type": "object",
+      "properties": {
+        "linear": {"enum": ["cm"]},
+        "angular": {"enum": ["deg"]}
+      }
+    },
+    "coordinate_system": {
+      "type": "object",
+      "required": ["source_application", "source_up_axis"],
+      "properties": {
+        "source_up_axis": {"enum": ["Y", "Z"]},
+        "vector_mapping": {"type": "string"},
+        "joint_local_mapping": {"type": "string"}
+      }
+    },
+    "module_build_order": {"type": "array", "items": {"type": "string"}},
+    "bone_controllers": {
+      "type": "object",
+      "additionalProperties": {"type": "array", "items": {"$ref": "#/$defs/controller"}}
+    },
+    "control_shapes": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/shape"}
+    },
+    "shapes_dir": {"type": "string"},
+    "modules": {"type": "array", "items": {"$ref": "#/$defs/module"}}
+  },
+  "$defs": {
+    "vec3": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+    "vec3_or_null": {"type": ["array", "null"], "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+    "axis_label": {"type": ["string", "null"], "enum": ["+X", "-X", "+Y", "-Y", "+Z", "-Z", null]},
+    "module": {
+      "type": "object",
+      "required": ["module_type", "module_name", "chain"],
+      "properties": {
+        "module_type": {"type": "string", "minLength": 1},
+        "module_name": {"type": "string", "minLength": 1},
+        "chain": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
+        "chain_items": {"type": "array", "items": {"type": "object", "required": ["bone_name"]}},
+        "connections": {
+          "type": "object",
+          "properties": {
+            "parent_module": {"type": ["string", "null"]},
+            "parent_bone": {"type": ["string", "null"]},
+            "parent_attach_point": {"type": ["string", "null"]}
+          }
+        },
+        "axes": {
+          "type": "object",
+          "properties": {
+            "aim_axis": {"$ref": "#/$defs/axis_label"},
+            "up_axis": {"$ref": "#/$defs/axis_label"},
+            "aim_axis_unreal": {"$ref": "#/$defs/axis_label"},
+            "up_axis_unreal": {"$ref": "#/$defs/axis_label"}
+          }
+        },
+        "params": {
+          "type": "object",
+          "properties": {
+            "constraints": {"type": "array", "items": {"$ref": "#/$defs/constraint"}},
+            "switch": {"$ref": "#/$defs/switch"},
+            "spline": {"$ref": "#/$defs/spline"}
+          }
+        }
+      }
+    },
+    "controller": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "role": {"type": ["string", "null"]},
+        "anchor_bone": {"type": ["string", "null"]},
+        "offset_from_anchor_unreal": {"$ref": "#/$defs/vec3_or_null"},
+        "offset_local": {"$ref": "#/$defs/vec3_or_null"},
+        "reference_local": {
+          "type": ["object", "null"],
+          "properties": {"bone": {"type": "string"}, "vector": {"$ref": "#/$defs/vec3"}}
+        },
+        "world_axes_unreal": {"type": ["array", "null"], "items": {"$ref": "#/$defs/vec3"}, "minItems": 3, "maxItems": 3},
+        "size_unreal": {"$ref": "#/$defs/vec3_or_null"},
+        "parent_controllers": {"type": "array", "items": {"type": "string"}},
+        "parent_space_bone": {"type": ["string", "null"]},
+        "locked_channels": {"type": "array", "items": {"type": "string"}},
+        "shape_id": {"type": ["string", "null"]},
+        "attributes": {"type": "array", "items": {"$ref": "#/$defs/attribute"}}
+      }
+    },
+    "attribute": {
+      "type": "object",
+      "required": ["name", "type", "value"],
+      "properties": {
+        "name": {"type": "string"},
+        "type": {"enum": ["float", "int", "enum", "bool"]},
+        "value": {"type": "number"},
+        "min": {"type": "number"},
+        "max": {"type": "number"},
+        "enum_names": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "shape": {
+      "type": "object",
+      "required": ["strands"],
+      "properties": {
+        "strands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["points"],
+            "properties": {"points": {"type": "array", "items": {"$ref": "#/$defs/vec3"}}, "closed": {"type": "boolean"}}
+          }
+        }
+      }
+    },
+    "constraint": {
+      "type": "object",
+      "required": ["bone", "type", "channels", "targets"],
+      "properties": {
+        "bone": {"type": "string"},
+        "type": {"enum": ["parent", "point", "orient", "scale", "aim"]},
+        "channels": {
+          "type": "object",
+          "properties": {
+            "translate": {"type": "array", "items": {"enum": ["x", "y", "z"]}},
+            "rotate": {"type": "array", "items": {"enum": ["x", "y", "z"]}},
+            "scale": {"type": "array", "items": {"enum": ["x", "y", "z"]}}
+          }
+        },
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["weight", "controller"],
+            "properties": {
+              "weight": {"type": "number"},
+              "controller": {"$ref": "#/$defs/controller"}
+            }
+          }
+        }
+      }
+    },
+    "switch": {
+      "type": "object",
+      "required": ["control", "attribute", "ik_value", "fk_value"],
+      "properties": {
+        "control": {"$ref": "#/$defs/controller"},
+        "attribute": {"type": "string"},
+        "ik_value": {"type": "number"},
+        "fk_value": {"type": "number"},
+        "default_ik_weight": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "spline": {
+      "type": "object",
+      "required": ["controls", "cvs"],
+      "properties": {
+        "controls": {"type": "array", "items": {"$ref": "#/$defs/controller"}, "minItems": 1},
+        "cvs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["anchor_bone", "weights"],
+            "properties": {"weights": {"type": "array", "items": {"type": "number"}}}
+          }
+        }
+      }
+    }
+  }
+}

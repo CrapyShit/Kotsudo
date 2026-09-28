@@ -1,8 +1,12 @@
 class RigModule:
     module_type = None
+    # Solve stage this module's nodes run in (see RigBuilder.SOLVE_STAGES):
+    # primary solvers (FK / IK / spline / constraints) by default; helpers,
+    # dynamics and curve drivers will declare later stages.
+    solve_stage = "primary"
 
     def __init__(self, context, chain, recipe, name, logger=None,
-                 parent_module_name=None, parent_attach_point=None):
+                 parent_module_name=None, parent_attach_point=None, parent_bone=None):
         self.context = context
         self.chain = chain
         self.recipe = recipe
@@ -11,7 +15,28 @@ class RigModule:
         # Name of the module whose attach point this module roots under, or None.
         self.parent_module_name = parent_module_name
         # Which attach point on the parent to use for control parenting (e.g. "fk_tip_ctrl").
+        # Legacy: only used when the manifest has no parent_bone.
         self.parent_attach_point = parent_attach_point
+        # The skeleton joint this module hangs from (connections.parent_bone).
+        self.parent_bone = parent_bone
+
+    def default_parent_key(self):
+        """Where this module's controls hang when no Maya parent says otherwise.
+
+        The follow space of the joint the module hangs from: a null tracking
+        that joint's FINAL transform, whatever solves it (FK, IK, spline,
+        constraints). Falls back to the legacy attach-point control, then world.
+        """
+        from .. import graph_utils
+
+        if self.parent_bone:
+            key = self.context.follow_space(self.parent_bone)
+            if key is not None:
+                return key
+        return (
+            self.context.get_parent_control_key(self.parent_module_name, self.parent_attach_point)
+            or graph_utils.get_world_parent_key(self.context.hierarchy, self.context.hierarchy_controller)
+        )
 
     @classmethod
     def describe_contract(cls):

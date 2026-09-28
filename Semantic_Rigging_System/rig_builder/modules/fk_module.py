@@ -5,7 +5,7 @@ try:
 except ImportError:
     unreal = cast(Any, None)
 
-from .. import graph_utils
+from .. import constraints, graph_utils
 from .rig_module import RigModule
 
 
@@ -55,10 +55,7 @@ class FKModule(RigModule):
             raise RuntimeError("RigUnit_SetTransform is not available in this Unreal Python API.")
 
         module_prefix = graph_utils.sanitize_name(self.name)
-        parent_key = (
-            self.context.get_parent_control_key(self.parent_module_name, self.parent_attach_point)
-            or graph_utils.get_world_parent_key(hierarchy, hierarchy_controller)
-        )
+        parent_key = self.default_parent_key()
         control_scale_multiplier = float(recipe_data.get("ControlScale") or 1.0)
         control_scale = graph_utils.compute_chain_scale(
             hierarchy, self.chain, fraction=0.35, multiplier=control_scale_multiplier
@@ -67,44 +64,67 @@ class FKModule(RigModule):
 
         x_origin = self.context.claim_module_column()
 
+        # Bones driven channel-by-channel in Maya (point-only, orient-only,
+        # several targets, one controller feeding several bones...) are rebuilt
+        # from the exported constraints instead of one FK control per bone.
+        records = constraints.constraint_records(recipe_data)
+        mode = str(recipe_data.get("ConstraintMode") or "auto").strip().lower()
+        if records and (mode == "always" or (mode == "auto" and constraints.needs_constraint_mode(records))):
+            return self._build_from_constraints(
+                recipe_data, records, parent_key, module_prefix, control_scale,
+                x_origin, forwards_solve,
+            )
+
         controls = []
         nodes = []
         attach_points = {
             "root": self.chain[0],
             "tip": self.chain[-1],
         }
+        # Pass 1: every control. Parent resolution may add follow-space update
+        # nodes to the exec chain, so no exec wiring happens until all the
+        # module's controls exist (pass 2 reads the exec tail afterwards).
+        built = []
         previous_control_key = parent_key
-        previous_exec_node = self.context.get_exec_tail() or forwards_solve
-
         for index, bone_name in enumerate(self.chain):
             bone_transform = graph_utils.get_bone_global_transform(hierarchy, bone_name)
-            bone_position = graph_utils.transform_to_location(bone_transform)
             chain_direction = graph_utils.get_chain_direction(hierarchy, self.chain, index)
             shape_rotation = graph_utils.get_control_shape_rotation(bone_transform, chain_direction)
+            control_name = f"{module_prefix}_{graph_utils.sanitize_name(bone_name)}_FK_CTRL"
+
+            # One call resolves everything the Maya controller contributes:
+            # its origin (control at the controller, bone driven through a
+            # null), its exact shape, and its custom attributes. The parent is
+            # the Maya parent controller when it exists in the rig.
+            record = graph_utils.find_controller_record(recipe_data, bone_name, ("bone_driver",))
+            control_name = self.context.control_name(record, control_name)
+            control_key, driver_null = graph_utils.build_record_control(
+                self.context.rig, hierarchy, hierarchy_controller, recipe_data,
+                self.context.resolve_control_parent(record, previous_control_key),
+                control_name, bone_name, bone_transform, record,
+                graph_utils.record_color(record, unreal.LinearColor(1.0, 0.65, 0.1, 1.0)),
+                control_shape, (control_scale, control_scale, control_scale), shape_rotation,
+            )
+            if driver_null and self.logger:
+                self.logger.log(
+                    f"[FKModule] '{control_name}' placed at the Maya controller origin, "
+                    f"bone driven through '{driver_null}'."
+                )
+            built.append((control_name, driver_null))
+            previous_control_key = control_key
+
+        # Pass 2: graph nodes and exec wiring.
+        previous_exec_node = self.context.get_exec_tail() or forwards_solve
+        for index, bone_name in enumerate(self.chain):
+            control_name, driver_null = built[index]
             safe_bone_name = graph_utils.sanitize_name(bone_name)
-            control_name = f"{module_prefix}_{safe_bone_name}_FK_CTRL"
             get_control_node = f"{module_prefix}_{safe_bone_name}_GetFK"
             set_transform_node = f"{module_prefix}_{safe_bone_name}_SetFK"
 
-            control_key = graph_utils.create_control(
-                hierarchy,
-                hierarchy_controller,
-                previous_control_key,
-                control_name,
-                bone_position,
-                unreal.LinearColor(1.0, 0.65, 0.1, 1.0),
-                (control_scale, control_scale, control_scale),
-                shape_name=control_shape,
-                shape_rotation=shape_rotation,
-            )
-            hierarchy.set_global_transform(control_key, bone_transform, True, True)
-
-            graph_utils.create_unit_node(
-                controller,
-                model,
-                get_control_node,
-                unreal.RigUnit_GetControlTransform,
+            graph_utils.create_transform_getter(
+                controller, model, get_control_node,
                 unreal.Vector2D(x_origin, 180 + index * 220),
+                control_name, driver_null,
             )
             graph_utils.create_unit_node(
                 controller,
@@ -114,8 +134,6 @@ class FKModule(RigModule):
                 unreal.Vector2D(x_origin + 520, 180 + index * 220),
             )
 
-            graph_utils.set_pin_default(controller, model, f"{get_control_node}.Control", control_name)
-            graph_utils.set_pin_default(controller, model, f"{get_control_node}.Space", "GlobalSpace")
             graph_utils.set_key_pin(controller, model, set_transform_node, ["Item", "Bone", "Child"], "Bone", bone_name)
             graph_utils.set_any_pin(controller, model, set_transform_node, ["Space"], "GlobalSpace")
             graph_utils.set_any_pin(controller, model, set_transform_node, ["Initial"], "False")
@@ -131,17 +149,7 @@ class FKModule(RigModule):
             if not graph_utils.connect_pins(controller, model, f"{get_control_node}.Transform", f"{set_transform_node}.Value"):
                 graph_utils.connect_pins(controller, model, f"{get_control_node}.Transform", f"{set_transform_node}.Transform")
 
-            source_exec = (
-                f"{previous_exec_node}.ExecuteContext"
-                if graph_utils.pin_exists(model, f"{previous_exec_node}.ExecuteContext")
-                else f"{previous_exec_node}.Execute"
-            )
-            target_exec = (
-                f"{set_transform_node}.ExecuteContext"
-                if graph_utils.pin_exists(model, f"{set_transform_node}.ExecuteContext")
-                else f"{set_transform_node}.Execute"
-            )
-            graph_utils.connect_pins(controller, model, source_exec, target_exec)
+            graph_utils.connect_exec(controller, model, previous_exec_node, set_transform_node)
 
             controls.append(control_name)
             nodes.extend([get_control_node, set_transform_node])
@@ -154,7 +162,6 @@ class FKModule(RigModule):
                 attach_points["mid"] = bone_name
                 attach_points["fk_mid_ctrl"] = control_name
 
-            previous_control_key = control_key
             previous_exec_node = set_transform_node
 
         # Advance the shared exec tail so the next module chains after FK.
@@ -178,17 +185,56 @@ class FKModule(RigModule):
             },
         )
 
+    def _build_from_constraints(self, recipe_data, records, parent_key, module_prefix,
+                                control_scale, x_origin, forwards_solve):
+        """Constraint mode: Maya controllers + native constraint nodes."""
+        builder = constraints.ConstraintBuilder(
+            self, recipe_data, parent_key, module_prefix,
+            (control_scale, control_scale, control_scale),
+        )
+        # Children track the constrained bones through follow spaces the
+        # context creates on demand.
+        self.context.set_exec_tail(builder.build(records, forwards_solve, x_origin))
+
+        if self.logger:
+            self.logger.log(
+                f"[FKModule] {self.name}: constraint mode, {len(records)} constraint(s), "
+                f"controls {builder.controls}."
+            )
+            self.logger.pop()
+
+        attach_points = {"root": self.chain[0], "tip": self.chain[-1]}
+        if builder.controls:
+            attach_points["fk_root_ctrl"] = builder.controls[0]
+            attach_points["fk_tip_ctrl"] = builder.controls[-1]
+        return self.build_result(
+            controls=builder.controls,
+            nodes=builder.nodes,
+            attach_points=attach_points,
+            outputs={"driven_bones": list(self.chain), "mode": "constraints"},
+            recipe_data=recipe_data,
+            metadata={"constraint_count": len(records)},
+        )
+
     def read_recipe(self):
         recipe_fields = {
             "ModuleType": None,
             "ControlShape": "Circle_Thick",
             "ControlScale": 1.0,
+            "ControllerRecords": None,
+            "ShapeTable": None,
+            "Constraints": None,
+            "ConstraintMode": "auto",
         }
 
         fallback_names = {
             "ModuleType": ["module_type"],
             "ControlShape": ["control_shape"],
             "ControlScale": ["control_scale"],
+            "Constraints": ["constraints"],
+            "ConstraintMode": ["constraint_mode"],
+            "ControllerRecords": ["controller_records", "controllerrecords"],
+            "ShapeTable": ["shape_table", "shapetable"],
         }
 
         return self.resolve_recipe_fields(recipe_fields, fallback_names=fallback_names)
