@@ -9,6 +9,7 @@ Shelf button (Python):
 
     import sys, importlib
     sys.path.insert(0, r"E:\\Kotsudo\\Semantic_Rigging_System\\tools\\maya")
+    importlib.invalidate_caches()   # see files added since Maya started
     import kotsudo_launcher; importlib.reload(kotsudo_launcher); kotsudo_launcher.launch()
 """
 
@@ -28,6 +29,7 @@ def reload_all():
     for path in (HERE, REPO):
         if path not in sys.path:
             sys.path.insert(0, path)
+    importlib.invalidate_caches()   # modules added since Maya started
     # The shared validator lives in the Unreal-side package; drop it so the
     # exporter imports the current version.
     for name in [m for m in sys.modules if m == "rig_builder" or m.startswith("rig_builder.")]:

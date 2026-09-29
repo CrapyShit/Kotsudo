@@ -3572,6 +3572,9 @@ def export(export_dir, filename_base, rig_name, modules_config):
         here = os.path.dirname(os.path.abspath(__file__))
         if here not in sys.path:
             sys.path.insert(0, here)
+        # Python caches each folder's file list: a module file added after
+        # Maya started is invisible to import until the cache is dropped.
+        importlib.invalidate_caches()
         import export_test_poses
         importlib.reload(export_test_poses)
         export_test_poses.export_test_poses(
