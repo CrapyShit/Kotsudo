@@ -405,7 +405,21 @@ class IKFKModule(RigModule):
         graph_utils.set_any_pin(controller, model, node, ["Space"], "GlobalSpace")
         graph_utils.set_any_pin(controller, model, node, ["bInitial", "Initial"], "False")
         graph_utils.set_any_pin(controller, model, node, ["bPropagateToChildren", "PropagateToChildren"], "True")
-        graph_utils.connect_pins(controller, model, f"{get_node}.Transform.Rotation", f"{node}.Rotation")
+        # The quaternion input is "Value" on UE5's Set Rotation ("Rotation" on
+        # older builds). An unconnected pin would silently write identity.
+        if not any(
+            graph_utils.connect_pins(controller, model, f"{get_node}.Transform.Rotation", f"{node}.{pin}")
+            for pin in ("Value", "Rotation")
+            if graph_utils.pin_exists(model, f"{node}.{pin}")
+        ):
+            _log_node_pins(node, model)
+            _log_warning(f"{self.name}: could not wire the IK end-bone rotation; removed.")
+            try:
+                controller.remove_node_by_name(node)
+            except Exception:
+                pass
+            return None
+        _log_info(f"{self.name}: '{self.chain[-1]}' follows the IK control's rotation (IK-weighted).")
         # Same weight as the solver: the switch source, or the blend variable.
         source = getattr(self, "_ik_weight_source", None)
         if source:

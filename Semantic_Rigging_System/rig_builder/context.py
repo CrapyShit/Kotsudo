@@ -174,6 +174,9 @@ class RigContext:
                 return None
             self._follow_spaces[bone] = name
             owner = self.bone_owner.get(bone)
+            if not owner and self.bone_owner:
+                self._warn(f"Follow space on '{bone}', which no module drives: controls under it "
+                           "will not move (re-export: the exporter now prefers module joints).")
             if owner and owner not in self._finished_modules:
                 self._pending_follow.setdefault(owner, []).append(bone)
             else:

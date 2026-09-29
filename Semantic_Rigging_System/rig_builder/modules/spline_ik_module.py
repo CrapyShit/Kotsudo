@@ -1078,11 +1078,11 @@ class SplineIKModule(RigModule):
         return {"records": records, "positions": positions, "cvs": cvs}
 
     @staticmethod
-    def _influences_of(cv, limit=2, minimum=0.01):
+    def _influences_of(cv, limit=None, minimum=0.01):
         """Indices of the controls influencing a CV, strongest first."""
         weights = cv.get("weights") or []
         order = sorted(range(len(weights)), key=lambda j: -float(weights[j]))
-        chosen = [j for j in order[:limit] if float(weights[j]) >= minimum]
+        chosen = [j for j in (order[:limit] if limit else order) if float(weights[j]) >= minimum]
         return chosen or order[:1]
 
     def _create_cv_drivers(self, hierarchy, hierarchy_controller, module_prefix, plan, control_keys):
@@ -1107,8 +1107,12 @@ class SplineIKModule(RigModule):
     def _build_cv_sources(self, controller, model, module_prefix, plan, drivers, x_origin, all_nodes):
         """Graph pins giving each spline point (one per Maya CV).
 
-        A CV influenced by two controls is a vector lerp between the two
-        driver nulls, weighted by the Maya skin weights.
+        A CV is the Maya skin-weighted average of its driver nulls (one per
+        influencing control, riding on it -- so control rotation counts too).
+        Any number of influences, as a chain of lerps: after adding influence
+        i the running result has weight W_i, and the lerp towards p_i uses
+        w_i / W_i -- exactly the weighted average. Dropping the weakest
+        influence (an earlier two-control limit) bent the curve unlike Maya's.
         """
         lerp_unit = None
         for candidate in ("RigUnit_MathVectorLerp", "RigUnit_MathVectorInterpolate", "RigUnit_MathVectorMix"):
@@ -1134,21 +1138,26 @@ class SplineIKModule(RigModule):
                 sources.append(pins[0][0])
                 continue
 
-            lerp_node = f"{module_prefix}_CV{cv_index:02d}_Lerp"
-            graph_utils.create_unit_node(
-                controller, model, lerp_node, lerp_unit,
-                unreal.Vector2D(x_origin - 100, 60 + cv_index * 200),
-            )
-            graph_utils.connect_pins(controller, model, pins[0][0], f"{lerp_node}.A")
-            graph_utils.connect_pins(controller, model, pins[1][0], f"{lerp_node}.B")
-            total = pins[0][1] + pins[1][1]
-            graph_utils.set_any_pin(
-                controller, model, lerp_node, ["T", "Alpha", "Ratio", "W"],
-                str(round(pins[1][1] / total, 6) if total > 1e-9 else 0.0),
-            )
-            all_nodes.append(lerp_node)
-            result = _find_pin_among(model, lerp_node, ["Result", "Value", "ReturnValue"])
-            sources.append(f"{lerp_node}.{result}" if result else pins[0][0])
+            running_pin, running_weight = pins[0]
+            for step, (pin, weight) in enumerate(pins[1:], start=1):
+                lerp_node = f"{module_prefix}_CV{cv_index:02d}_Lerp" + (f"{step}" if step > 1 else "")
+                graph_utils.create_unit_node(
+                    controller, model, lerp_node, lerp_unit,
+                    unreal.Vector2D(x_origin - 100 + (step - 1) * 220, 60 + cv_index * 200),
+                )
+                graph_utils.connect_pins(controller, model, running_pin, f"{lerp_node}.A")
+                graph_utils.connect_pins(controller, model, pin, f"{lerp_node}.B")
+                running_weight += weight
+                graph_utils.set_any_pin(
+                    controller, model, lerp_node, ["T", "Alpha", "Ratio", "W"],
+                    str(round(weight / running_weight, 6) if running_weight > 1e-9 else 0.0),
+                )
+                all_nodes.append(lerp_node)
+                result = _find_pin_among(model, lerp_node, ["Result", "Value", "ReturnValue"])
+                if not result:
+                    break
+                running_pin = f"{lerp_node}.{result}"
+            sources.append(running_pin)
         return sources
 
     def read_recipe(self):

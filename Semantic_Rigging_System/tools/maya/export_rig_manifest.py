@@ -867,16 +867,30 @@ def _space_drivers(node):
         for source in sources:
             if cmds.objectType(source, isAType='constraint'):
                 drivers = drivers if drivers is not None else []
-                targets = cmds.listConnections(
-                    '{}.target'.format(source), source=True, destination=False
-                ) or []
-                for target in targets:
+                for target in _constraint_targets(source):
                     if (target not in drivers and target != _short_node_name(node)
                             and cmds.objectType(target, isAType='transform')):
                         drivers.append(target)
             elif attribute == 'offsetParentMatrix':
                 drivers = drivers if drivers is not None else []
     return drivers
+
+
+def _constraint_targets(constraint):
+    """The transforms a constraint follows -- what feeds each target's
+    parent matrix. Weight inputs (an IK/FK switch wired to target weights)
+    are also connected under .target and must not count as targets."""
+    targets = []
+    for index in cmds.getAttr('{}.target'.format(constraint), multiIndices=True) or []:
+        for plug in ('targetParentMatrix', 'targetTranslate', 'targetRotate'):
+            sources = cmds.listConnections(
+                '{}.target[{}].{}'.format(constraint, index, plug), source=True, destination=False
+            ) or []
+            if sources:
+                if sources[0] not in targets:
+                    targets.append(sources[0])
+                break
+    return targets
 
 
 def _is_driven_space(node):
@@ -913,10 +927,8 @@ def _parent_space(node):
             drivers = _space_drivers(current)
             if drivers is not None:
                 if not controllers:
-                    points = [
-                        cmds.xform(target, query=True, worldSpace=True, rotatePivot=True)
-                        for target in drivers
-                    ] or [cmds.xform(current, query=True, worldSpace=True, rotatePivot=True)]
+                    points = [_target_point(target) for target in drivers] or [
+                        cmds.xform(current, query=True, worldSpace=True, rotatePivot=True)]
                     centre = [sum(p[i] for p in points) / len(points) for i in range(3)]
                     return controllers, _nearest_exported_joint(centre)
                 break
@@ -931,14 +943,42 @@ def _exported_joints():
     return root + (cmds.listRelatives(root[0], allDescendents=True, type='joint', fullPath=True) or [])
 
 
+def _is_module_joint(joint):
+    """True for joints a tagged module owns (rebuilt in Unreal)."""
+    try:
+        return bool(cmds.attributeQuery('rigTag_moduleName', node=joint, exists=True)
+                    and cmds.getAttr('{}.rigTag_moduleName'.format(joint)))
+    except Exception:
+        return False
+
+
 def _nearest_exported_joint(world_point):
-    best, best_distance = None, None
+    """Exported joint nearest to a point; module joints win ties (within 0.1
+    unit) over helper chains sitting at the same place -- a blended limb's
+    FK/IK duplicate joints are exported but not rebuilt, so a space following
+    one of them would never move in Unreal."""
+    ranked = []
     for joint in _exported_joints():
         position = _world_translation(joint)
-        distance = sum((position[i] - world_point[i]) ** 2 for i in range(3))
-        if best_distance is None or distance < best_distance:
-            best, best_distance = joint, distance
-    return _short_node_name(best) if best else None
+        distance = sum((position[i] - world_point[i]) ** 2 for i in range(3)) ** 0.5
+        ranked.append((distance, joint))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    nearest = ranked[0][0]
+    for distance, joint in ranked:
+        if distance > nearest + 0.1:
+            break
+        if _is_module_joint(joint):
+            return _short_node_name(joint)
+    return _short_node_name(ranked[0][1])
+
+
+def _target_point(node):
+    """Where a constraint target sits: a joint's position, else its pivot."""
+    if cmds.objectType(node, isAType='joint'):
+        return _world_translation(node)
+    return cmds.xform(node, query=True, worldSpace=True, rotatePivot=True)
 
 
 def _joint_local_unreal(world_point, joint):
