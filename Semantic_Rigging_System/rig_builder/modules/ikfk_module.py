@@ -308,14 +308,18 @@ class IKFKModule(RigModule):
         _chain_exec(controller, model, exec_tail, ik_node)
         exec_tail = ik_node
 
-        # The two-bone solver only places the chain; the hand/foot must also
-        # take the IK control's rotation (Maya: the IK control orients the
-        # wrist/ankle), blended by the same IK weight.
-        tip_node = self._build_tip_rotation(
-            controller, model, hierarchy, hierarchy_controller, module_prefix,
-            ik_effector_key, tip_transform, ik_col, weight_pin,
-            blend_var if switch_control is None else None,
-        )
+        # The two-bone solver only places the chain. When the Maya rig ALSO
+        # orients the end joint (an orient/parent constraint on the IK wrist or
+        # ankle, exported as ik_end_orient), the hand/foot takes the IK
+        # control's rotation, blended by the same IK weight. Without it Maya
+        # leaves the end joint to the solver, and so does Unreal.
+        tip_node = None
+        if graph_utils.recipe_bool(recipe_data.get("IKEndOrient"), False):
+            tip_node = self._build_tip_rotation(
+                controller, model, hierarchy, hierarchy_controller, module_prefix,
+                ik_effector_key, tip_transform, ik_col, weight_pin,
+                blend_var if switch_control is None else None,
+            )
         if tip_node:
             _chain_exec(controller, model, exec_tail, tip_node)
             exec_tail = tip_node
@@ -810,6 +814,7 @@ class IKFKModule(RigModule):
             "ShapeTable": None,
             "Switch": None,
             "SwitchDrivesVisibility": True,
+            "IKEndOrient": False,
             "ChainAxes": None,
         }
         fallback_names = {
@@ -817,6 +822,7 @@ class IKFKModule(RigModule):
             "ShapeTable": ["shape_table", "shapetable"],
             "Switch": ["switch"],
             "SwitchDrivesVisibility": ["switch_drives_visibility"],
+            "IKEndOrient": ["ik_end_orient"],
             "ChainAxes": ["chain_axes"],
             "ModuleType": ["module_type"],
             "ControlScale": ["control_scale", "controlscale"],

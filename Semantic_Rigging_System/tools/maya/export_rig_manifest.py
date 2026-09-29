@@ -1419,6 +1419,34 @@ def _constraint_drives_joint(constraint, joint):
     return False
 
 
+def _ik_end_joint(handle):
+    """The joint an ikHandle's end effector follows (the chain's end joint)."""
+    try:
+        effector = cmds.ikHandle(handle, query=True, endEffector=True)
+    except Exception:
+        return None
+    sources = cmds.listConnections('{}.translateX'.format(effector), source=True,
+                                   destination=False, type='joint') or []
+    return sources[0] if sources else None
+
+
+def ik_end_orient(module):
+    """True when the IK chain's END joint is oriented by the rig (an orient or
+    parent constraint on it -- typically to the IK control), False when only
+    the solver sets it. An IK solver alone never rotates the end joint with
+    the IK control; Unreal must copy that behaviour, not assume either way.
+    """
+    ik_root = (module.get('params') or {}).get('ik_chain_root')
+    handle = _ik_handle_for_joint(ik_root) if ik_root and cmds.objExists(ik_root) else None
+    end = _ik_end_joint(handle) if handle else None
+    if not end:
+        return False
+    for kind in ('orientConstraint', 'parentConstraint'):
+        if cmds.listConnections(end, type=kind, source=True, destination=False):
+            return True
+    return False
+
+
 def _ik_handle_for_joint(joint):
     """The ikHandle whose solved chain contains ``joint`` (start..end), or None."""
     short = _short_node_name(_full_dag_path(joint))
@@ -3053,6 +3081,7 @@ def _merge_scene_detected_module_data(module):
         if enriched.get('module_type') == 'IKFKSwitch':
             _verify_ikfk_roots(enriched)
             extra = _ikfk_switch_export(enriched)
+            extra['ik_end_orient'] = ik_end_orient(enriched)
         elif enriched.get('module_type') == 'SplineIK':
             spline = _spline_ik_export(enriched)
             extra = {'spline': spline} if spline else {}
