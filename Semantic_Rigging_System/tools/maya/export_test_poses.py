@@ -14,19 +14,26 @@ quaternions [x, y, z, w] of the converted world frame. The rest pose is
 pose 0. Unreal replays the inputs on the rebuilt Control Rig and compares
 (rig_builder/pose_harness.py).
 
+IK/FK limbs: a probe of an FK control is taken with its limb in FK, an IK
+control's with the limb in IK; every pose records all switch values as
+channels, so Unreal replays the same mode.
+
 Usage: export() in export_rig_manifest.py writes <name>.poses.json next to
-the FBX; call export_test_poses(path, manifest) directly to regenerate.
+the FBX. To regenerate only the poses (no FBX export), in Maya:
+
+    import export_test_poses; export_test_poses.export_from_scene()
 """
 
 import json
 import math
+import os
 import random
 
 import maya.cmds as cmds
 
 import export_rig_manifest as erm
 
-POSES_SCHEMA_VERSION = 1
+POSES_SCHEMA_VERSION = 2   # 2: switch modes per pose, probe info, maya_motion
 ROTATE_PROBE_DEGREES = 20.0
 TRANSLATE_PROBE_CM = 5.0
 RANDOM_POSES = 12
@@ -171,6 +178,86 @@ def _probe_value(channel, current, attribute_info, unit_scale):
     return lo if abs(current - hi) < 1e-6 else hi
 
 
+# ---------------------------------------------------------------------------
+# IK/FK switches
+# ---------------------------------------------------------------------------
+
+_FK_ROLES = ("bone_driver", "constraint_driver")
+_IK_ROLES = ("ik_effector", "effector", "pole_vector", "pv")
+
+
+def _record_name(record):
+    return record.get("shape_source") or record.get("ue_control_name") or record.get("name")
+
+
+def switches(manifest):
+    """Every exported IK/FK switch: control, attribute, IK and FK values."""
+    found = []
+    for module in manifest.get("modules") or []:
+        switch = ((module.get("params") or {}).get("switch")) or {}
+        record = switch.get("control") or {}
+        name = _record_name(record) if record else None
+        matches = cmds.ls(name, long=True) if name else []
+        if not matches or not switch.get("attribute"):
+            continue
+        found.append({
+            "module": module.get("module_name"),
+            "control": erm._short_node_name(matches[0]),
+            "node": matches[0],
+            "attribute": switch["attribute"],
+            "ik": float(switch.get("ik_value", 1.0)),
+            "fk": float(switch.get("fk_value", 0.0)),
+        })
+    return found
+
+
+def control_modes(manifest, found_switches):
+    """{control name: (switch index, "ik" | "fk")} for the controls of switched limbs.
+
+    A probe of an FK control is only meaningful with its limb in FK (in IK
+    the control moves nothing), and vice versa -- so each probe first puts
+    the limb in the right mode, and records it.
+    """
+    # Controller records live all over the manifest (per bone, per module);
+    # each one names its module, which is what ties it to a switch.
+    index_of = {s["module"]: i for i, s in enumerate(found_switches)}
+    modes = {}
+    for record in _records(manifest):
+        index = index_of.get(record.get("module_name"))
+        if index is None:
+            continue
+        role = str(record.get("role") or "")
+        mode = "fk" if role in _FK_ROLES else "ik" if role in _IK_ROLES else None
+        if mode:
+            modes.setdefault(_record_name(record), (index, mode))
+    return modes
+
+
+def _switch_channels(found_switches):
+    """Current value of every switch, as pose channels."""
+    return {
+        "{}.{}".format(s["control"], s["attribute"]): float(cmds.getAttr("{}.{}".format(s["node"], s["attribute"])))
+        for s in found_switches
+    }
+
+
+def _motion(pose, rest):
+    """Largest joint motion of a pose vs rest (cm, deg): 0 means a dead probe."""
+    cm = deg = 0.0
+    for name, state in pose["joints"].items():
+        base = rest["joints"].get(name)
+        if not base:
+            continue
+        cm = max(cm, math.sqrt(sum((a - b) ** 2 for a, b in zip(state["t"], base["t"]))))
+        dot = min(1.0, abs(sum(a * b for a, b in zip(state["q"], base["q"]))))
+        deg = max(deg, math.degrees(2.0 * math.acos(dot)))
+    return {"cm": round(cm, 4), "deg": round(deg, 4)}
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
 def export_test_poses(path, manifest):
     """Write the probe + random pose set. Restores every touched attribute."""
     joints = erm._exported_joints()
@@ -179,15 +266,18 @@ def export_test_poses(path, manifest):
     attribute_info = {}
     for record in _records(manifest):
         for info in record.get("attributes") or []:
-            owner = record.get("shape_source") or record.get("ue_control_name") or record.get("name")
-            attribute_info[(owner, info.get("name"))] = info
+            attribute_info[(_record_name(record), info.get("name"))] = info
+
+    found_switches = switches(manifest)
+    modes = control_modes(manifest, found_switches)
 
     plan = []   # (control, node, channel)
     for control_name, node in sorted(controls.items()):
         rotate, translate, custom = _channels(node, _attribute_names(manifest, control_name))
         plan.extend((control_name, node, c) for c in rotate + translate + custom)
 
-    poses = [_capture(joints, {}, {}, "rest", "rest")]
+    poses = [_capture(joints, {}, _switch_channels(found_switches), "rest", "rest")]
+    rest = poses[0]
     # Rest state of every control: its frame (t, q) for replaying deltas, and
     # its origin (o) as the builder places it, for calibration.
     control_rest = {}
@@ -214,28 +304,59 @@ def export_test_poses(path, manifest):
         touched.setdefault(plug, previous)
         return True
 
+    def _restore():
+        for plug in list(touched):
+            cmds.setAttr(plug, touched.pop(plug))
+
+    def _set_mode(control_name, mode=None):
+        """Put the limb of ``control_name`` in its mode (or ``mode``)."""
+        index, wanted = modes.get(control_name, (None, None))
+        if index is None:
+            return
+        switch = found_switches[index]
+        _set(switch["node"], switch["attribute"], switch[mode or wanted])
+
+    def _add(pose):
+        pose["maya_motion"] = _motion(pose, rest)
+        poses.append(pose)
+
     try:
         for control_name, node, channel in plan:
             plug = "{}.{}".format(node, channel)
+            is_custom = channel not in _ROTATE + _TRANSLATE
+            if not is_custom:
+                _set_mode(control_name)
             current = cmds.getAttr(plug)
             info = attribute_info.get((control_name, channel), {})
             if not _set(node, channel, _probe_value(channel, current, info, unit_scale)):
+                _restore()
                 continue
-            is_custom = channel not in _ROTATE + _TRANSLATE
-            poses.append(_capture(
-                joints,
-                {} if is_custom else {control_name: node},
-                {"{}.{}".format(control_name, channel): cmds.getAttr(plug)} if is_custom else {},
+            channels = _switch_channels(found_switches)
+            if is_custom:
+                channels["{}.{}".format(control_name, channel)] = float(cmds.getAttr(plug))
+            pose = _capture(
+                joints, {} if is_custom else {control_name: node}, channels,
                 "{}.{}".format(control_name, channel), "probe",
-            ))
-            cmds.setAttr(plug, touched.pop(plug))
+            )
+            pose["probe"] = {"control": control_name, "channel": channel,
+                             "mode": modes.get(control_name, (None, None))[1] if not is_custom else None}
+            _add(pose)
+            _restore()
 
+        # Random multi-control poses, each limb in a random mode; only the
+        # controls active in their limb's mode are posed.
         rng = random.Random(RANDOM_SEED)
         transform_plan = [p for p in plan if p[2] in _ROTATE + _TRANSLATE]
         for index in range(RANDOM_POSES if transform_plan else 0):
-            chosen = rng.sample(transform_plan, min(RANDOM_CONTROLS_PER_POSE, len(transform_plan)))
+            chosen_modes = [rng.choice(("ik", "fk")) for _ in found_switches]
+            for switch, mode in zip(found_switches, chosen_modes):
+                _set(switch["node"], switch["attribute"], switch[mode])
+            active = [
+                p for p in transform_plan
+                if p[0] not in modes or chosen_modes[modes[p[0]][0]] == modes[p[0]][1]
+            ]
             posed = {}
-            for control_name, node, channel in chosen:
+            for control_name, node, channel in rng.sample(active, min(RANDOM_CONTROLS_PER_POSE, len(active))):
                 current = cmds.getAttr("{}.{}".format(node, channel))
                 if channel in _ROTATE:
                     value = current + rng.uniform(-30.0, 30.0)
@@ -243,15 +364,14 @@ def export_test_poses(path, manifest):
                     value = current + rng.uniform(-8.0, 8.0) / unit_scale
                 if _set(node, channel, value):
                     posed[control_name] = node
-            if not posed:
-                continue
-            poses.append(_capture(joints, posed, {}, "random_{:02d}".format(index), "random"))
-            for plug in list(touched):
-                cmds.setAttr(plug, touched.pop(plug))
+            if posed:
+                _add(_capture(joints, posed, _switch_channels(found_switches),
+                              "random_{:02d}".format(index), "random"))
+            _restore()
     finally:
-        for plug, value in touched.items():
-            cmds.setAttr(plug, value)
+        _restore()
 
+    dead = [p["name"] for p in poses[1:] if p["maya_motion"]["cm"] < 1e-3 and p["maya_motion"]["deg"] < 1e-3]
     document = {
         "schema": "kotsudo.poses",
         "schema_version": POSES_SCHEMA_VERSION,
@@ -262,13 +382,39 @@ def export_test_poses(path, manifest):
                   "random_poses": RANDOM_POSES, "seed": RANDOM_SEED},
         "controls": sorted(controls),
         "control_rest": control_rest,
+        "switches": [{k: s[k] for k in ("module", "control", "attribute", "ik", "fk")} for s in found_switches],
         "poses": poses,
     }
     with open(path, "w") as handle:
         json.dump(document, handle, separators=(",", ":"))
-    print("[RigManifest] Test poses: {} pose(s) over {} control(s) -> {}".format(
-        len(poses), len(controls), path))
+    print("[RigManifest] Test poses: {} pose(s) over {} control(s), {} IK/FK switch(es) -> {}".format(
+        len(poses), len(controls), len(found_switches), path))
+    if dead:
+        print("[RigManifest] Test poses: {} probe(s) move no joint in Maya (e.g. {}); "
+              "Unreal must not move anything for them either.".format(len(dead), ", ".join(dead[:6])))
     if skipped:
         print("[RigManifest] Test poses: {} channel(s) Maya refused to set, skipped: {}".format(
             len(skipped), ", ".join(skipped[:10]) + (" ..." if len(skipped) > 10 else "")))
     return path
+
+
+def export_from_scene(out_dir=None):
+    """Re-export ONLY the test poses, from the manifest last written on the root joint.
+
+    For iterating on a rig without a full FBX export. The file goes where
+    Unreal looks for it: ``out_dir`` (default: the repo's FBXs folder), named
+    by the manifest's ``poses_file``. Run a full export first if the rig's
+    modules or controls changed -- the manifest on the root joint must match
+    the FBX Unreal built from.
+    """
+    plug = "{}.{}".format(erm.ROOT_JOINT_NAME, erm.MANIFEST_ATTR)
+    if not cmds.objExists(plug):
+        raise RuntimeError("No manifest on '{}': run a full export first.".format(plug))
+    manifest = json.loads(cmds.getAttr(plug))
+    if out_dir is None:
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        out_dir = os.path.join(repo, "FBXs")
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
+    name = manifest.get("poses_file") or "{}.poses.json".format(manifest.get("rig_name") or "rig")
+    return export_test_poses(os.path.join(out_dir, name), manifest)

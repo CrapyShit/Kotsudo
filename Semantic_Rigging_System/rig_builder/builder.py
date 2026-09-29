@@ -575,6 +575,8 @@ class RigBuilder:
         source_asset = self.load_source_asset()
         skeleton = self.resolve_skeleton(source_asset)
         skeletal_mesh = source_asset if isinstance(source_asset, unreal.SkeletalMesh) else None
+        # Where the imported FBX came from: the pose check finds its poses file there.
+        self.source_assets = [skeletal_mesh, skeleton]
 
         self.logger.log("[RigBuilder] Reading metadata")
         metadata = {}
