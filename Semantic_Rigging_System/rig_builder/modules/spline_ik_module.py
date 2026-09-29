@@ -5,7 +5,7 @@ try:
 except ImportError:
     unreal = cast(Any, None)
 
-from .. import graph_utils
+from .. import constraints, graph_utils
 from .rig_module import RigModule
 
 # ---------------------------------------------------------------------------
@@ -802,6 +802,20 @@ class SplineIKModule(RigModule):
             self.context.set_exec_tail(last_exec)
             primary_node = last_exec
 
+        # Maya constraints layered on the chain (a top joint orient-constrained
+        # to the chest control...) run after the spline fit, as in Maya.
+        records = constraints.constraint_records(recipe_data)
+        if records:
+            builder = constraints.ConstraintBuilder(
+                self, recipe_data, parent_key, module_prefix,
+                float(recipe_data.get("ControlScale") or 1.0),
+            )
+            self.context.set_exec_tail(builder.build(records, forwards_solve, x_origin + 2400))
+            all_nodes.extend(builder.nodes)
+            if self.logger:
+                self.logger.log(f"[SplineIKModule] {self.name}: {len(records)} extra constraint(s) "
+                                f"on the chain ({', '.join(r['bone'] for r in records)}).")
+
         if self.logger:
             self.logger.pop()
 
@@ -1152,8 +1166,10 @@ class SplineIKModule(RigModule):
             "SamplingPrecision": 16,
             "SquashEnabled": False,
             "SquashAmount": 1.0,
+            "Constraints": None,
         }
         fallback_names = {
+            "Constraints": ["constraints"],
             "ModuleType": ["module_type"],
             "SplineData": ["spline", "spline_data", "splinedata"],
             "ChainAxes": ["chain_axes"],

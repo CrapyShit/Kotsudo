@@ -3016,6 +3016,11 @@ def _merge_scene_detected_module_data(module):
         elif enriched.get('module_type') == 'SplineIK':
             spline = _spline_ik_export(enriched)
             extra = {'spline': spline} if spline else {}
+            # Constraints layered on the spline chain (e.g. the top joint
+            # orient-constrained to the chest control) are part of its behaviour.
+            constraints = _bone_constraints_export(enriched)
+            if constraints:
+                extra['constraints'] = constraints
         elif enriched.get('module_type') == 'FKChain':
             constraints = _bone_constraints_export(enriched)
             extra = {'constraints': constraints} if constraints else {}

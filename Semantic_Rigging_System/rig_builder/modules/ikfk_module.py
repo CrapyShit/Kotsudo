@@ -308,6 +308,19 @@ class IKFKModule(RigModule):
         _chain_exec(controller, model, exec_tail, ik_node)
         exec_tail = ik_node
 
+        # The two-bone solver only places the chain; the hand/foot must also
+        # take the IK control's rotation (Maya: the IK control orients the
+        # wrist/ankle), blended by the same IK weight.
+        tip_node = self._build_tip_rotation(
+            controller, model, hierarchy, hierarchy_controller, module_prefix,
+            ik_effector_key, tip_transform, ik_col, weight_pin,
+            blend_var if switch_control is None else None,
+        )
+        if tip_node:
+            _chain_exec(controller, model, exec_tail, tip_node)
+            exec_tail = tip_node
+            all_nodes.append(tip_node)
+
         # Show only the controls of the active mode (IK controls hidden in
         # full FK and vice versa); both sets while blending.
         if switch_control and graph_utils.recipe_bool(recipe_data.get("SwitchDrivesVisibility"), True):
@@ -363,6 +376,47 @@ class IKFKModule(RigModule):
     # ------------------------------------------------------------------
     # Control visibility from the switch
     # ------------------------------------------------------------------
+
+    def _build_tip_rotation(self, controller, model, hierarchy, hierarchy_controller, prefix,
+                            effector_key, tip_transform, ik_col, weight_pin, blend_var):
+        """SetRotation on the chain's end bone from the IK control, IK-weighted.
+
+        Reads a null under the IK control that sits on the end bone at rest,
+        so the bone keeps its own axes and only the control's motion applies.
+        Returns the node name, or None when the engine lacks the units.
+        """
+        set_rotation = getattr(unreal, "RigUnit_SetRotation", None)
+        if set_rotation is None or effector_key is None:
+            _log_warning(f"{self.name}: RigUnit_SetRotation unavailable; the IK end bone keeps "
+                         "the solver's rotation.")
+            return None
+        align_null = graph_utils.create_offset_driver(
+            hierarchy, hierarchy_controller, effector_key, f"{prefix}_IKTipAlign", tip_transform
+        )
+        if not align_null:
+            return None
+        get_node = f"{prefix}_GetIKTipAlign"
+        graph_utils.create_transform_getter(
+            controller, model, get_node, unreal.Vector2D(ik_col + 700, 520), None, align_null
+        )
+        node = f"{prefix}_IKTipRotation"
+        graph_utils.create_unit_node(controller, model, node, set_rotation, unreal.Vector2D(ik_col + 1000, 520))
+        graph_utils.set_key_pin(controller, model, node, ["Item"], "Bone", self.chain[-1])
+        graph_utils.set_any_pin(controller, model, node, ["Space"], "GlobalSpace")
+        graph_utils.set_any_pin(controller, model, node, ["bInitial", "Initial"], "False")
+        graph_utils.set_any_pin(controller, model, node, ["bPropagateToChildren", "PropagateToChildren"], "True")
+        graph_utils.connect_pins(controller, model, f"{get_node}.Transform.Rotation", f"{node}.Rotation")
+        # Same weight as the solver: the switch source, or the blend variable.
+        source = getattr(self, "_ik_weight_source", None)
+        if source:
+            graph_utils.connect_pins(controller, model, source, f"{node}.Weight")
+        elif blend_var:
+            _bind_pin_to_variable(controller, model, f"{node}.Weight", blend_var,
+                                  unreal.Vector2D(ik_col + 700, 700))
+        else:
+            graph_utils.set_any_pin(controller, model, node, ["Weight"],
+                                    str(float(self.read_recipe().get("DefaultBlend") or 0.0)))
+        return node
 
     def _build_switch_visibility(self, controller, model, prefix, exec_tail, ik_col,
                                  fk_controls, ik_controls):
@@ -518,6 +572,7 @@ class IKFKModule(RigModule):
                     controller, model, f"{module_prefix}_SwitchToIKWeight", out_pin,
                     unreal.Vector2D(ik_col + 520, 500),
                 )
+            self._ik_weight_source = weight_source
             if not weight_source or not graph_utils.connect_pins(
                 controller, model, weight_source, weight_pin
             ):

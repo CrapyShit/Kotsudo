@@ -86,13 +86,14 @@ def world_state(node):
     """(position_cm_ue, quat_ue) of a node's world frame, Unreal convention."""
     axes = erm._world_axes_unreal(node)            # [P(X), P(Z), P(Y)] -- a proper basis
     x_axis, y_axis, z_axis = _orthonormal(axes[0], axes[1])
-    # The frame's world origin (not the pivot): with it, pose x rest^-1 is the
-    # exact rigid world delta even when pivots are moved. Queried with
-    # -translation, NOT read from -matrix: the matrix answers in Maya's
-    # internal cm while the unit scale below expects UI units (m scenes).
-    position = cmds.xform(node, query=True, worldSpace=True, translation=True)
+    # The world MATRIX translation, not the translate channel: with moved
+    # pivots (a frozen control whose pivot is away from its origin) the
+    # matrix is the only frame for which pose x rest^-1 is the exact rigid
+    # motion -- rotating about the pivot. xform -matrix answers in Maya's
+    # INTERNAL unit, always cm, so no UI-unit scale is applied.
+    position = cmds.xform(node, query=True, worldSpace=True, matrix=True)[12:15]
     return (
-        [round(c, 4) for c in erm._maya_vector_to_unreal(position, apply_unit_scale=True)],
+        [round(c, 4) for c in erm._maya_vector_to_unreal(position, apply_unit_scale=False)],
         _quat_from_basis(x_axis, y_axis, z_axis),
     )
 
@@ -370,6 +371,18 @@ def export_test_poses(path, manifest):
             _restore()
     finally:
         _restore()
+
+    # The rest pose again, now that every probe has been applied and undone:
+    # the first capture can precede a full evaluation of the scene (orient
+    # constraints settling), which shows up as a constant error in every pose.
+    settled = _capture(joints, {}, _switch_channels(found_switches), "rest", "rest")
+    drift = max((_motion(settled, rest)["deg"], _motion(settled, rest)["cm"]))
+    if drift > 1e-3:
+        print("[RigManifest] Test poses: rest pose re-captured after evaluation settled "
+              "(first capture was off by up to {:.4f}).".format(drift))
+    poses[0] = settled
+    for pose in poses[1:]:
+        pose["maya_motion"] = _motion(pose, settled)
 
     dead = [p["name"] for p in poses[1:] if p["maya_motion"]["cm"] < 1e-3 and p["maya_motion"]["deg"] < 1e-3]
     document = {

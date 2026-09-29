@@ -289,13 +289,23 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
     calibration["worst_controls"] = sorted(
         ((n, round(e, 4)) for n, e in control_errors.items()), key=lambda item: -item[1]
     )[:10]
-    calibration_ok = (calibration["joints_position_cm"] or {}).get("max", 0.0) <= CALIBRATION_TOLERANCE_CM
+    # The CONVERSION is wrong when the bulk of the joints is off (a wrong axis
+    # or unit moves nearly everything). A few joints off is rig placement,
+    # reported as rest offsets -- the pose errors below measure MOTION from
+    # rest, so they stay meaningful either way.
+    joint_stats = calibration["joints_position_cm"] or {}
+    calibration_ok = joint_stats.get("p95", 0.0) <= CALIBRATION_TOLERANCE_CM
+    calibration["rest_offsets"] = [
+        item for item in calibration["worst_joints"] if item[1] > CALIBRATION_TOLERANCE_CM
+    ]
     if not calibration_ok:
         _warn(
-            "Calibration FAILED: at rest, Unreal joints differ from the exported Maya positions by up "
-            f"to {calibration['joints_position_cm']['max']:.3f} cm -- the Maya->Unreal conversion is "
-            "wrong, rig error below is not meaningful. Worst: " + str(calibration["worst_joints"][:3])
+            "Calibration FAILED: at rest, most Unreal joints differ from the exported Maya positions "
+            f"(p95 {joint_stats.get('p95', 0):.3f} cm) -- the Maya->Unreal conversion is wrong. "
+            "Worst: " + str(calibration["worst_joints"][:3])
         )
+    elif calibration["rest_offsets"]:
+        _warn("Joints not at their Maya position at rest (cm): " + str(calibration["rest_offsets"][:5]))
     misplaced = [item for item in calibration["worst_controls"] if item[1] > CALIBRATION_TOLERANCE_CM]
     if misplaced:
         _warn("Controls not at their Maya origin at rest (cm): " + str(misplaced[:5]))
@@ -330,13 +340,21 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
 
         pose_p, pose_r = [], []
         worst = (0.0, None)
+        scored = []
         for name, key in joint_keys.items():
             transform = instance.global_transform(key)
             p_ue, q_ue = _to_p(transform), _to_q(transform)
             maya = pose["joints"].get(name)
             if not maya:
                 continue
-            e_p = _distance(p_ue, maya["t"])
+            # Motion error: Unreal's displacement from rest vs Maya's, so a
+            # joint placed slightly off at rest (reported in calibration) does
+            # not add the same constant to every pose.
+            rest_p = rest["joints"][name]["t"]
+            e_p = _distance(
+                [p_ue[i] - ue_rest[name][0][i] for i in range(3)],
+                [float(maya["t"][i]) - float(rest_p[i]) for i in range(3)],
+            )
             delta_ue = _q_mul(q_ue, _q_inv(ue_rest[name][1]))
             delta_maya = _q_mul(_q(maya["q"]), _q_inv(_q(rest["joints"][name]["q"])))
             e_r = _q_angle(delta_ue, delta_maya)
@@ -344,6 +362,7 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
             per_joint[name]["r"].append(e_r)
             if e_p + e_r / 10.0 > worst[0]:
                 worst = (e_p + e_r / 10.0, name)
+            scored.append((e_p + e_r / 10.0, name, round(e_p, 3), round(e_r, 2)))
             pose_p.append(e_p)
             pose_r.append(e_r)
         group = per_group.setdefault(pose.get("group", "?"), {"p": [], "r": []})
@@ -353,6 +372,7 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
             "name": pose.get("name"), "group": pose.get("group"), "applied": applied,
             "probe": pose.get("probe"), "maya_motion": pose.get("maya_motion"),
             "worst_joint": worst[1],
+            "top_joints": [(n, p, r) for _, n, p, r in sorted(scored, reverse=True)[:3]],
             "max_position_cm": round(max(pose_p), 4) if pose_p else None,
             "max_rotation_deg": round(max(pose_r), 4) if pose_r else None,
         })
@@ -399,7 +419,7 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
         },
         "by_joint": joints_report,
         "by_control": _by_control(per_pose),
-        "verdict": _verdict(calibration_ok, per_module, skipped, tier),
+        "verdict": _verdict(calibration_ok, per_module, skipped, tier, calibration["rest_offsets"]),
         "worst_poses": sorted(
             (p for p in per_pose if p["max_position_cm"] is not None),
             key=lambda p: -(p["max_position_cm"] + p["max_rotation_deg"] / 10.0),
@@ -451,12 +471,14 @@ def _by_control(per_pose):
                                                           + item[1]["max_rotation_deg"] / 10.0)))
 
 
-def _verdict(calibration_ok, per_module, skipped, tier):
+def _verdict(calibration_ok, per_module, skipped, tier, rest_offsets=()):
     if not calibration_ok:
         return "CALIBRATION FAILED - conversion error, fix before reading rig numbers"
     tiers = [tier(max(v["p"] or [0]), max(v["r"] or [0])) for v in per_module.values()]
     failing = sum(1 for t in tiers if t == "above T1")
     text = f"{len(tiers) - failing}/{len(tiers)} module(s) within T1"
+    if rest_offsets:
+        text += f"; {len(rest_offsets)} joint(s) off at rest"
     if skipped:
         text += f"; {skipped} pose(s) could not be fully applied"
     return text
@@ -584,7 +606,7 @@ def _summarise(report, report_path, html_path=None):
     )
     cal = report["calibration"]["joints_position_cm"] or {}
     ctl = report["calibration"].get("controls_position_cm") or {}
-    _log(f"Calibration (rest): joints max {cal.get('max', 0):.4f} cm -> "
+    _log(f"Calibration (rest): joints p95 {cal.get('p95', 0):.4f} / max {cal.get('max', 0):.4f} cm -> "
          + ("OK" if report["calibration_ok"] else "FAILED")
          + f"; controls vs Maya origin max {ctl.get('max', 0):.4f} cm")
     for group, data in report["by_group"].items():
@@ -598,6 +620,9 @@ def _summarise(report, report_path, html_path=None):
     for control, data in list(report["by_control"].items())[:5]:
         _log(f"  worst control {control}: {data['max_position_cm']:.3f} cm / {data['max_rotation_deg']:.3f} deg "
              f"({data['worst_probe']}, joint {data['worst_joint']})")
+    for pose in report.get("worst_poses", [])[:5]:
+        _log(f"  worst pose {pose['name']}: " + ", ".join(
+            f"{n} {p} cm/{r} deg" for n, p, r in pose.get("top_joints") or []))
     for module, change in (report.get("compared_to_previous") or {}).items():
         if change["state"] != "same":
             _log(f"  vs previous run: {module} {change['state']} "
