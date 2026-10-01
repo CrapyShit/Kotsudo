@@ -308,18 +308,21 @@ class IKFKModule(RigModule):
         _chain_exec(controller, model, exec_tail, ik_node)
         exec_tail = ik_node
 
-        # The two-bone solver only places the chain. When the Maya rig ALSO
-        # orients the end joint (an orient/parent constraint on the IK wrist or
-        # ankle, exported as ik_end_orient), the hand/foot takes the IK
-        # control's rotation, blended by the same IK weight. Without it Maya
-        # leaves the end joint to the solver, and so does Unreal.
-        tip_node = None
-        if graph_utils.recipe_bool(recipe_data.get("IKEndOrient"), False):
-            tip_node = self._build_tip_rotation(
-                controller, model, hierarchy, hierarchy_controller, module_prefix,
-                ik_effector_key, tip_transform, ik_col, weight_pin,
-                blend_var if switch_control is None else None,
-            )
+        # End bone (wrist/ankle) rotation. Control Rig's two-bone node ALWAYS
+        # gives the end bone the effector's rotation; Maya's IK solver never
+        # does. So:
+        #  * Maya orients the IK end joint (orient/parent constraint, exported
+        #    as ik_end_orient): the hand/foot takes the IK control's rotation;
+        #  * otherwise (measured on Murakami): the end bone keeps its rest
+        #    rotation relative to its parent, as Maya's IK chain end joint does.
+        # Both IK-weighted, so FK and the blend are untouched.
+        follows_control = graph_utils.recipe_bool(recipe_data.get("IKEndOrient"), False)
+        tip_node = self._build_tip_rotation(
+            controller, model, hierarchy, hierarchy_controller, module_prefix,
+            ik_effector_key, tip_transform, ik_col, weight_pin,
+            blend_var if switch_control is None else None,
+            follow_control=follows_control,
+        )
         if tip_node:
             _chain_exec(controller, model, exec_tail, tip_node)
             exec_tail = tip_node
@@ -382,31 +385,42 @@ class IKFKModule(RigModule):
     # ------------------------------------------------------------------
 
     def _build_tip_rotation(self, controller, model, hierarchy, hierarchy_controller, prefix,
-                            effector_key, tip_transform, ik_col, weight_pin, blend_var):
-        """SetRotation on the chain's end bone from the IK control, IK-weighted.
+                            effector_key, tip_transform, ik_col, weight_pin, blend_var,
+                            follow_control=True):
+        """SetRotation on the chain's end bone after the IK solve, IK-weighted.
 
-        Reads a null under the IK control that sits on the end bone at rest,
-        so the bone keeps its own axes and only the control's motion applies.
+        follow_control=True: the IK control's rotation, read from a null under
+        the control that sits on the end bone at rest (the bone keeps its own
+        axes; only the control's motion applies). False: the bone's REST
+        rotation relative to its parent (Maya's plain IK end joint).
         Returns the node name, or None when the engine lacks the units.
         """
         set_rotation = getattr(unreal, "RigUnit_SetRotation", None)
-        if set_rotation is None or effector_key is None:
+        if set_rotation is None or (follow_control and effector_key is None):
             _log_warning(f"{self.name}: RigUnit_SetRotation unavailable; the IK end bone keeps "
                          "the solver's rotation.")
             return None
-        align_null = graph_utils.create_offset_driver(
-            hierarchy, hierarchy_controller, effector_key, f"{prefix}_IKTipAlign", tip_transform
-        )
-        if not align_null:
-            return None
-        get_node = f"{prefix}_GetIKTipAlign"
-        graph_utils.create_transform_getter(
-            controller, model, get_node, unreal.Vector2D(ik_col + 700, 520), None, align_null
-        )
+        get_node = f"{prefix}_GetIKTipAlign" if follow_control else f"{prefix}_GetIKTipRest"
+        if follow_control:
+            align_null = graph_utils.create_offset_driver(
+                hierarchy, hierarchy_controller, effector_key, f"{prefix}_IKTipAlign", tip_transform
+            )
+            if not align_null:
+                return None
+            graph_utils.create_transform_getter(
+                controller, model, get_node, unreal.Vector2D(ik_col + 700, 520), None, align_null
+            )
+        else:
+            graph_utils.create_unit_node(controller, model, get_node, unreal.RigUnit_GetTransform,
+                                         unreal.Vector2D(ik_col + 700, 520))
+            graph_utils.set_key_pin(controller, model, get_node, ["Item"], "Bone", self.chain[-1])
+            graph_utils.set_any_pin(controller, model, get_node, ["Space"], "LocalSpace")
+            graph_utils.set_any_pin(controller, model, get_node, ["bInitial", "Initial"], "True")
         node = f"{prefix}_IKTipRotation"
         graph_utils.create_unit_node(controller, model, node, set_rotation, unreal.Vector2D(ik_col + 1000, 520))
         graph_utils.set_key_pin(controller, model, node, ["Item"], "Bone", self.chain[-1])
-        graph_utils.set_any_pin(controller, model, node, ["Space"], "GlobalSpace")
+        graph_utils.set_any_pin(controller, model, node, ["Space"],
+                                "GlobalSpace" if follow_control else "LocalSpace")
         graph_utils.set_any_pin(controller, model, node, ["bInitial", "Initial"], "False")
         graph_utils.set_any_pin(controller, model, node, ["bPropagateToChildren", "PropagateToChildren"], "True")
         # The quaternion input is "Value" on UE5's Set Rotation ("Rotation" on
@@ -423,7 +437,9 @@ class IKFKModule(RigModule):
             except Exception:
                 pass
             return None
-        _log_info(f"{self.name}: '{self.chain[-1]}' follows the IK control's rotation (IK-weighted).")
+        _log_info(f"{self.name}: in IK, '{self.chain[-1]}' "
+                  + ("follows the IK control's rotation." if follow_control
+                     else "keeps its rest rotation relative to its parent (as Maya's IK end joint)."))
         # Same weight as the solver: the switch source, or the blend variable.
         source = getattr(self, "_ik_weight_source", None)
         if source:
