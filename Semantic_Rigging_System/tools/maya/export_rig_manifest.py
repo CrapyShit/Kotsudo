@@ -893,6 +893,68 @@ def _constraint_targets(constraint):
     return targets
 
 
+def _weight_source(constraint, index):
+    """What drives one constraint target's weight: {'value': w}, or
+    {'control', 'attr', 'invert'} for a control attribute used directly or
+    through a reverse node (the usual IK/FK blend). None when unsupported."""
+    plug = '{}.target[{}].targetWeight'.format(constraint, index)
+    sources = cmds.listConnections(plug, source=True, destination=False, plugs=True,
+                                   skipConversionNodes=True) or []
+    if not sources:
+        return {'value': float(cmds.getAttr(plug))}
+    node, attr = sources[0].split('.', 1)
+    if cmds.nodeType(node) == 'reverse':
+        axis = attr[-1].upper() if attr[-1].upper() in 'XYZ' else 'X'
+        inputs = cmds.listConnections('{}.input{}'.format(node, axis), source=True, destination=False,
+                                      plugs=True, skipConversionNodes=True) or []
+        if inputs:
+            source_node, source_attr = inputs[0].split('.', 1)
+            if cmds.objectType(source_node, isAType='transform'):
+                return {'control': _short_node_name(source_node), 'attr': source_attr, 'invert': True}
+        return None
+    if cmds.objectType(node, isAType='transform'):
+        return {'control': _short_node_name(node), 'attr': attr, 'invert': False}
+    return None
+
+
+def _parent_space_blend(node):
+    """The constraint that replaces a controller's parent space, as a blend.
+
+    Walks up like _parent_space; at the first constraint-driven group (before
+    any controller) returns {'kind': 'parent', 'targets': [{'controller',
+    'weight'}]} -- e.g. a foot FK group parent-constrained to the IK and FK
+    foot controls, weighted by the IK/FK switch and its reverse. None when
+    the space is not a fully describable parentConstraint.
+    """
+    current = (cmds.listRelatives(node, parent=True, fullPath=True) or [None])[0]
+    while current:
+        if cmds.objectType(current, isAType='transform') and _has_controller_shape(current):
+            return None
+        constraints = sorted({
+            source for attribute in _DRIVEN_ATTRS
+            if cmds.attributeQuery(attribute, node=current, exists=True)
+            for source in (cmds.listConnections('{}.{}'.format(current, attribute), source=True,
+                                                destination=False, skipConversionNodes=True) or [])
+            if cmds.objectType(source, isAType='constraint')
+        })
+        if constraints:
+            constraint = constraints[0]
+            if len(constraints) != 1 or cmds.nodeType(constraint) != 'parentConstraint':
+                return None
+            targets = []
+            for index in cmds.getAttr('{}.target'.format(constraint), multiIndices=True) or []:
+                sources = cmds.listConnections('{}.target[{}].targetParentMatrix'.format(constraint, index),
+                                               source=True, destination=False) or []
+                weight = _weight_source(constraint, index)
+                if not sources or weight is None:
+                    return None
+                controller = _nearest_controller_transform(sources[0]) or sources[0]
+                targets.append({'controller': _short_node_name(controller), 'weight': weight})
+            return {'kind': 'parent', 'targets': targets} if targets else None
+        current = (cmds.listRelatives(current, parent=True, fullPath=True) or [None])[0]
+    return None
+
+
 def _is_driven_space(node):
     """True when a constraint or matrix input replaces the node's space."""
     return _space_drivers(node) is not None
@@ -1140,13 +1202,16 @@ def _query_transform_snapshot(node, role, module_name, driven_bone, anchor_bone,
     except Exception:
         rotate_order = None
 
-    parent_controllers, parent_space_bone = [], None
+    parent_controllers, parent_space_bone, parent_space_blend = [], None, None
     try:
         parent_controllers, parent_space_bone = _parent_space(node)
+        if parent_space_bone:
+            parent_space_blend = _parent_space_blend(node)
     except Exception:
         pass
 
     return dict(local_fields, **{
+        'parent_space_blend': parent_space_blend,
         'name': _short_node_name(node),
         'dag_path': node,
         'node_type': cmds.nodeType(node),

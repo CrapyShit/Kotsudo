@@ -92,6 +92,11 @@ class RigContext:
             key = self.control_key_for_maya(name)
             if key is not None:
                 return key
+        blend = record.get("parent_space_blend")
+        if blend:
+            key = self.blended_space(record, blend)
+            if key is not None:
+                return key
         space_bone = self._acyclic_space_bone(record, record.get("parent_space_bone"))
         if space_bone:
             key = self.follow_space(space_bone)
@@ -149,6 +154,101 @@ class RigContext:
                 return replacement
             current, depth = self._bone_parent(current), depth + 1
         return space_bone
+
+    def blended_space(self, record, blend):
+        """A null driven like the Maya group that replaces a controller's
+        parent: a Parent Constraint (maintain offset) to the same controls,
+        with each weight a constant or a control channel (optionally 1 - x,
+        as through a Maya reverse node). Returns its key, or None when a
+        target or weight source is not in the rig (caller falls back)."""
+        from . import constraints, graph_utils
+
+        parents = []
+        for target in blend.get("targets") or []:
+            key = self.control_key_for_maya(target.get("controller"))
+            weight = target.get("weight") or {"value": 1.0}
+            # Every weight source must already exist (a switch weighting its
+            # own parent group cannot: the control is being created now).
+            if key is None or ("attr" in weight and self.control_key_for_maya(weight.get("control")) is None):
+                return None
+            parents.append((key, weight))
+        unit = getattr(unreal, "RigUnit_ParentConstraint", None)
+        if not parents or unit is None:
+            return None
+
+        label = graph_utils.sanitize_name(str(record.get("name") or "space"))
+        anchor = record.get("anchor_bone") or record.get("driven_bone")
+        placement = graph_utils.record_transform(self.hierarchy, record, anchor, label=label)
+        null = graph_utils.create_follow_null(
+            self.hierarchy, self.hierarchy_controller, f"RB_{label}_Space", placement, self.world_key()
+        )
+        if not null:
+            return None
+
+        x = self.claim_module_column(width=900)
+        node = f"RB_{label}_SpaceBlend"
+        graph_utils.create_unit_node(self.graph_controller, self.model, node, unit, unreal.Vector2D(x + 500, -700))
+        graph_utils.set_key_pin(self.graph_controller, self.model, node, ["Child"], "Null", null)
+        graph_utils.set_any_pin(self.graph_controller, self.model, node, ["bMaintainOffset", "MaintainOffset"], "True")
+        graph_utils.set_any_pin(self.graph_controller, self.model, node, ["Weight"], "1.0")
+        for index, (key, weight) in enumerate(parents):
+            if not constraints._insert_array_element(self.graph_controller, self.model, f"{node}.Parents"):
+                return None
+            base = f"{node}.Parents.{index}"
+            graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Item.Type"], "Control")
+            graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Item.Name"], str(key.name))
+            pin = self._weight_pin(weight, f"{node}_W{index}", unreal.Vector2D(x, -700 + index * 180))
+            if pin:
+                graph_utils.connect_pins(self.graph_controller, self.model, pin, f"{base}.Weight")
+            else:
+                graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Weight"],
+                                        str(float(weight.get("value", 1.0))))
+        tail = self.get_exec_tail() or graph_utils.find_forwards_solve_node_name(self.model)
+        graph_utils.connect_exec(self.graph_controller, self.model, tail, node)
+        self.set_exec_tail(node)
+        print(f"[RigBuilder] Controller '{record.get('name')}': parent space blended between "
+              + ", ".join(str(k.name) for k, _ in parents) + " (as the Maya constraint).")
+        return unreal.RigElementKey(type=unreal.RigElementType.NULL, name=str(null))
+
+    def _weight_pin(self, weight, node_name, position):
+        """Graph pin for a channel-driven weight (1 - x when inverted), or None."""
+        from . import graph_utils
+
+        if "attr" not in weight:
+            return None
+        host = self.control_key_for_maya(weight.get("control"))
+        if host is None:
+            return None
+        attribute = str(weight["attr"])
+        channel = None
+        try:
+            children = self.hierarchy.get_children(host, False) or []
+        except TypeError:
+            children = self.hierarchy.get_children(host) or []
+        for child in children:
+            if child.type == unreal.RigElementType.CONTROL and str(child.name).startswith(attribute):
+                channel = child
+                break
+        if channel is None:
+            return None
+        pin = graph_utils.create_channel_getter(
+            self.graph_controller, self.model, node_name, str(host.name), attribute, str(channel.name), position
+        )
+        if not pin or not weight.get("invert"):
+            return pin
+        sub = None
+        for name in ("RigVMFunction_MathFloatSub", "RigUnit_MathFloatSub"):
+            sub = getattr(unreal, name, None)
+            if sub is not None:
+                break
+        if sub is None:
+            return None
+        inv = f"{node_name}_Inv"
+        graph_utils.create_unit_node(self.graph_controller, self.model, inv, sub,
+                                     unreal.Vector2D(position.x + 250, position.y))
+        graph_utils.set_pin_default(self.graph_controller, self.model, f"{inv}.A", "1.0")
+        graph_utils.connect_pins(self.graph_controller, self.model, pin, f"{inv}.B")
+        return f"{inv}.Result"
 
     def follow_space(self, bone):
         """A null that tracks ``bone``'s FINAL transform every evaluation.
