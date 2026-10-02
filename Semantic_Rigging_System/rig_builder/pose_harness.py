@@ -77,8 +77,18 @@ def _q_inv(q):
 
 
 def _q_angle(a, b):
-    dot = abs(sum(x * y for x, y in zip(a, b)))
-    return math.degrees(2.0 * math.acos(max(-1.0, min(1.0, dot))))
+    # Normalised, then atan2 instead of acos(dot): the poses file stores
+    # rounded quaternions (|q| off by ~3e-7), and acos near 1 turns that
+    # rounding into a fake ~0.1 deg error.
+    a = _q_unit(a)
+    b = _q_unit(b)
+    d = _q_mul(_q_inv(a), b)
+    return math.degrees(2.0 * math.atan2(math.sqrt(d[0] ** 2 + d[1] ** 2 + d[2] ** 2), abs(d[3])))
+
+
+def _q_unit(q):
+    n = math.sqrt(sum(c * c for c in q)) or 1.0
+    return tuple(c / n for c in q)
 
 
 def _distance(a, b):
