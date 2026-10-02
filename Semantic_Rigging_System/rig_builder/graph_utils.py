@@ -1356,6 +1356,15 @@ def _world_origin_position(hierarchy, record, anchor_bone, label):
     return vector_add(anchor_position, scaled), scaled
 
 
+def transform_pin_string(transform):
+    """Pin default text for an FTransform."""
+    q = get_transform_rotation(transform)
+    t = transform_to_location(transform)
+    sc = transform.scale3d
+    return ("(Rotation=(X={:.9g},Y={:.9g},Z={:.9g},W={:.9g}),Translation=(X={:.9g},Y={:.9g},Z={:.9g}),"
+            "Scale3D=(X={:.9g},Y={:.9g},Z={:.9g}))").format(q.x, q.y, q.z, q.w, t.x, t.y, t.z, sc.x, sc.y, sc.z)
+
+
 def bone_aligned_transform_at(bone_transform, position):
     """Bone rotation (unit scale) placed at ``position``."""
     result = unit_scale_transform(bone_transform)

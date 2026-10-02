@@ -883,9 +883,13 @@ def _constraint_targets(constraint):
     targets = []
     for index in cmds.getAttr('{}.target'.format(constraint), multiIndices=True) or []:
         for plug in ('targetParentMatrix', 'targetTranslate', 'targetRotate'):
-            sources = cmds.listConnections(
-                '{}.target[{}].{}'.format(constraint, index, plug), source=True, destination=False
-            ) or []
+            # Not every constraint type has every plug (orient: no translate).
+            try:
+                sources = cmds.listConnections(
+                    '{}.target[{}].{}'.format(constraint, index, plug), source=True, destination=False
+                ) or []
+            except (ValueError, RuntimeError):
+                continue
             if sources:
                 if sources[0] not in targets:
                     targets.append(sources[0])
@@ -950,9 +954,64 @@ def _parent_space_blend(node):
                     return None
                 controller = _nearest_controller_transform(sources[0]) or sources[0]
                 targets.append({'controller': _short_node_name(controller), 'weight': weight})
-            return {'kind': 'parent', 'targets': targets} if targets else None
+            if not targets:
+                return None
+            blend = {'kind': 'parent', 'targets': targets}
+            try:
+                _measure_solo_targets(node, blend)
+            except Exception:
+                pass
+            return blend
         current = (cmds.listRelatives(current, parent=True, fullPath=True) or [None])[0]
     return None
+
+
+def _world_pose_unreal(node):
+    """{'position', 'axes'} of a node's world matrix in Unreal axes / cm."""
+    matrix = cmds.xform(node, query=True, worldSpace=True, matrix=True)
+    return {
+        'position': _maya_vector_to_unreal(matrix[12:15], apply_unit_scale=False),
+        'axes': _world_axes_unreal(node),
+    }
+
+
+def _measure_solo_targets(node, blend):
+    """Record where the controller sits with each target alone ('solo').
+
+    A Maya parentConstraint keeps one offset PER TARGET, set when it was
+    made; they need not agree at the current pose (Murakami's foot FK group
+    drops 1 cm when the switch goes from IK to FK at rest). Unreal's maintain
+    offset measures a single relation from the rest pose, so the per-target
+    poses are exported and rebuilt as one offset each. Only channel-weighted
+    targets that can be made the sole driver are measured; the channels are
+    restored afterwards.
+    """
+    targets = blend['targets']
+    plugs = {}
+    for target in targets:
+        weight = target['weight']
+        if 'attr' not in weight:
+            return
+        plugs['{}.{}'.format(weight['control'], weight['attr'])] = None
+    for plug in plugs:
+        plugs[plug] = cmds.getAttr(plug)
+    blend['rest'] = _world_pose_unreal(node)
+    try:
+        for target in targets:
+            weight = target['weight']
+            plug = '{}.{}'.format(weight['control'], weight['attr'])
+            cmds.setAttr(plug, 0.0 if weight.get('invert') else 1.0)
+            values = {p: cmds.getAttr(p) for p in plugs}
+            others = [
+                (1.0 - values['{}.{}'.format(o['weight']['control'], o['weight']['attr'])])
+                if o['weight'].get('invert') else values['{}.{}'.format(o['weight']['control'], o['weight']['attr'])]
+                for o in targets if o is not target
+            ]
+            if all(abs(w) < 1e-6 for w in others):
+                target['solo'] = _world_pose_unreal(node)
+    finally:
+        for plug, value in plugs.items():
+            cmds.setAttr(plug, value)
 
 
 def _is_driven_space(node):
@@ -1373,44 +1432,6 @@ def _joints_driven_by_constraint(joint, constraint_types):
         conns = cmds.listConnections(joint, type=ct, source=False, destination=True) or []
         result.extend(conns)
     return list(set(result))
-
-
-def _constraint_targets(constraint):
-    """Return all target transform nodes driving *constraint*.
-    
-    Carefully guards both targetTranslate and targetRotate queries because
-    different constraint types expose different attributes:
-    - parentConstraint: has both targetTranslate and targetRotate
-    - orientConstraint: only targetRotate
-    - pointConstraint: only targetTranslate
-    - poleVectorConstraint: only targetTranslate
-    
-    Querying a missing attribute can raise RuntimeError/ValueError depending
-    on Maya version, so both are wrapped in try-except.
-    """
-    targets = []
-    indices = cmds.getAttr('{}.target'.format(constraint), multiIndices=True) or []
-    for idx in indices:
-        # Guard targetTranslate: not all constraints have this (e.g., orientConstraint).
-        try:
-            conns = cmds.listConnections(
-                '{}.target[{}].targetTranslate'.format(constraint, idx),
-                source=True, destination=False, plugs=False,
-            ) or []
-            targets.extend(conns)
-        except (ValueError, RuntimeError, AttributeError):
-            pass
-        
-        # Guard targetRotate: not all constraints have this (e.g., pointConstraint).
-        try:
-            conns2 = cmds.listConnections(
-                '{}.target[{}].targetRotate'.format(constraint, idx),
-                source=True, destination=False, plugs=False,
-            ) or []
-            targets.extend(conns2)
-        except (ValueError, RuntimeError, AttributeError):
-            pass
-    return list(set(targets))
 
 
 def _upstream_float_control_attr(node, attr):

@@ -185,18 +185,25 @@ class RigContext:
         if not null:
             return None
 
+        # Per-target offsets (Maya keeps one per target; they may disagree at
+        # rest): a null under each target where the space sits with that
+        # target alone, constrained WITHOUT maintain offset. Otherwise one
+        # offset measured from the rest pose (maintain offset).
+        items = self._solo_target_nulls(blend, parents, placement, label)
         x = self.claim_module_column(width=900)
         node = f"RB_{label}_SpaceBlend"
         graph_utils.create_unit_node(self.graph_controller, self.model, node, unit, unreal.Vector2D(x + 500, -700))
         graph_utils.set_key_pin(self.graph_controller, self.model, node, ["Child"], "Null", null)
-        graph_utils.set_any_pin(self.graph_controller, self.model, node, ["bMaintainOffset", "MaintainOffset"], "True")
+        graph_utils.set_any_pin(self.graph_controller, self.model, node, ["bMaintainOffset", "MaintainOffset"],
+                                "False" if items else "True")
         graph_utils.set_any_pin(self.graph_controller, self.model, node, ["Weight"], "1.0")
         for index, (key, weight) in enumerate(parents):
             if not constraints._insert_array_element(self.graph_controller, self.model, f"{node}.Parents"):
                 return None
             base = f"{node}.Parents.{index}"
-            graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Item.Type"], "Control")
-            graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Item.Name"], str(key.name))
+            item_type, item_name = items[index] if items else ("Control", str(key.name))
+            graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Item.Type"], item_type)
+            graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Item.Name"], item_name)
             pin = self._weight_pin(weight, f"{node}_W{index}", unreal.Vector2D(x, -700 + index * 180))
             if pin:
                 graph_utils.connect_pins(self.graph_controller, self.model, pin, f"{base}.Weight")
@@ -209,6 +216,50 @@ class RigContext:
         print(f"[RigBuilder] Controller '{record.get('name')}': parent space blended between "
               + ", ".join(str(k.name) for k, _ in parents) + " (as the Maya constraint).")
         return unreal.RigElementKey(type=unreal.RigElementType.NULL, name=str(null))
+
+    def _solo_target_nulls(self, blend, parents, placement, label):
+        """[(type, name)] per target, or None when the export has no solo poses.
+
+        null_i = space_rest * ctrl_rest^-1 * ctrl_i: the space moved by the
+        controller's Maya motion from rest to "target i alone".
+        """
+        from . import graph_utils
+
+        targets = blend.get("targets") or []
+        rest = blend.get("rest")
+        if not rest or len(targets) != len(parents) or not all(t.get("solo") for t in targets):
+            return None
+
+        def pose(data):
+            rotation = graph_utils.record_rotation({"world_axes_unreal": data.get("axes")})
+            if rotation is None or not data.get("position"):
+                return None
+            result = unreal.Transform(location=unreal.Vector(*[float(c) for c in data["position"]]))
+            result.rotation = rotation
+            return result
+
+        ctrl_rest = pose(rest)
+        if ctrl_rest is None:
+            return None
+        to_space = unreal.MathLibrary.compose_transforms(placement, unreal.MathLibrary.invert_transform(ctrl_rest))
+        items = []
+        for index, (target, (key, _)) in enumerate(zip(targets, parents)):
+            ctrl_solo = pose(target["solo"])
+            if ctrl_solo is None:
+                return None
+            name = graph_utils.create_follow_null(
+                self.hierarchy, self.hierarchy_controller, f"RB_{label}_Space_T{index}",
+                unreal.MathLibrary.compose_transforms(to_space, ctrl_solo), key,
+            )
+            if not name:
+                return None
+            items.append(("Null", str(name)))
+            shift = graph_utils.vector_length(graph_utils.vector_sub(
+                graph_utils.transform_to_location(ctrl_solo), graph_utils.transform_to_location(ctrl_rest)))
+            if shift > 0.01:
+                print(f"[RigBuilder] Controller '{label}': with only '{key.name}' driving it, Maya moves "
+                      f"it {shift:.3f} cm from rest (per-target offset kept).")
+        return items
 
     def _weight_pin(self, weight, node_name, position):
         """Graph pin for a channel-driven weight (1 - x when inverted), or None."""

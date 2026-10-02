@@ -786,6 +786,19 @@ class SplineIKModule(RigModule):
                         "build -- squash skipped, stretch still applied."
                     )
 
+            # Rest correction: Fit Chain does not land exactly on the bind
+            # pose (a few hundredths of a cm), and every limb riding on the
+            # spine inherits it -- a straight leg then has slack and its knee
+            # never bends where Maya's does. Each bone is re-applied with a
+            # local offset the builder measures at rest after compiling
+            # (identity until then).
+            correction_nodes, last_exec = self._build_rest_correction(
+                controller, model, module_prefix, x_origin, self.context.get_exec_tail())
+            if correction_nodes:
+                all_nodes.extend(correction_nodes)
+                self.context.set_exec_tail(last_exec)
+                primary_node = last_exec
+
         if not native_built:
             # ----- Fallback: distributed-FK (native spline units unavailable,
             #       or NumControls < 4, which Control Rig's own spline
@@ -847,6 +860,53 @@ class SplineIKModule(RigModule):
     # ------------------------------------------------------------------
     # Squash / stretch volume preservation
     # ------------------------------------------------------------------
+
+    def _build_rest_correction(self, controller, model, prefix, x_origin, exec_tail):
+        """Per bone: Global = RestOffset x (solved Global), RestOffset baked later.
+
+        Returns (node names, last exec node). Registers (bone, MakeAbsolute
+        node) on the context for the builder's rest bake.
+        """
+        absolute = None
+        for name in ("RigVMFunction_MathTransformMakeAbsolute", "RigUnit_MathTransformMakeAbsolute"):
+            absolute = getattr(unreal, name, None)
+            if absolute is not None:
+                break
+        if absolute is None or exec_tail is None:
+            return [], exec_tail
+        nodes = []
+        registry = getattr(self.context, "rest_corrections", None)
+        if registry is None:
+            registry = self.context.rest_corrections = []
+        for index, bone in enumerate(self.chain):
+            y = 900 + index * 220
+            get_node, abs_node, set_node = (f"{prefix}_RestFix{index}_Get", f"{prefix}_RestFix{index}_Offset",
+                                            f"{prefix}_RestFix{index}_Set")
+            graph_utils.create_unit_node(controller, model, get_node, unreal.RigUnit_GetTransform,
+                                         unreal.Vector2D(x_origin + 1400, y))
+            graph_utils.set_key_pin(controller, model, get_node, ["Item"], "Bone", bone)
+            graph_utils.set_any_pin(controller, model, get_node, ["Space"], "GlobalSpace")
+            graph_utils.set_any_pin(controller, model, get_node, ["bInitial", "Initial"], "False")
+            graph_utils.create_unit_node(controller, model, abs_node, absolute, unreal.Vector2D(x_origin + 1650, y))
+            graph_utils.create_unit_node(controller, model, set_node, unreal.RigUnit_SetTransform,
+                                         unreal.Vector2D(x_origin + 1900, y))
+            graph_utils.set_key_pin(controller, model, set_node, ["Item"], "Bone", bone)
+            graph_utils.set_any_pin(controller, model, set_node, ["Space"], "GlobalSpace")
+            graph_utils.set_any_pin(controller, model, set_node, ["bInitial", "Initial"], "False")
+            graph_utils.set_any_pin(controller, model, set_node, ["Weight"], "1.0")
+            # Children keep their global transforms: the next bone is read
+            # as Fit Chain left it.
+            graph_utils.set_any_pin(controller, model, set_node, ["bPropagateToChildren", "PropagateToChildren"],
+                                    "False")
+            if not (graph_utils.connect_pins(controller, model, f"{get_node}.Transform", f"{abs_node}.Parent")
+                    and graph_utils.connect_pins(controller, model, f"{abs_node}.Global", f"{set_node}.Value")):
+                unreal.log_warning(f"[SplineIKModule] {self.name}: rest correction could not be wired; skipped.")
+                return nodes, exec_tail
+            graph_utils.connect_exec(controller, model, exec_tail, set_node)
+            exec_tail = set_node
+            nodes.extend([get_node, abs_node, set_node])
+            registry.append((bone, abs_node))
+        return nodes, exec_tail
 
     def _build_squash_factor_network(
         self, controller, model, module_prefix, spline_points_node,
