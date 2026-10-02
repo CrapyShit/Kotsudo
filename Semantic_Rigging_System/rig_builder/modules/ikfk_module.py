@@ -138,6 +138,7 @@ class IKFKModule(RigModule):
         fk_controls = []
         fk_get_nodes = []
         prev_fk_key = parent_key
+        fk_root_parent = None
 
         for idx, bone_name in enumerate(self.chain):
             bone_transform = graph_utils.get_bone_global_transform(hierarchy, bone_name)
@@ -153,9 +154,12 @@ class IKFKModule(RigModule):
             # custom attributes all come from its exported record.
             record = graph_utils.find_controller_record(recipe_data, bone_name, ("bone_driver",))
             fk_ctrl = self.context.control_name(record, fk_ctrl)
+            fk_parent = self.context.resolve_control_parent(record, prev_fk_key)
+            if idx == 0:
+                fk_root_parent = fk_parent
             fk_key, driver_null = graph_utils.build_record_control(
                 self.context.rig, hierarchy, hierarchy_controller, recipe_data,
-                self.context.resolve_control_parent(record, prev_fk_key),
+                fk_parent,
                 fk_ctrl, bone_name, bone_transform, record,
                 graph_utils.record_color(record, fk_color),
                 "Circle_Thick", (fk_scale, fk_scale, fk_scale), shape_rot,
@@ -262,6 +266,17 @@ class IKFKModule(RigModule):
         else:
             blend_var = switch_control
 
+        # Root rebase (before the exec tail is read: it may add a follow-space
+        # update). Maya limbs blended with pairBlends copy the IK/FK chains'
+        # LOCAL values onto the bound joints, so the root rides on its parent
+        # joint (a hip on the spine), not on the FK control's parent (the
+        # pelvis control). The root is then written as: the FK pose relative
+        # to the FK control's parent, re-applied under a null that follows the
+        # root's parent bone from the same rest relation.
+        rebase = None
+        if graph_utils.recipe_bool(recipe_data.get("RootLocalBlend"), False):
+            rebase = self._root_rebase(hierarchy, hierarchy_controller, module_prefix, fk_root_parent)
+
         # ------------------------------------------------------------------
         # 5. Execution chain: FK SetTransforms -> IK solver
         # ------------------------------------------------------------------
@@ -298,6 +313,9 @@ class IKFKModule(RigModule):
             )
 
             fk_out = f"{fk_get_nodes[idx]}.Transform"
+            if idx == 0 and rebase:
+                fk_out = self._rebased_pin(controller, model, module_prefix, fk_out, rebase,
+                                           unreal.Vector2D(x_origin + 200, 100)) or fk_out
             if not graph_utils.connect_pins(controller, model, fk_out, f"{set_node}.Value"):
                 graph_utils.connect_pins(controller, model, fk_out, f"{set_node}.Transform")
 
@@ -383,6 +401,62 @@ class IKFKModule(RigModule):
     # ------------------------------------------------------------------
     # Control visibility from the switch
     # ------------------------------------------------------------------
+
+    def _root_rebase(self, hierarchy, hierarchy_controller, prefix, fk_parent_key):
+        """(fk parent key, rebase null) or None: a null under the follow space
+        of the root bone's parent, placed at the FK control parent's rest."""
+        if fk_parent_key is None or not graph_utils.is_valid_key(hierarchy, fk_parent_key):
+            return None
+        root_key = graph_utils.make_key(unreal.RigElementType.BONE, self.chain[0])
+        try:
+            parent_bone = hierarchy.get_first_parent(root_key)
+        except Exception:
+            parent_bone = None
+        if parent_bone is None or parent_bone.type != unreal.RigElementType.BONE:
+            return None
+        follow = self.context.follow_space(str(parent_bone.name))
+        if follow is None:
+            return None
+        null = graph_utils.create_follow_null(
+            hierarchy, hierarchy_controller, f"{prefix}_RootRebase",
+            hierarchy.get_global_transform(fk_parent_key, True), follow,
+        )
+        if not null:
+            return None
+        _log_info(f"{self.name}: root '{self.chain[0]}' rides on '{parent_bone.name}' "
+                  "(Maya blends this limb's chains locally).")
+        return fk_parent_key, null
+
+    def _rebased_pin(self, controller, model, prefix, global_pin, rebase, position):
+        """Pin: global_pin made relative to the FK parent, then absolute under the rebase null."""
+        fk_parent_key, null = rebase
+        relative = _pick_unit(("RigVMFunction_MathTransformMakeRelative", "RigUnit_MathTransformMakeRelative"))
+        absolute = _pick_unit(("RigVMFunction_MathTransformMakeAbsolute", "RigUnit_MathTransformMakeAbsolute"))
+        if relative is None or absolute is None:
+            _log_warning(f"{self.name}: Make Relative/Absolute units unavailable; root not rebased.")
+            return None
+        parent_get, null_get = f"{prefix}_RootFKParent", f"{prefix}_RootRebaseGet"
+        for node, item_type, name, y in ((parent_get, fk_parent_key.type, str(fk_parent_key.name), 0),
+                                         (null_get, unreal.RigElementType.NULL, null, 140)):
+            graph_utils.create_unit_node(controller, model, node, unreal.RigUnit_GetTransform,
+                                         unreal.Vector2D(position.x, position.y + y))
+            type_name = {unreal.RigElementType.CONTROL: "Control", unreal.RigElementType.NULL: "Null",
+                         unreal.RigElementType.BONE: "Bone"}.get(item_type, "Control")
+            graph_utils.set_key_pin(controller, model, node, ["Item"], type_name, name)
+            graph_utils.set_any_pin(controller, model, node, ["Space"], "GlobalSpace")
+            graph_utils.set_any_pin(controller, model, node, ["bInitial", "Initial"], "False")
+        rel, absn = f"{prefix}_RootRelative", f"{prefix}_RootRebased"
+        graph_utils.create_unit_node(controller, model, rel, relative, unreal.Vector2D(position.x + 300, position.y))
+        graph_utils.create_unit_node(controller, model, absn, absolute, unreal.Vector2D(position.x + 550, position.y))
+        ok = (graph_utils.connect_pins(controller, model, global_pin, f"{rel}.Global")
+              and graph_utils.connect_pins(controller, model, f"{parent_get}.Transform", f"{rel}.Parent")
+              and graph_utils.connect_pins(controller, model, f"{rel}.Local", f"{absn}.Local")
+              and graph_utils.connect_pins(controller, model, f"{null_get}.Transform", f"{absn}.Parent"))
+        if not ok:
+            _log_node_pins(rel, model)
+            _log_warning(f"{self.name}: root rebase could not be wired; root kept in world space.")
+            return None
+        return f"{absn}.Global"
 
     def _build_tip_rotation(self, controller, model, hierarchy, hierarchy_controller, prefix,
                             effector_key, tip_transform, ik_col, weight_pin, blend_var,
@@ -831,6 +905,7 @@ class IKFKModule(RigModule):
             "Switch": None,
             "SwitchDrivesVisibility": True,
             "IKEndOrient": False,
+            "RootLocalBlend": False,
             "ChainAxes": None,
         }
         fallback_names = {
@@ -839,6 +914,7 @@ class IKFKModule(RigModule):
             "Switch": ["switch"],
             "SwitchDrivesVisibility": ["switch_drives_visibility"],
             "IKEndOrient": ["ik_end_orient"],
+            "RootLocalBlend": ["root_local_blend"],
             "ChainAxes": ["chain_axes"],
             "ModuleType": ["module_type"],
             "ControlScale": ["control_scale", "controlscale"],

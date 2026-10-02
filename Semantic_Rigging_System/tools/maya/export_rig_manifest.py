@@ -1495,6 +1495,24 @@ def _ik_end_joint(handle):
     return sources[0] if sources else None
 
 
+def root_local_blend(module):
+    """True when the limb's ROOT joint takes its values as LOCAL channels
+    (pairBlend / blendColors from separate IK and FK chains), so it rides on
+    its parent joint; False when a constraint places it in world space."""
+    chain = list(module.get('chain') or [])
+    if not chain or not cmds.objExists(chain[0]):
+        return False
+    for attribute in ('translate', 'rotate', 'translateX', 'rotateX'):
+        for source in cmds.listConnections('{}.{}'.format(chain[0], attribute), source=True,
+                                           destination=False, skipConversionNodes=True) or []:
+            kind = cmds.nodeType(source)
+            if kind in ('pairBlend', 'blendColors', 'blendTwoAttr', 'animBlendNodeAdditiveRotation'):
+                return True
+            if cmds.objectType(source, isAType='constraint'):
+                return False
+    return False
+
+
 def ik_end_orient(module):
     """True when the IK chain's END joint is oriented by the rig (an orient or
     parent constraint on it -- typically to the IK control), False when only
@@ -3147,6 +3165,7 @@ def _merge_scene_detected_module_data(module):
             _verify_ikfk_roots(enriched)
             extra = _ikfk_switch_export(enriched)
             extra['ik_end_orient'] = ik_end_orient(enriched)
+            extra['root_local_blend'] = root_local_blend(enriched)
         elif enriched.get('module_type') == 'SplineIK':
             spline = _spline_ik_export(enriched)
             extra = {'spline': spline} if spline else {}
