@@ -2721,6 +2721,20 @@ def _spline_cv_influences(curve_shape, cv_count):
     return [], []
 
 
+def _spline_stretches(spline):
+    """True when the spline curve's arc length drives anything (a stretch
+    network); a plain spline IK keeps its joint lengths."""
+    handle = (spline or {}).get('ik_handle')
+    try:
+        curve = cmds.ikHandle(handle, query=True, curve=True) if handle and cmds.objExists(handle) else None
+    except Exception:
+        curve = None
+    for info in (cmds.listConnections(curve, type='curveInfo') or []) if curve else []:
+        if cmds.listConnections('{}.arcLength'.format(info), source=False, destination=True):
+            return True
+    return False
+
+
 def _spline_ik_export(module):
     """Everything needed to rebuild a Maya spline IK's controls in Unreal.
 
@@ -3169,6 +3183,9 @@ def _merge_scene_detected_module_data(module):
         elif enriched.get('module_type') == 'SplineIK':
             spline = _spline_ik_export(enriched)
             extra = {'spline': spline} if spline else {}
+            # Maya's spline IK keeps joint lengths unless a curveInfo network
+            # drives the joints; record which, so Unreal does the same.
+            extra['stretch_enabled'] = _spline_stretches(spline)
             # Constraints layered on the spline chain (e.g. the top joint
             # orient-constrained to the chest control) are part of its behaviour.
             constraints = _bone_constraints_export(enriched)

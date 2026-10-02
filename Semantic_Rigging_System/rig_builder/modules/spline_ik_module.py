@@ -374,7 +374,7 @@ class SplineIKModule(RigModule):
         back to distributed-FK automatically).
     ControlScale : float  (default 1.0)
         Uniform scale multiplier for all control shapes.
-    StretchEnabled : bool  (default True)
+    StretchEnabled : bool  (default False -- Maya's spline IK keeps joint lengths)
         Whether the chain should stretch/compress to fully reach the
         spline's length (Alignment = Stretched) or hold bone lengths fixed
         and only bend (Alignment = Front).
@@ -473,7 +473,9 @@ class SplineIKModule(RigModule):
         control_scale = graph_utils.compute_chain_scale(
             hierarchy, self.chain, fraction=0.35, multiplier=scale_multiplier
         )
-        stretch_enabled = bool(recipe_data.get("StretchEnabled", True))
+        # Maya spline IK keeps joint lengths unless a stretch network exists
+        # (exported as stretch_enabled); default to Maya's behaviour.
+        stretch_enabled = graph_utils.recipe_bool(recipe_data.get("StretchEnabled"), False)
         # The axis of each bone that runs along the chain is read from the
         # imported skeleton. A hard-coded "X" twists every bone 90 degrees when
         # the joints actually run along Y/Z (a Maya Y-up spine with no joint
@@ -1168,7 +1170,7 @@ class SplineIKModule(RigModule):
             "ChainAxes": None,
             "NumControls": 4,
             "ControlScale": 1.0,
-            "StretchEnabled": True,
+            "StretchEnabled": False,
             "PrimaryAxis": None,
             "UsePoleVector": False,
             "SecondaryAxis": "Y",
