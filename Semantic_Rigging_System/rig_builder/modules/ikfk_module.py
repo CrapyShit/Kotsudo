@@ -313,9 +313,11 @@ class IKFKModule(RigModule):
             )
 
             fk_out = f"{fk_get_nodes[idx]}.Transform"
-            if idx == 0 and rebase:
-                fk_out = self._rebased_pin(controller, model, module_prefix, fk_out, rebase,
-                                           unreal.Vector2D(x_origin + 200, 100)) or fk_out
+            # The whole FK chain is rebased, not just the root: Maya's FK chain
+            # lives under the root's parent joint, so every bone rides on it.
+            if rebase:
+                fk_out = self._rebased_pin(controller, model, f"{module_prefix}_{idx}", fk_out, rebase,
+                                           unreal.Vector2D(x_origin + 200, 100 + idx * 300)) or fk_out
             if not graph_utils.connect_pins(controller, model, fk_out, f"{set_node}.Value"):
                 graph_utils.connect_pins(controller, model, fk_out, f"{set_node}.Transform")
 
@@ -435,7 +437,7 @@ class IKFKModule(RigModule):
         if relative is None or absolute is None:
             _log_warning(f"{self.name}: Make Relative/Absolute units unavailable; root not rebased.")
             return None
-        parent_get, null_get = f"{prefix}_RootFKParent", f"{prefix}_RootRebaseGet"
+        parent_get, null_get = f"{prefix}_FKParent", f"{prefix}_RebaseGet"
         for node, item_type, name, y in ((parent_get, fk_parent_key.type, str(fk_parent_key.name), 0),
                                          (null_get, unreal.RigElementType.NULL, null, 140)):
             graph_utils.create_unit_node(controller, model, node, unreal.RigUnit_GetTransform,
@@ -445,7 +447,7 @@ class IKFKModule(RigModule):
             graph_utils.set_key_pin(controller, model, node, ["Item"], type_name, name)
             graph_utils.set_any_pin(controller, model, node, ["Space"], "GlobalSpace")
             graph_utils.set_any_pin(controller, model, node, ["bInitial", "Initial"], "False")
-        rel, absn = f"{prefix}_RootRelative", f"{prefix}_RootRebased"
+        rel, absn = f"{prefix}_Relative", f"{prefix}_Rebased"
         graph_utils.create_unit_node(controller, model, rel, relative, unreal.Vector2D(position.x + 300, position.y))
         graph_utils.create_unit_node(controller, model, absn, absolute, unreal.Vector2D(position.x + 550, position.y))
         ok = (graph_utils.connect_pins(controller, model, global_pin, f"{rel}.Global")
@@ -855,8 +857,18 @@ class IKFKModule(RigModule):
             controller, model, ik_node, ["Weight"], str(float(recipe_data.get("DefaultBlend") or 0.0))
         )
         graph_utils.set_any_pin(controller, model, ik_node, ["PropagateToChildren"], "true")
-        graph_utils.set_any_pin(controller, model, ik_node, ["BoneALength"], "0.0")
-        graph_utils.set_any_pin(controller, model, ik_node, ["BoneBLength"], "0.0")
+        # Rest bone lengths, explicitly. With 0 the node measures the CURRENT
+        # pose, and any small offset of the input pose changes the lengths --
+        # on a nearly straight limb a millimetre of length moves the knee by
+        # centimetres. Maya's IK chain keeps its joint lengths.
+        length_a = graph_utils.vector_length(graph_utils.vector_sub(
+            graph_utils.get_bone_global_position(hierarchy, self.chain[1]),
+            graph_utils.get_bone_global_position(hierarchy, self.chain[0])))
+        length_b = graph_utils.vector_length(graph_utils.vector_sub(
+            graph_utils.get_bone_global_position(hierarchy, self.chain[2]),
+            graph_utils.get_bone_global_position(hierarchy, self.chain[1])))
+        graph_utils.set_any_pin(controller, model, ik_node, ["BoneALength"], str(round(length_a, 6)))
+        graph_utils.set_any_pin(controller, model, ik_node, ["BoneBLength"], str(round(length_b, 6)))
 
         enable_stretch = _recipe_bool(recipe_data.get("EnableStretch"), False)
         graph_utils.set_any_pin(

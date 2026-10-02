@@ -239,8 +239,12 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
             module_of[bone] = module.get("module_name")
 
     # -- rest state in Unreal ------------------------------------------------
+    # Solved as many times as every pose is (3), so constraints and follow
+    # spaces that settle on their first evaluation do not make the rest
+    # reference differ from the poses by a constant.
     instance.reset()
-    instance.run()
+    for _ in range(3):
+        instance.run()
     joint_keys, ue_rest = {}, {}
     # Only joints a module rebuilds are scored. Helper chains Maya exports
     # but the Unreal rig does not drive (e.g. separate FK/IK joint chains
@@ -318,13 +322,15 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
     for pose in poses[1:]:
         instance.reset()
         applied = True
+        targets = []
         for name, state in (pose.get("controls") or {}).items():
             key = control_keys.get(name)
             if key is None:
                 applied = False
                 continue
             rest_state = _maya_control_rest(document, name)
-            target = _posed_control(ue_control_rest[name], rest_state, state)
+            targets.append((key, _posed_control(ue_control_rest[name], rest_state, state)))
+        for key, target in targets:
             instance.set_global(key, target)
         for plug, value in (pose.get("channels") or {}).items():
             control_name, attribute = plug.split(".", 1)
@@ -337,6 +343,16 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
         if not applied:
             skipped += 1
         instance.run()
+        # A control under a rig-driven space (follow or blended null) was set
+        # against its parent's REST transform; the run above moved that parent.
+        # Re-apply the world targets against the updated parents and solve
+        # again (two passes cover a space driven by another posed control).
+        for _ in range(2):
+            if not targets:
+                break
+            for key, target in targets:
+                instance.set_global(key, target)
+            instance.run()
 
         pose_p, pose_r = [], []
         worst = (0.0, None)

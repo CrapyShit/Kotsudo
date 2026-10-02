@@ -1235,6 +1235,11 @@ def controller_origin_position(hierarchy, record, anchor_bone, min_offset=None, 
     # affect it; it is validated the same way against a neighbour bone.
     local_result = _local_origin_position(hierarchy, record, anchor_bone, label)
     world_result = _world_origin_position(hierarchy, record, anchor_bone, label)
+    # A joint-local offset is only trusted once validated against a neighbour
+    # bone (reference_local); single-bone modules have none, so their
+    # validated world offset wins.
+    if local_result is not None and world_result is not None and not (record.get("reference_local") or {}).get("vector"):
+        local_result = None
     result = local_result or world_result
     if local_result is not None and world_result is not None:
         # Two independent encodings of the same point. When they agree the
