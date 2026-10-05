@@ -1109,10 +1109,21 @@ class SplineIKModule(RigModule):
         positions = []
         for record in records:
             anchor = record.get("anchor_bone") or record.get("driven_bone") or self.chain[0]
-            position = graph_utils.controller_origin_position(
-                hierarchy, record, anchor, min_offset=0.0,
-                label=record.get("ue_control_name") or record.get("name"),
-            )
+            label = record.get("ue_control_name") or record.get("name")
+            # The control stands for the animator controller (chest_ctrl), so
+            # it sits at that controller's origin when exported; the record
+            # itself is the influence joint under it, whose position only
+            # matters for the curve points (placed from the CVs).
+            position = None
+            origin = record.get("ue_control_origin")
+            if isinstance(origin, dict):
+                position = graph_utils.controller_origin_position(
+                    hierarchy, origin, origin.get("anchor_bone") or anchor, min_offset=0.0, label=label,
+                )
+            if position is None:
+                position = graph_utils.controller_origin_position(
+                    hierarchy, record, anchor, min_offset=0.0, label=label,
+                )
             if position is None:
                 graph_utils._log_warning(
                     f"Spline '{self.name}': could not place Maya controller "

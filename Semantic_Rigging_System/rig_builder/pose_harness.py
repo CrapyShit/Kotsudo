@@ -39,6 +39,13 @@ from . import control_shapes, graph_utils
 
 TIERS = (("T0", 0.01, 0.01), ("T1", 0.1, 0.5))
 CALIBRATION_TOLERANCE_CM = 0.1
+# Uncertainty of a limb's slack (A + B - reach) from the poses file itself:
+# positions are written to 1e-4 cm, and the slack combines three rounded
+# lengths. On a nearly straight limb the middle joint's offset from the
+# root-tip line is ~sqrt(2 k slack), so this alone leaves a straight 7 m arm's
+# elbow undetermined by ~0.4 cm.
+SLACK_ROUNDING_CM = 5e-4
+LIMB_MODULE_TYPES = ("IKFKSwitch", "IKLimb")
 
 
 def _log(message):
@@ -89,6 +96,44 @@ def _q_angle(a, b):
 def _q_unit(q):
     n = math.sqrt(sum(c * c for c in q)) or 1.0
     return tuple(c / n for c in q)
+
+
+def _triangle_height(a, b, reach):
+    """Distance of the middle joint from the root-tip line for bone lengths
+    a, b and a root-tip distance ``reach`` (0 when the limb is straight)."""
+    if reach <= 1e-9 or reach >= a + b:
+        return 0.0
+    if reach <= abs(a - b):
+        return min(a, b)
+    half = (a + b + reach) / 2.0
+    area2 = max(0.0, half * (half - a) * (half - b) * (half - reach))
+    return 2.0 * math.sqrt(area2) / reach
+
+
+def _line_distance(point, start, end):
+    axis = [end[i] - start[i] for i in range(3)]
+    length = math.sqrt(sum(c * c for c in axis))
+    rel = [point[i] - start[i] for i in range(3)]
+    if length < 1e-9:
+        return math.sqrt(sum(c * c for c in rel))
+    t = sum(rel[i] * axis[i] for i in range(3)) / (length * length)
+    return _distance(point, [start[i] + axis[i] * t for i in range(3)])
+
+
+def _bend_explained(a, b, reach_ue, reach_maya, h_maya):
+    """How far the middle joint may differ between Unreal and Maya purely
+    because the two reaches differ (and the export rounding).
+
+    Range of possible bend heights on each side -- Unreal from its measured
+    reach, Maya from its reach and its measured height -- and the largest gap
+    between them. Near straight this is large (the bend is extremely
+    sensitive to the reach); on a bent limb it shrinks to almost nothing, so
+    real errors are still scored.
+    """
+    eps = SLACK_ROUNDING_CM
+    ue = [_triangle_height(a, b, reach_ue - eps), _triangle_height(a, b, reach_ue + eps)]
+    maya = [_triangle_height(a, b, reach_maya - eps), _triangle_height(a, b, reach_maya + eps), h_maya]
+    return max(abs(max(ue) - min(maya)), abs(max(maya) - min(ue)))
 
 
 def _distance(a, b):
@@ -327,6 +372,16 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
     # -- poses -----------------------------------------------------------------
     per_joint = {n: {"p": [], "r": []} for n in joint_keys}
     per_group = {}
+    # Three-joint IK limbs: their middle joint is scored on the error its
+    # own root/tip and the reach do not explain (see _bend_explained).
+    limbs = []
+    for module in (manifest or {}).get("modules") or []:
+        chain = [str(b).split("|")[-1] for b in (module.get("chain") or [])]
+        if module.get("module_type") in LIMB_MODULE_TYPES and len(chain) == 3 and all(b in joint_keys for b in chain):
+            root, mid, tip = (rest["joints"][b]["t"] for b in chain)
+            limbs.append((module.get("module_name"), chain, _distance(root, mid), _distance(mid, tip)))
+    straight = {}
+
     per_pose = []
     skipped = 0
     for pose in poses[1:]:
@@ -367,6 +422,7 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
         pose_p, pose_r = [], []
         worst = (0.0, None)
         scored = []
+        errors = {}
         for name, key in joint_keys.items():
             transform = instance.global_transform(key)
             p_ue, q_ue = _to_p(transform), _to_q(transform)
@@ -384,6 +440,27 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
             delta_ue = _q_mul(q_ue, _q_inv(ue_rest[name][1]))
             delta_maya = _q_mul(_q(maya["q"]), _q_inv(_q(rest["joints"][name]["q"])))
             e_r = _q_angle(delta_ue, delta_maya)
+            errors[name] = [e_p, e_r, p_ue]
+        raw_max = max((e[0] for e in errors.values()), default=0.0)
+        for module_name, (root, mid, tip), length_a, length_b in limbs:
+            if not all(n in errors and n in pose["joints"] for n in (root, mid, tip)):
+                continue
+            maya_root, maya_mid, maya_tip = (pose["joints"][n]["t"] for n in (root, mid, tip))
+            explained = _bend_explained(
+                length_a, length_b,
+                _distance(errors[root][2], errors[tip][2]), _distance(maya_root, maya_tip),
+                _line_distance(maya_mid, maya_root, maya_tip),
+            ) + max(errors[root][0], errors[tip][0])
+            raw = errors[mid][0]
+            errors[mid][0] = max(0.0, raw - explained)
+            if raw > TIERS[-1][1] and errors[mid][0] < raw:
+                entry = straight.setdefault(module_name, {"joint": mid, "poses": 0, "max_raw_cm": 0.0,
+                                                          "max_unexplained_cm": 0.0, "worst_pose": None})
+                entry["poses"] += 1
+                if raw > entry["max_raw_cm"]:
+                    entry["max_raw_cm"], entry["worst_pose"] = round(raw, 4), pose.get("name")
+                entry["max_unexplained_cm"] = round(max(entry["max_unexplained_cm"], errors[mid][0]), 4)
+        for name, (e_p, e_r, _p) in errors.items():
             per_joint[name]["p"].append(e_p)
             per_joint[name]["r"].append(e_r)
             if e_p + e_r / 10.0 > worst[0]:
@@ -401,6 +478,7 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
             "top_joints": [(n, p, r) for _, n, p, r in sorted(scored, reverse=True)[:3]],
             "max_position_cm": round(max(pose_p), 4) if pose_p else None,
             "max_rotation_deg": round(max(pose_r), 4) if pose_r else None,
+            "max_raw_position_cm": round(raw_max, 4),
         })
 
     # -- aggregate --------------------------------------------------------------
@@ -445,7 +523,8 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
         },
         "by_joint": joints_report,
         "by_control": _by_control(per_pose),
-        "verdict": _verdict(calibration_ok, per_module, skipped, tier, calibration["rest_offsets"]),
+        "straight_limb": straight,
+        "verdict": _verdict(calibration_ok, per_module, skipped, tier, calibration["rest_offsets"], straight),
         "worst_poses": sorted(
             (p for p in per_pose if p["max_position_cm"] is not None),
             key=lambda p: -(p["max_position_cm"] + p["max_rotation_deg"] / 10.0),
@@ -497,7 +576,7 @@ def _by_control(per_pose):
                                                           + item[1]["max_rotation_deg"] / 10.0)))
 
 
-def _verdict(calibration_ok, per_module, skipped, tier, rest_offsets=()):
+def _verdict(calibration_ok, per_module, skipped, tier, rest_offsets=(), straight=None):
     if not calibration_ok:
         return "CALIBRATION FAILED - conversion error, fix before reading rig numbers"
     tiers = [tier(max(v["p"] or [0]), max(v["r"] or [0])) for v in per_module.values()]
@@ -507,6 +586,9 @@ def _verdict(calibration_ok, per_module, skipped, tier, rest_offsets=()):
         text += f"; {len(rest_offsets)} joint(s) off at rest"
     if skipped:
         text += f"; {skipped} pose(s) could not be fully applied"
+    if straight:
+        text += (f"; {len(straight)} limb(s) near straight on some poses (middle joint scored on the error "
+                 "its root/tip and the export precision do not explain)")
     return text
 
 
@@ -576,6 +658,15 @@ def _html(report):
             f"{(data['position_cm'] or {}).get('max', 0):.3f}", f"{(data['rotation_deg'] or {}).get('max', 0):.3f}",
             f"{change['state']} ({change['position_cm'][0]} &rarr; {change['position_cm'][1]} cm)" if change else "",
         ]))
+    if report.get("straight_limb"):
+        parts.append("</table><h2>Near-straight limbs</h2><p>On these poses the limb is (almost) straight, so "
+                     "its middle joint moves a lot for a tiny change of reach. The tier uses only the part of the "
+                     "error that the limb's own root/tip error and the export precision do not explain.</p>"
+                     "<table><tr><th>Module</th><th>Joint</th><th>poses</th><th>max raw cm</th>"
+                     "<th>max unexplained cm</th><th>worst pose</th></tr>")
+        for module, data in sorted(report["straight_limb"].items()):
+            parts.append(row([_h.escape(module), _h.escape(data["joint"]), data["poses"], data["max_raw_cm"],
+                              data["max_unexplained_cm"], _h.escape(str(data["worst_pose"]))]))
     parts.append("</table><h2>Controls whose probe breaks the most</h2><table><tr><th>Control</th>"
                  "<th>mode</th><th>worst probe</th><th>worst joint</th><th>max cm</th><th>max deg</th></tr>")
     for control, data in list(report["by_control"].items())[:25]:
@@ -643,6 +734,9 @@ def _summarise(report, report_path, html_path=None):
     for module, data in sorted(report["by_module"].items()):
         p, r = data["position_cm"] or {}, data["rotation_deg"] or {}
         _log(f"  {module:18s} {data['tier']:9s} max {p.get('max', 0):.3f} cm / {r.get('max', 0):.3f} deg")
+    for module, data in sorted((report.get("straight_limb") or {}).items()):
+        _log(f"  near-straight {module}: {data['joint']} raw max {data['max_raw_cm']:.3f} cm on {data['poses']} "
+             f"pose(s), unexplained max {data['max_unexplained_cm']:.3f} cm ({data['worst_pose']})")
     for control, data in list(report["by_control"].items())[:5]:
         _log(f"  worst control {control}: {data['max_position_cm']:.3f} cm / {data['max_rotation_deg']:.3f} deg "
              f"({data['worst_probe']}, joint {data['worst_joint']})")

@@ -71,13 +71,17 @@ the pivot as Maya does.
   sliders) will show as errors on those probes — expected until supported.
 * The Unreal side drives a rig instance from Python; if the engine gives no
   fresh instance it uses the editor's own, reset before every pose.
-* **Perfectly straight limbs.** When a leg or arm is exactly straight at rest
-  (Murakami's), the knee/elbow position on poses that keep it straight is
-  decided by sub-0.0001 cm differences in reach. Unreal solves in 32-bit
-  floats (about 0.00006 cm of precision 10 m from the origin), so the middle
-  joint can differ by a few tenths of a cm (Murakami: knee 0.15–0.19 cm,
-  elbow 0.39 cm on 5 cm probes) while the end joints match. This is
-  numerical, not a rig difference; it disappears as soon as the limb bends.
+* **Near-straight limbs.** On a (nearly) straight leg or arm the middle
+  joint's offset from the root-tip line is about sqrt(2 k slack), with
+  k = A·B/(A+B) and slack = A + B - reach, so it moves a lot for a tiny change
+  of reach (Murakami's straight 7 m arm: 0.0005 cm of slack moves the elbow
+  ~0.4 cm). For every three-joint IK limb the report therefore scores the
+  middle joint on the error that is *not* explained by (a) the limb's own
+  root/tip error, (b) the measured Unreal vs Maya reach, and (c) the poses
+  file's precision (`SLACK_ROUNDING_CM`, positions are written to 1e-4 cm).
+  Raw and unexplained values are listed under `straight_limb` ("Near-straight
+  limbs" in the HTML). On a bent limb the allowance shrinks to almost zero,
+  so real errors still count.
 * **Bind pose vs rest pose.** Unreal's skeleton is the skin's bind pose. If
   the rig rests elsewhere (Murakami's toes: 1.01 cm), the builder starts the
   Control Rig from the exported Maya rest (`rest_pose` in the manifest) and

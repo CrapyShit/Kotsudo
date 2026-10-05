@@ -1187,7 +1187,11 @@ def pick_perpendicular_axis(primary_label, preferred_label=None):
 # ---------------------------------------------------------------------------
 
 # Offsets shorter than this (cm) are treated as "same origin as the bone".
-ORIGIN_OFFSET_TOLERANCE = 0.5
+# Export precision only (offsets are written to 1e-6): any real offset is
+# honoured, since the control's origin is the pivot the animator rotates
+# about (Murakami's neck controls sit 0.11-0.13 cm off their joints; a
+# former 0.5 cm threshold snapped them onto the bone).
+ORIGIN_OFFSET_TOLERANCE = 0.001
 # Maya->UE mapping is accepted when the reference bone direction agrees within
 # this angle (degrees).
 ORIGIN_MAPPING_ANGLE_TOLERANCE = 10.0

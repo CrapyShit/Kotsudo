@@ -2857,9 +2857,20 @@ def _spline_ik_export(module):
             holder = holders.get(controls[index])
             snapshot['ue_control_name'] = _short_node_name(holder or controls[index])
             snapshot['semantic_name'] = '{}_SplineCtrl{:02d}_CTRL'.format(module_name, rank)
+            holder_origin = None
+            if holder:
+                # The UE control stands for the holder, so it sits at the
+                # holder's own origin (the pivot the animator rotates about),
+                # not at the influence joint under it (chest_ctrl's sits 0.59
+                # cm away). The curve points are placed separately.
+                try:
+                    holder_origin, _source = _controller_origin_world(holder)
+                    snapshot['ue_control_origin'] = _point_offset_record(chain, holder_origin)
+                except Exception:
+                    holder_origin = None
             if holder and not snapshot.get('shape_id'):
                 try:
-                    origin, _source = _controller_origin_world(controls[index])
+                    origin = holder_origin or _controller_origin_world(controls[index])[0]
                     snapshot['shape_id'] = _register_controller_shape(holder, origin)
                     snapshot['attributes'] = _controller_attributes(holder)
                     snapshot['shape_source'] = _short_node_name(holder)
