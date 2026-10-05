@@ -6,7 +6,7 @@ try:
 except ImportError:
     unreal = cast(Any, None)
 
-from . import control_shapes, graph_utils
+from . import control_shapes, graph_layout, graph_utils
 from .context import RigContext
 from .logger import RigLogger
 from . import manifest_schema
@@ -703,8 +703,16 @@ class RigBuilder:
             )
         self.logger.push("[RigBuilder] Building modules")
         built_modules = []
+        # Graph nodes per module (what appeared while it was built, its
+        # follow-space updates included), for the layout at the end.
+        layout_groups = []
+        if context:
+            start = [n for n in (graph_utils.find_forwards_solve_node_name(context.model),
+                                 graph_utils.SOLVE_STAGE_NODE) if n]
+            layout_groups.append(("Start (Forwards Solve, solve order)", "Start", start))
         for module_definition in detected_modules:
             module_name = module_definition["module_name"]
+            nodes_before = set(graph_layout.node_names(context.model)) if context else set()
 
             # Cascading skip: if this module's declared parent already failed
             # or was skipped, don't build this module detached at world
@@ -744,10 +752,21 @@ class RigBuilder:
                 context.mark_failed(module_name)
             # Follow spaces waiting on this module's bones update now, after it.
             context.module_finished(module_name)
+            failed = " - FAILED" if context.is_failed(module_name) else ""
+            layout_groups.append((
+                f"{module_name}  ({module_definition['module_type']}){failed}",
+                module_definition["module_type"],
+                [n for n in graph_layout.node_names(context.model) if n not in nodes_before],
+            ))
 
         if context:
+            nodes_before = set(graph_layout.node_names(context.model))
             context.begin_stage("primary")
             context.flush_follow_spaces()
+            late = [n for n in graph_layout.node_names(context.model) if n not in nodes_before]
+            if late:
+                layout_groups.append(("Follow spaces (owner module missing)", "Shared", late))
+            graph_layout.arrange(context.graph_controller, context.model, layout_groups, self.logger.log)
         self.logger.pop()
 
         if built_modules and self.rig:
