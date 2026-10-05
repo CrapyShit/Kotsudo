@@ -7,13 +7,6 @@ except ImportError:
     unreal = cast(Any, None)
 
 from . import control_shapes, graph_utils
-
-
-def _quat(values):
-    """unreal.Quat from [x, y, z, w], normalised (the export is rounded)."""
-    quat = unreal.Quat(*[float(c) for c in values])
-    quat.normalize()
-    return quat
 from .context import RigContext
 from .logger import RigLogger
 from . import manifest_schema
@@ -30,6 +23,23 @@ from .modules.ik_module import IKModule
 from .modules.ikfk_module import IKFKModule
 from .modules.rig_module import RigModule
 from .modules.spline_ik_module import SplineIKModule
+
+
+def _quat(values):
+    """[x, y, z, w] normalised (the export is rounded)."""
+    norm = math.sqrt(sum(float(c) * float(c) for c in values)) or 1.0
+    return [float(c) / norm for c in values]
+
+
+def _quat_mul(a, b):
+    """Hamilton product a x b ([x, y, z, w]): b applied first, then a."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return [aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz]
+
 
 MODULE_REGISTRY = {
     "FKChain": FKModule,
@@ -776,15 +786,16 @@ class RigBuilder:
             # way, as the pose check replays motion) applied on top of the
             # imported bone rotation, so no absolute axis convention is
             # assumed. Position: the exported rest point (validated mapping).
-            rest_q = _quat(state["q"])
-            delta = rest_q * _quat(state["bind_q"]).inverse()
-            delta.normalize()
+            bind_x, bind_y, bind_z, bind_w = _quat(state["bind_q"])
+            delta = _quat(_quat_mul(_quat(state["q"]), [-bind_x, -bind_y, -bind_z, bind_w]))
+            q0 = graph_utils.get_transform_rotation(current)
+            rotated = _quat(_quat_mul(delta, [q0.x, q0.y, q0.z, q0.w]))
             target = unreal.Transform(location=unreal.Vector(*[float(c) for c in state["t"]]))
-            target.rotation = delta * graph_utils.get_transform_rotation(current)
+            target.rotation = unreal.Quat(*rotated)
             target.scale3d = current.scale3d
             distance = graph_utils.vector_length(graph_utils.vector_sub(
                 graph_utils.transform_to_location(target), graph_utils.transform_to_location(current)))
-            angle = math.degrees(2.0 * math.acos(min(1.0, abs(delta.w))))
+            angle = math.degrees(2.0 * math.acos(min(1.0, abs(delta[3]))))
             if distance <= self.REST_POSE_TOLERANCE_CM and angle <= self.REST_POSE_TOLERANCE_DEG:
                 continue
             moved.append((name, distance, angle, target))
