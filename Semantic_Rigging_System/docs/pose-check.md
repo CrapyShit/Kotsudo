@@ -71,3 +71,14 @@ the pivot as Maya does.
   sliders) will show as errors on those probes — expected until supported.
 * The Unreal side drives a rig instance from Python; if the engine gives no
   fresh instance it uses the editor's own, reset before every pose.
+* **Perfectly straight limbs.** When a leg or arm is exactly straight at rest
+  (Murakami's), the knee/elbow position on poses that keep it straight is
+  decided by sub-0.0001 cm differences in reach. Unreal solves in 32-bit
+  floats (about 0.00006 cm of precision 10 m from the origin), so the middle
+  joint can differ by a few tenths of a cm (Murakami: knee 0.15–0.19 cm,
+  elbow 0.39 cm on 5 cm probes) while the end joints match. This is
+  numerical, not a rig difference; it disappears as soon as the limb bends.
+* **Bind pose vs rest pose.** Unreal's skeleton is the skin's bind pose. If
+  the rig rests elsewhere (Murakami's toes: 1.01 cm), the builder starts the
+  Control Rig from the exported Maya rest (`rest_pose` in the manifest) and
+  logs which bones it moved.

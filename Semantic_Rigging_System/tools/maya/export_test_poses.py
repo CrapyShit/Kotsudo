@@ -84,16 +84,20 @@ def _orthonormal(x_axis, y_axis):
 
 def world_state(node):
     """(position_cm_ue, quat_ue) of a node's world frame, Unreal convention."""
-    axes = erm._world_axes_unreal(node)            # [P(X), P(Z), P(Y)] -- a proper basis
-    x_axis, y_axis, z_axis = _orthonormal(axes[0], axes[1])
     # The world MATRIX translation, not the translate channel: with moved
     # pivots (a frozen control whose pivot is away from its origin) the
     # matrix is the only frame for which pose x rest^-1 is the exact rigid
     # motion -- rotating about the pivot. xform -matrix answers in Maya's
     # INTERNAL unit, always cm, so no UI-unit scale is applied.
-    position = cmds.xform(node, query=True, worldSpace=True, matrix=True)[12:15]
+    return matrix_state(cmds.xform(node, query=True, worldSpace=True, matrix=True))
+
+
+def matrix_state(matrix):
+    """(position_cm_ue, quat_ue) of a flat 16-value Maya world matrix."""
+    axes = erm._matrix_axes_unreal(matrix)          # [P(X), P(Z), P(Y)] -- a proper basis
+    x_axis, y_axis, z_axis = _orthonormal(axes[0], axes[1])
     return (
-        [round(c, 4) for c in erm._maya_vector_to_unreal(position, apply_unit_scale=False)],
+        [round(c, 4) for c in erm._maya_vector_to_unreal(list(matrix[12:15]), apply_unit_scale=False)],
         _quat_from_basis(x_axis, y_axis, z_axis),
     )
 

@@ -804,7 +804,11 @@ def _world_axes_unreal(node):
     swap roles too). The result is a proper right-handed basis, directly
     usable as a Control Rig rotation.
     """
-    matrix = cmds.xform(node, query=True, worldSpace=True, matrix=True)
+    return _matrix_axes_unreal(cmds.xform(node, query=True, worldSpace=True, matrix=True))
+
+
+def _matrix_axes_unreal(matrix):
+    """Unreal axes [X, Y, Z] of a flat 16-value Maya world matrix."""
     axes = []
     for row in range(3):
         vector = [matrix[row * 4 + i] for i in range(3)]
@@ -1062,6 +1066,48 @@ def _exported_joints():
     if not root:
         return []
     return root + (cmds.listRelatives(root[0], allDescendents=True, type='joint', fullPath=True) or [])
+
+
+def _rest_pose_unreal():
+    """{joint: {'t', 'q', 'bind_t', 'bind_q'}} for every exported joint
+    (Unreal axes, cm): the frame as the scene stands and the frame the skin
+    was bound in. Unreal's skeleton comes from the BIND pose, which can
+    differ from where the rig actually rests (Murakami's toes sit 1 cm above
+    where they were bound); the builder moves its bones by rest x bind^-1."""
+    import export_test_poses
+    import maya.api.OpenMaya as om
+
+    bind_pre = {}
+    for skin in cmds.ls(type='skinCluster') or []:
+        for index in cmds.getAttr(skin + '.matrix', multiIndices=True) or []:
+            sources = cmds.listConnections('{}.matrix[{}]'.format(skin, index), source=True,
+                                           destination=False) or []
+            sources = cmds.ls(sources, long=True) if sources else []
+            if sources and sources[0] not in bind_pre:
+                bind_pre[sources[0]] = om.MMatrix(cmds.getAttr('{}.bindPreMatrix[{}]'.format(skin, index)))
+
+    bind_world = {}
+
+    def bind_of(joint):
+        # Unskinned joints keep their local transform under a bound parent.
+        if joint not in bind_world:
+            if joint in bind_pre:
+                bind_world[joint] = bind_pre[joint].inverse()
+            else:
+                world = om.MMatrix(cmds.xform(joint, query=True, worldSpace=True, matrix=True))
+                parent = (cmds.listRelatives(joint, parent=True, fullPath=True, type='joint') or [None])[0]
+                if parent:
+                    parent_now = om.MMatrix(cmds.xform(parent, query=True, worldSpace=True, matrix=True))
+                    world = world * parent_now.inverse() * bind_of(parent)
+                bind_world[joint] = world
+        return bind_world[joint]
+
+    pose = {}
+    for joint in _exported_joints():
+        position, rotation = export_test_poses.world_state(joint)
+        bind_t, bind_q = export_test_poses.matrix_state(list(bind_of(joint)))
+        pose[_short_node_name(joint)] = {'t': position, 'q': rotation, 'bind_t': bind_t, 'bind_q': bind_q}
+    return pose
 
 
 def _is_module_joint(joint):
@@ -3322,6 +3368,7 @@ def build_manifest(rig_name, modules_config):
         # degrees. Source units are kept for reference only.
         "units": {"linear": "cm", "angular": "deg"},
         "coordinate_system": _coordinate_system_manifest(),
+        "rest_pose": _safe_call(_rest_pose_unreal),
         "module_build_order": list(graph.get("build_order", [])),
         "module_graph": {
             "valid": graph.get("valid", True),

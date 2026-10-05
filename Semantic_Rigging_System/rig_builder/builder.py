@@ -1,3 +1,4 @@
+import math
 from typing import Any, cast
 
 try:
@@ -6,6 +7,13 @@ except ImportError:
     unreal = cast(Any, None)
 
 from . import control_shapes, graph_utils
+
+
+def _quat(values):
+    """unreal.Quat from [x, y, z, w], normalised (the export is rounded)."""
+    quat = unreal.Quat(*[float(c) for c in values])
+    quat.normalize()
+    return quat
 from .context import RigContext
 from .logger import RigLogger
 from . import manifest_schema
@@ -669,6 +677,7 @@ class RigBuilder:
                 f"[RigBuilder] Cleared previous build: {removed_elements} element(s), "
                 f"{removed_nodes} graph node(s)."
             )
+            self.apply_maya_rest_pose(context)
             # Which module drives each bone: follow spaces emit their update
             # right after that module (RigContext.follow_space).
             context.bone_owner = {
@@ -738,6 +747,57 @@ class RigBuilder:
                 self.compile_rig()
 
         return built_modules
+
+    # Bones whose bind pose differs less than this from Maya's rest are left
+    # alone (export rounding).
+    REST_POSE_TOLERANCE_CM = 0.002
+    REST_POSE_TOLERANCE_DEG = 0.01
+
+    def apply_maya_rest_pose(self, context):
+        """Start the rig from the pose Maya's rig rests in.
+
+        The imported skeleton is the skin's BIND pose; a rig can rest
+        elsewhere (Murakami's toes sit 1.01 cm above where they were bound).
+        Every module places its controls from the bones' initial transforms,
+        so those are set to the exported Maya rest first. Bones keep their
+        children's globals (each bone is set from the export).
+        """
+        rest = (self.manifest or {}).get("rest_pose") or {}
+        if not rest:
+            return
+        hierarchy = context.hierarchy
+        moved = []
+        for name, state in rest.items():
+            key = graph_utils.make_key(unreal.RigElementType.BONE, name)
+            if not hierarchy.contains(key) or not all(state.get(k) for k in ("t", "q", "bind_q")):
+                continue
+            current = hierarchy.get_global_transform(key, True)
+            # Rotation as a DELTA (rest x bind^-1, both converted the same
+            # way, as the pose check replays motion) applied on top of the
+            # imported bone rotation, so no absolute axis convention is
+            # assumed. Position: the exported rest point (validated mapping).
+            rest_q = _quat(state["q"])
+            delta = rest_q * _quat(state["bind_q"]).inverse()
+            delta.normalize()
+            target = unreal.Transform(location=unreal.Vector(*[float(c) for c in state["t"]]))
+            target.rotation = delta * graph_utils.get_transform_rotation(current)
+            target.scale3d = current.scale3d
+            distance = graph_utils.vector_length(graph_utils.vector_sub(
+                graph_utils.transform_to_location(target), graph_utils.transform_to_location(current)))
+            angle = math.degrees(2.0 * math.acos(min(1.0, abs(delta.w))))
+            if distance <= self.REST_POSE_TOLERANCE_CM and angle <= self.REST_POSE_TOLERANCE_DEG:
+                continue
+            moved.append((name, distance, angle, target))
+        for name, _, _, target in moved:
+            key = graph_utils.make_key(unreal.RigElementType.BONE, name)
+            for initial in (True, False):
+                hierarchy.set_global_transform(key, target, initial, False)
+        if moved:
+            worst = max(moved, key=lambda item: item[1])
+            self.logger.log(
+                f"[RigBuilder] {len(moved)} bone(s) start from Maya's rest pose instead of the skin's bind "
+                f"pose (largest: '{worst[0]}' {worst[1]:.4f} cm / {worst[2]:.3f} deg)."
+            )
 
     def bake_rest_corrections(self, context):
         """Measure where the solved rig puts each rest-corrected bone at rest
