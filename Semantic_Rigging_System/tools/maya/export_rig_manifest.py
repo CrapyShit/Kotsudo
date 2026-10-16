@@ -1209,30 +1209,163 @@ def _blendshape_driver(plug, depth=0):
     return None, None, '{} node not supported'.format(kind)
 
 
-def _blendshape_records():
-    """One entry per blendshape target: mesh, morph name, driver and maths."""
-    records = []
-    for blendshape in sorted(cmds.ls(type='blendShape') or []):
+# Registration, stored on the blendShape node like module tags on joints:
+# only registered blendshapes are exported, minus the targets left unticked.
+BLENDSHAPE_EXPORT_ATTR = 'rigTag_exportBlendshape'
+BLENDSHAPE_EXCLUDED_ATTR = 'rigTag_excludedTargets'
+_TRANSFORM_CHANNELS = tuple('{}{}'.format(k, a) for k in ('translate', 'rotate', 'scale') for a in 'XYZ')
+
+
+def blendshape_registered(blendshape):
+    plug = '{}.{}'.format(blendshape, BLENDSHAPE_EXPORT_ATTR)
+    return bool(cmds.objExists(plug) and cmds.getAttr(plug))
+
+
+def set_blendshape_registered(blendshape, registered):
+    if not cmds.attributeQuery(BLENDSHAPE_EXPORT_ATTR, node=blendshape, exists=True):
+        cmds.addAttr(blendshape, longName=BLENDSHAPE_EXPORT_ATTR, attributeType='bool')
+    cmds.setAttr('{}.{}'.format(blendshape, BLENDSHAPE_EXPORT_ATTR), bool(registered))
+
+
+def blendshape_excluded_targets(blendshape):
+    plug = '{}.{}'.format(blendshape, BLENDSHAPE_EXCLUDED_ATTR)
+    if not cmds.objExists(plug):
+        return []
+    return [t for t in (cmds.getAttr(plug) or '').split(',') if t]
+
+
+def set_blendshape_target_included(blendshape, target, included):
+    excluded = [t for t in blendshape_excluded_targets(blendshape) if t != target]
+    if not included:
+        excluded.append(target)
+    if not cmds.attributeQuery(BLENDSHAPE_EXCLUDED_ATTR, node=blendshape, exists=True):
+        cmds.addAttr(blendshape, longName=BLENDSHAPE_EXCLUDED_ATTR, dataType='string')
+    cmds.setAttr('{}.{}'.format(blendshape, BLENDSHAPE_EXCLUDED_ATTR), ','.join(excluded), type='string')
+
+
+def blendshapes_of(nodes):
+    """blendShape nodes on the given meshes/transforms (or the nodes themselves)."""
+    found = []
+    for node in nodes or []:
+        if cmds.nodeType(node) == 'blendShape':
+            candidates = [node]
+        else:
+            candidates = [h for h in (cmds.listHistory(node, pruneDagObjects=True) or [])
+                          if cmds.nodeType(h) == 'blendShape']
+        for candidate in candidates:
+            if candidate not in found:
+                found.append(candidate)
+    return found
+
+
+def describe_ops(ops):
+    """Readable form of a driver's maths, e.g. 'x 0.1' or '1 - x, clamp 0..1'."""
+    def num(v):
+        return '{:g}'.format(round(v, 6))
+    parts = []
+    for op in ops or []:
+        kind = op.get('op')
+        if kind == 'mul':
+            parts.append('x {}'.format(num(op['value'])))
+        elif kind == 'div':
+            parts.append('/ {}'.format(num(op['value'])))
+        elif kind == 'pow':
+            parts.append('^ {}'.format(num(op['value'])))
+        elif kind == 'add':
+            parts.append(('+ {}' if op['value'] >= 0 else '- {}').format(num(abs(op['value']))))
+        elif kind == 'reverse':
+            parts.append('1 - x')
+        elif kind == 'clamp':
+            parts.append('clamp {}..{}'.format(num(op['min']), num(op['max'])))
+        elif kind == 'remap':
+            parts.append('remap {}..{} -> {}..{}'.format(*[num(v) for v in op['from'] + op['to']]))
+        elif kind == 'curve':
+            parts.append('driven keys ({})'.format(len(op.get('keys') or [])))
+    return ', '.join(parts) if parts else 'direct'
+
+
+def _blendshape_target_record(blendshape, mesh, target):
+    plug = '{}.{}'.format(blendshape, target)
+    entry = {
+        'blendshape': blendshape,
+        'mesh': _short_node_name(mesh) if mesh else None,
+        'target': target,
+        'morph': target,          # FBX/Unreal morph target name
+        'rest_weight': round(float(cmds.getAttr(plug)), 6),
+        'driver': None,
+        'ops': [],
+    }
+    control, attribute, ops = _blendshape_driver(plug)
+    if control is not None:
+        entry['driver'] = {'control': control, 'attr': attribute}
+        entry['ops'] = ops
+    elif ops != 'not connected':
+        entry['unsupported'] = ops
+    return entry
+
+
+def _blendshape_status(entry, duplicate_morphs=()):
+    """(green/orange/red/gray, message) for one target, as the tool shows it."""
+    if entry.get('unsupported'):
+        return 'red', 'Maya wiring not supported: {}'.format(entry['unsupported'])
+    driver = entry.get('driver')
+    if not driver:
+        return 'gray', 'not driven (weight stays {:g})'.format(entry.get('rest_weight', 0.0))
+    control, attribute = driver['control'], driver['attr']
+    if not cmds.objExists(control):
+        return 'red', "driver '{}' no longer exists".format(control)
+    if attribute in _TRANSFORM_CHANNELS:
+        return 'orange', '{}.{} is a transform channel; Unreal only drives morphs from sliders for now'.format(
+            control, attribute)
+    if not _has_controller_shape(control):
+        return 'orange', "'{}' is not a controller: Unreal gets no slider for it".format(control)
+    if attribute not in [a['name'] for a in _controller_attributes(control)]:
+        return 'orange', "'{}.{}' is not a keyable slider: Unreal gets no slider for it".format(control, attribute)
+    if entry.get('morph') in duplicate_morphs:
+        return 'orange', "another registered target is also named '{}'; Unreal drives both together".format(
+            entry['morph'])
+    return 'green', 'slider {}.{} ({})'.format(control, attribute, describe_ops(entry.get('ops')))
+
+
+def blendshape_inventory():
+    """Every blendShape node in the scene with its targets, for the tool.
+
+    [{'blendshape', 'mesh', 'registered', 'targets': [record + 'included',
+    'status', 'message', 'maths']}], sorted by mesh then node.
+    """
+    items = []
+    for blendshape in cmds.ls(type='blendShape') or []:
         geometry = cmds.blendShape(blendshape, query=True, geometry=True) or []
         mesh = (cmds.listRelatives(geometry[0], parent=True) or [geometry[0]])[0] if geometry else None
+        excluded = set(blendshape_excluded_targets(blendshape))
+        targets = []
         for target in cmds.listAttr(blendshape + '.w', multi=True) or []:
-            plug = '{}.{}'.format(blendshape, target)
-            entry = {
-                'blendshape': blendshape,
-                'mesh': _short_node_name(mesh) if mesh else None,
-                'target': target,
-                'morph': target,          # FBX/Unreal morph target name
-                'rest_weight': round(float(cmds.getAttr(plug)), 6),
-                'driver': None,
-                'ops': [],
-            }
-            control, attribute, ops = _blendshape_driver(plug)
-            if control is not None:
-                entry['driver'] = {'control': control, 'attr': attribute}
-                entry['ops'] = ops
-            elif ops != 'not connected':
-                entry['unsupported'] = ops
-            records.append(entry)
+            entry = _blendshape_target_record(blendshape, mesh, target)
+            entry['included'] = target not in excluded
+            targets.append(entry)
+        items.append({'blendshape': blendshape, 'mesh': _short_node_name(mesh) if mesh else '',
+                      'registered': blendshape_registered(blendshape), 'targets': targets})
+    exported = [t['morph'] for item in items if item['registered'] for t in item['targets'] if t['included']]
+    duplicates = {m for m in exported if exported.count(m) > 1}
+    for item in items:
+        for entry in item['targets']:
+            entry['status'], entry['message'] = _blendshape_status(
+                entry, duplicates if item['registered'] and entry['included'] else ())
+            entry['maths'] = describe_ops(entry.get('ops'))
+    items.sort(key=lambda i: (i['mesh'].lower(), i['blendshape'].lower()))
+    return items
+
+
+def _blendshape_records(only_registered=True):
+    """Manifest entries: one per exported blendshape target."""
+    records = []
+    for item in blendshape_inventory():
+        if only_registered and not item['registered']:
+            continue
+        for entry in item['targets']:
+            if only_registered and not entry['included']:
+                continue
+            records.append({k: v for k, v in entry.items() if k not in ('included', 'status', 'message', 'maths')})
     return records
 
 

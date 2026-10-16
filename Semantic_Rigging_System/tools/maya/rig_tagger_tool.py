@@ -556,17 +556,31 @@ class RigTaggerWindow(QtWidgets.QDialog):
         self._last_modules = []
         self._last_graph = {}
 
+        self._refreshing_blendshapes = False
+
         self._build_ui()
         self.refresh_module_list()
+        self.refresh_blendshapes()
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        main_layout = QtWidgets.QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 10, 10, 10)
+        outer_layout = QtWidgets.QVBoxLayout(self)
+        outer_layout.setContentsMargins(10, 10, 10, 10)
+        outer_layout.setSpacing(7)
+
+        self._tabs = QtWidgets.QTabWidget()
+        outer_layout.addWidget(self._tabs, 1)
+        modules_page = QtWidgets.QWidget()
+        main_layout = QtWidgets.QVBoxLayout(modules_page)
+        main_layout.setContentsMargins(6, 6, 6, 6)
         main_layout.setSpacing(7)
+        self._modules_layout = main_layout
+        self._tabs.addTab(modules_page, "Modules")
+        self._tabs.addTab(self._build_blendshape_page(), "Blendshapes")
+        self._tabs.currentChanged.connect(self._on_tab_changed)
 
         main_layout.addWidget(self._section_label("1. Define the module chain"))
         main_layout.addLayout(self._build_chain_form())
@@ -637,13 +651,13 @@ class RigTaggerWindow(QtWidgets.QDialog):
         self._build_order_box.setPlaceholderText("No modules tagged.")
         main_layout.addWidget(self._build_order_box)
 
-        main_layout.addWidget(self._section_label("5. Export"))
-        main_layout.addLayout(self._build_export_form())
+        outer_layout.addWidget(self._section_label("Export"))
+        outer_layout.addLayout(self._build_export_form())
 
         export_btn = QtWidgets.QPushButton("Export Manifest + FBX")
         export_btn.setStyleSheet("font-weight: bold; padding: 8px;")
         export_btn.clicked.connect(self._export)
-        main_layout.addWidget(export_btn)
+        outer_layout.addWidget(export_btn)
 
     def _section_label(self, text):
         label = QtWidgets.QLabel(text)
@@ -866,7 +880,7 @@ class RigTaggerWindow(QtWidgets.QDialog):
         self._switch_confirm_btn = QtWidgets.QPushButton(text)
         self._switch_confirm_btn.setStyleSheet("font-weight: bold; padding: 5px;")
         self._switch_confirm_btn.clicked.connect(callback)
-        self.layout().insertWidget(6, self._switch_confirm_btn)
+        self._modules_layout.insertWidget(6, self._switch_confirm_btn)
 
     # ------------------------------------------------------------------
     # Module tree / validation
@@ -1089,6 +1103,178 @@ class RigTaggerWindow(QtWidgets.QDialog):
         self.refresh_module_list()
 
     # ------------------------------------------------------------------
+    # Blendshapes
+    # ------------------------------------------------------------------
+
+    def _build_blendshape_page(self):
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(7)
+
+        intro = QtWidgets.QLabel(
+            "Register the blendshapes to export. Each target's weight is followed back to the controller "
+            "slider that drives it; Unreal rebuilds that link on the morph target. Untick a target to "
+            "leave it out. Double-click a target to select its driver."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self._bs_tree = QtWidgets.QTreeWidget()
+        self._bs_tree.setColumnCount(4)
+        self._bs_tree.setHeaderLabels(["Blendshape / Target", "Driver", "Maths", "Validation"])
+        self._bs_tree.setAlternatingRowColors(True)
+        self._bs_tree.setUniformRowHeights(True)
+        self._bs_tree.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._bs_tree.itemChanged.connect(self._on_blendshape_item_changed)
+        self._bs_tree.itemDoubleClicked.connect(self._select_blendshape_driver)
+        layout.addWidget(self._bs_tree, 1)
+
+        self._bs_summary = QtWidgets.QLabel("")
+        self._bs_summary.setWordWrap(True)
+        layout.addWidget(self._bs_summary)
+
+        buttons = QtWidgets.QHBoxLayout()
+        for text, callback in (
+            ("Refresh", self.refresh_blendshapes),
+            ("Register Selected", lambda: self._register_selected_blendshapes(True)),
+            ("Register All", self._register_all_blendshapes),
+            ("Unregister Selected", lambda: self._register_selected_blendshapes(False)),
+            ("Select Mesh", self._select_blendshape_mesh),
+            ("Select Driver", self._select_blendshape_driver),
+        ):
+            button = QtWidgets.QPushButton(text)
+            button.clicked.connect(callback)
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        return page
+
+    def _on_tab_changed(self, index):
+        if self._tabs.tabText(index) == "Blendshapes":
+            self.refresh_blendshapes()
+
+    def refresh_blendshapes(self):
+        if not hasattr(self, "_bs_tree"):
+            return
+        self._refreshing_blendshapes = True
+        try:
+            self._bs_tree.clear()
+            inventory = erm.blendshape_inventory()
+            counts = {"green": 0, "orange": 0, "red": 0, "gray": 0}
+            exported = 0
+            for item in inventory:
+                registered = item["registered"]
+                statuses = [t["status"] for t in item["targets"] if t["included"]]
+                node_status = _worst_status([s for s in statuses if s != "gray"]) if registered else "gray"
+                node_item = QtWidgets.QTreeWidgetItem([
+                    "{}   ({})".format(item["blendshape"], item["mesh"] or "no mesh"),
+                    "", "{} target(s)".format(len(item["targets"])),
+                    "Registered" if registered else "Not registered (not exported)",
+                ])
+                node_item.setFlags(node_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                node_item.setCheckState(0, QtCore.Qt.Checked if registered else QtCore.Qt.Unchecked)
+                node_item.setIcon(0, self._status_icon(node_status))
+                node_item.setData(0, USER_ROLE, {"kind": "blendshape", "item": item})
+                font = node_item.font(0)
+                font.setBold(True)
+                node_item.setFont(0, font)
+                self._bs_tree.addTopLevelItem(node_item)
+                for target in item["targets"]:
+                    driver = target.get("driver") or {}
+                    active = registered and target["included"]
+                    status = target["status"] if active else "gray"
+                    message = target["message"] if active else (
+                        "excluded" if registered else "blendshape not registered") + " - " + target["message"]
+                    child = QtWidgets.QTreeWidgetItem([
+                        target["target"],
+                        "{}.{}".format(driver["control"], driver["attr"]) if driver else "-",
+                        target["maths"] if driver else "",
+                        message,
+                    ])
+                    child.setFlags(child.flags() | QtCore.Qt.ItemIsUserCheckable)
+                    child.setCheckState(0, QtCore.Qt.Checked if target["included"] else QtCore.Qt.Unchecked)
+                    if not registered:
+                        child.setDisabled(True)
+                    child.setIcon(0, self._status_icon(status))
+                    child.setForeground(3, QtGui.QColor(STATUS_COLORS[status]))
+                    child.setToolTip(3, message)
+                    child.setData(0, USER_ROLE, {"kind": "target", "item": item, "target": target})
+                    node_item.addChild(child)
+                    if active:
+                        counts[target["status"]] += 1
+                        exported += 1
+                node_item.setExpanded(registered)
+            for column in range(3):
+                self._bs_tree.resizeColumnToContents(column)
+            if not inventory:
+                self._bs_summary.setText("No blendShape node in this scene.")
+            else:
+                self._bs_summary.setText(
+                    "{} blendshape node(s), {} registered; {} target(s) will be exported: "
+                    "{} ready, {} to review, {} error(s), {} not driven.".format(
+                        len(inventory), sum(1 for i in inventory if i["registered"]), exported,
+                        counts["green"], counts["orange"], counts["red"], counts["gray"],
+                    )
+                )
+        except Exception as exc:
+            self._bs_summary.setText("Could not read the blendshapes: {}".format(exc))
+        finally:
+            self._refreshing_blendshapes = False
+
+    def _on_blendshape_item_changed(self, tree_item, column):
+        if self._refreshing_blendshapes or column != 0:
+            return
+        data = tree_item.data(0, USER_ROLE) or {}
+        checked = tree_item.checkState(0) == QtCore.Qt.Checked
+        try:
+            if data.get("kind") == "blendshape":
+                erm.set_blendshape_registered(data["item"]["blendshape"], checked)
+            elif data.get("kind") == "target":
+                erm.set_blendshape_target_included(data["item"]["blendshape"], data["target"]["target"], checked)
+        except Exception as exc:
+            self._warn("Could not update the registration: {}".format(exc))
+        QtCore.QTimer.singleShot(0, self.refresh_blendshapes)
+
+    def _current_blendshape_data(self):
+        tree_item = self._bs_tree.currentItem()
+        return (tree_item.data(0, USER_ROLE) or {}) if tree_item else {}
+
+    def _register_selected_blendshapes(self, registered):
+        nodes = erm.blendshapes_of(cmds.ls(selection=True, long=True) or [])
+        data = self._current_blendshape_data()
+        if not nodes and data:
+            nodes = [data["item"]["blendshape"]]
+        if not nodes:
+            self._warn("Select a mesh (or blendShape node) in Maya, or a row in the list.")
+            return
+        for node in nodes:
+            erm.set_blendshape_registered(node, registered)
+        self.refresh_blendshapes()
+
+    def _register_all_blendshapes(self):
+        for item in erm.blendshape_inventory():
+            erm.set_blendshape_registered(item["blendshape"], True)
+        self.refresh_blendshapes()
+
+    def _select_blendshape_mesh(self, *args):
+        data = self._current_blendshape_data()
+        mesh = data.get("item", {}).get("mesh")
+        if not mesh or not cmds.objExists(mesh):
+            self._warn("Select a blendshape row first.")
+            return
+        cmds.select(mesh, replace=True)
+
+    def _select_blendshape_driver(self, *args):
+        data = self._current_blendshape_data()
+        driver = (data.get("target") or {}).get("driver")
+        if not driver:
+            self._warn("Select a target row that has a driver.")
+            return
+        if cmds.objExists(driver["control"]):
+            cmds.select(driver["control"], replace=True)
+
+    # ------------------------------------------------------------------
     # Export
     # ------------------------------------------------------------------
 
@@ -1118,6 +1304,23 @@ class RigTaggerWindow(QtWidgets.QDialog):
                 red_items.append(item_text)
             elif status == "orange":
                 orange_items.append(item_text)
+
+        blendshape_count = 0
+        try:
+            for item in erm.blendshape_inventory():
+                if not item["registered"]:
+                    continue
+                for target in item["targets"]:
+                    if not target["included"]:
+                        continue
+                    blendshape_count += 1
+                    text = "blendshape {}.{}: {}".format(item["blendshape"], target["target"], target["message"])
+                    if target["status"] == "red":
+                        red_items.append(text)
+                    elif target["status"] == "orange":
+                        orange_items.append(text)
+        except Exception as exc:
+            orange_items.append("blendshapes could not be checked: {}".format(exc))
 
         if red_items:
             proceed = QtWidgets.QMessageBox.warning(
@@ -1159,7 +1362,8 @@ class RigTaggerWindow(QtWidgets.QDialog):
         QtWidgets.QMessageBox.information(
             self,
             "Export Complete",
-            "Exported to:\n{}\n\nUE5 build order:\n{}".format(fbx_path, build_order),
+            "Exported to:\n{}\n\nUE5 build order:\n{}\n\nBlendshape targets exported: {}".format(
+                fbx_path, build_order, blendshape_count),
         )
 
     # ------------------------------------------------------------------

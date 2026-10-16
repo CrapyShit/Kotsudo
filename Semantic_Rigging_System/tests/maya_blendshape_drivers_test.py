@@ -132,7 +132,7 @@ def build_scene():
 
 def main():
     bs, ctrl, loc = build_scene()
-    records = {r["target"]: r for r in erm._blendshape_records() if r["blendshape"] == bs}
+    records = {r["target"]: r for r in erm._blendshape_records(only_registered=False) if r["blendshape"] == bs}
     assert records["T_unsupported"].get("unsupported"), records["T_unsupported"]
     assert records["T_unitconv"]["driver"]["control"] == "drv"
     rng = random.Random(1)
@@ -156,7 +156,7 @@ def main():
 
     if len(sys.argv) > 1:
         cmds.file(sys.argv[1], open=True, force=True, ignoreVersion=True)
-        for record in erm._blendshape_records():
+        for record in erm._blendshape_records(only_registered=False):
             print("SCENE", record["blendshape"], record["target"], "->",
                   record.get("driver"), record.get("ops"), record.get("unsupported") or "")
 
