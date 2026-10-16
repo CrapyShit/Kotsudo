@@ -33,7 +33,7 @@ import maya.cmds as cmds
 
 import export_rig_manifest as erm
 
-POSES_SCHEMA_VERSION = 2   # 2: switch modes per pose, probe info, maya_motion
+POSES_SCHEMA_VERSION = 3   # 2: switch modes per pose, probe info, maya_motion; 3: blendshape weights
 ROTATE_PROBE_DEGREES = 20.0
 TRANSLATE_PROBE_CM = 5.0
 RANDOM_POSES = 12
@@ -162,8 +162,15 @@ def _attribute_names(manifest, control_name):
 # Capture
 # ---------------------------------------------------------------------------
 
+# (morph name, "blendShape.target") pairs captured with every pose, so the
+# pose check can compare Unreal's morph target curves with Maya's weights.
+_BLENDSHAPE_PLUGS = []
+
+
 def _capture(joints, posed_controls, attribute_values, name, group):
     pose = {"name": name, "group": group, "controls": {}, "channels": attribute_values, "joints": {}}
+    if _BLENDSHAPE_PLUGS:
+        pose["blendshapes"] = {morph: round(float(cmds.getAttr(plug)), 6) for morph, plug in _BLENDSHAPE_PLUGS}
     for control_name, node in sorted(posed_controls.items(), key=lambda item: _depth(item[1])):
         position, rotation = world_state(node)
         pose["controls"][control_name] = {"t": position, "q": rotation}
@@ -275,6 +282,11 @@ def export_test_poses(path, manifest):
 
     found_switches = switches(manifest)
     modes = control_modes(manifest, found_switches)
+    _BLENDSHAPE_PLUGS[:] = [
+        (entry["morph"], "{}.{}".format(entry["blendshape"], entry["target"]))
+        for entry in (manifest.get("blendshapes") or [])
+        if entry.get("morph") and cmds.objExists("{}.{}".format(entry["blendshape"], entry["target"]))
+    ]
 
     plan = []   # (control, node, channel)
     for control_name, node in sorted(controls.items()):

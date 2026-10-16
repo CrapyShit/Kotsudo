@@ -20,6 +20,7 @@ connections, and constraint queries -- never from joint/control names.
 
 import importlib
 import json
+import math
 import os
 import re
 import sys
@@ -1066,6 +1067,173 @@ def _exported_joints():
     if not root:
         return []
     return root + (cmds.listRelatives(root[0], allDescendents=True, type='joint', fullPath=True) or [])
+
+
+# ---------------------------------------------------------------------------
+# Blendshapes: which controller slider drives each target weight, and how
+#
+# Unreal imports the targets themselves from the FBX (morph targets, same
+# names); what it cannot see is the wiring that drives their weights. Each
+# weight is followed back through the usual Maya maths nodes to the
+# controller attribute that drives it, and the maths is written as a list of
+# simple operations applied in order (driver -> op 1 -> op 2 -> weight).
+# ---------------------------------------------------------------------------
+
+_BLENDSHAPE_MAX_DEPTH = 16
+_MD_OPERATIONS = {0: None, 1: 'mul', 2: 'div', 3: 'pow'}
+
+
+def _source_plug(plug):
+    """The plug connected into ``plug`` (unit conversions kept), or None."""
+    sources = cmds.listConnections(plug, source=True, destination=False, plugs=True,
+                                   skipConversionNodes=False) or []
+    return sources[0] if sources else None
+
+
+def _blendshape_driver(plug, depth=0):
+    """(control, attribute, ops) of whatever drives ``plug``.
+
+    ``ops`` are applied in order to the controller attribute's value:
+    {'op': 'mul'|'div'|'pow'|'add', 'value': v}, {'op': 'reverse'} (1 - x),
+    {'op': 'clamp', 'min', 'max'}, {'op': 'remap', 'from': [a, b],
+    'to': [c, d]} (clamped) and {'op': 'curve', 'keys': [[in, out], ...]}
+    (driven keys, linear, constant outside the keys). Unsupported wiring
+    returns (None, None, reason).
+    """
+    if depth > _BLENDSHAPE_MAX_DEPTH:
+        return None, None, 'wiring too deep'
+    source = _source_plug(plug)
+    if source is None:
+        return None, None, 'not connected'
+    node, attribute = source.split('.', 1)
+    kind = cmds.nodeType(node)
+
+    def follow(input_plug, ops):
+        control, attr, upstream = _blendshape_driver(input_plug, depth + 1)
+        if control is None:
+            return control, attr, upstream
+        return control, attr, upstream + ops
+
+    def connected(input_plug):
+        return _source_plug(input_plug) is not None
+
+    if cmds.objectType(node, isAType='transform'):
+        return _short_node_name(node), attribute.split('[')[0], []
+
+    if kind == 'unitConversion':
+        # The factor applies to Maya's INTERNAL unit; drivers are read (and
+        # shown in Unreal) in UI units. Angles: internal radians, shown in
+        # degrees. Distances: internal cm, shown in the scene unit.
+        factor = float(cmds.getAttr(node + '.conversionFactor'))
+        upstream = _source_plug(node + '.input')
+        kind_in = cmds.getAttr(upstream, type=True) if upstream else None
+        if kind_in == 'doubleAngle':
+            factor *= math.pi / 180.0
+        elif kind_in == 'doubleLinear':
+            factor *= _maya_linear_to_centimeters_scale()
+        return follow(node + '.input', [{'op': 'mul', 'value': factor}])
+
+    if kind == 'multiplyDivide':
+        axis = attribute[-1]
+        operation = _MD_OPERATIONS.get(cmds.getAttr(node + '.operation'))
+        first, second = '{}.input1{}'.format(node, axis), '{}.input2{}'.format(node, axis)
+        if operation is None:
+            return follow(first, [])
+        if connected(first) and not connected(second):
+            return follow(first, [{'op': operation, 'value': float(cmds.getAttr(second))}])
+        if connected(second) and not connected(first) and operation == 'mul':
+            return follow(second, [{'op': 'mul', 'value': float(cmds.getAttr(first))}])
+        return None, None, 'multiplyDivide with two driven inputs'
+
+    if kind == 'reverse':
+        return follow('{}.input{}'.format(node, attribute[-1]), [{'op': 'reverse'}])
+
+    if kind in ('addDoubleLinear', 'multDoubleLinear'):
+        first, second = node + '.input1', node + '.input2'
+        op = 'add' if kind == 'addDoubleLinear' else 'mul'
+        if connected(first) != connected(second):
+            driven, constant = (first, second) if connected(first) else (second, first)
+            return follow(driven, [{'op': op, 'value': float(cmds.getAttr(constant))}])
+        return None, None, '{} with two driven inputs'.format(kind)
+
+    if kind == 'plusMinusAverage':
+        if attribute.startswith('output3D'):
+            axis = attribute[-1].lower()
+            indices = cmds.getAttr(node + '.input3D', multiIndices=True) or []
+            plugs = ['{}.input3D[{}].input3D{}'.format(node, i, axis) for i in indices]
+        else:
+            indices = cmds.getAttr(node + '.input1D', multiIndices=True) or []
+            plugs = ['{}.input1D[{}]'.format(node, i) for i in indices]
+        driven = [i for i, pl in enumerate(plugs) if connected(pl)]
+        if len(driven) != 1:
+            return None, None, 'plusMinusAverage needs exactly one driven input'
+        values = [0.0 if i == driven[0] else float(cmds.getAttr(pl)) for i, pl in enumerate(plugs)]
+        operation = cmds.getAttr(node + '.operation')
+        if operation == 1:      # sum
+            return follow(plugs[driven[0]], [{'op': 'add', 'value': sum(values)}])
+        if operation == 2:      # subtract: first - all others
+            if driven[0] == 0:
+                return follow(plugs[0], [{'op': 'add', 'value': -sum(values[1:])}])
+            return follow(plugs[driven[0]], [{'op': 'mul', 'value': -1.0},
+                                             {'op': 'add', 'value': values[0] - sum(values[1:])}])
+        if operation == 3:      # average
+            return follow(plugs[driven[0]], [{'op': 'add', 'value': sum(values)},
+                                             {'op': 'mul', 'value': 1.0 / len(plugs)}])
+        return None, None, 'plusMinusAverage with no operation'
+
+    if kind == 'clamp':
+        channel = attribute[-1]
+        value_plug = '{}.input{}'.format(node, channel)
+        low, high = '{}.min{}'.format(node, channel), '{}.max{}'.format(node, channel)
+        if connected(low) or connected(high):
+            return None, None, 'clamp with driven limits'
+        return follow(value_plug, [{'op': 'clamp', 'min': float(cmds.getAttr(low)), 'max': float(cmds.getAttr(high))}])
+
+    if kind == 'setRange':
+        axis = attribute[-1]
+        limits = ['{}.{}{}'.format(node, name, axis) for name in ('oldMin', 'oldMax', 'min', 'max')]
+        if any(connected(pl) for pl in limits):
+            return None, None, 'setRange with driven limits'
+        old_min, old_max, new_min, new_max = (float(cmds.getAttr(pl)) for pl in limits)
+        return follow('{}.value{}'.format(node, axis),
+                      [{'op': 'remap', 'from': [old_min, old_max], 'to': [new_min, new_max]}])
+
+    if kind.startswith('animCurveU'):
+        times = cmds.keyframe(node, query=True, floatChange=True) or []
+        values = cmds.keyframe(node, query=True, valueChange=True) or []
+        if not times:
+            return None, None, 'driven-key curve without keys'
+        keys = [[float(t), float(v)] for t, v in sorted(zip(times, values))]
+        return follow(node + '.input', [{'op': 'curve', 'keys': keys}])
+
+    return None, None, '{} node not supported'.format(kind)
+
+
+def _blendshape_records():
+    """One entry per blendshape target: mesh, morph name, driver and maths."""
+    records = []
+    for blendshape in sorted(cmds.ls(type='blendShape') or []):
+        geometry = cmds.blendShape(blendshape, query=True, geometry=True) or []
+        mesh = (cmds.listRelatives(geometry[0], parent=True) or [geometry[0]])[0] if geometry else None
+        for target in cmds.listAttr(blendshape + '.w', multi=True) or []:
+            plug = '{}.{}'.format(blendshape, target)
+            entry = {
+                'blendshape': blendshape,
+                'mesh': _short_node_name(mesh) if mesh else None,
+                'target': target,
+                'morph': target,          # FBX/Unreal morph target name
+                'rest_weight': round(float(cmds.getAttr(plug)), 6),
+                'driver': None,
+                'ops': [],
+            }
+            control, attribute, ops = _blendshape_driver(plug)
+            if control is not None:
+                entry['driver'] = {'control': control, 'attr': attribute}
+                entry['ops'] = ops
+            elif ops != 'not connected':
+                entry['unsupported'] = ops
+            records.append(entry)
+    return records
 
 
 def _rest_pose_unreal():
@@ -3380,6 +3548,7 @@ def build_manifest(rig_name, modules_config):
         "units": {"linear": "cm", "angular": "deg"},
         "coordinate_system": _coordinate_system_manifest(),
         "rest_pose": _safe_call(_rest_pose_unreal),
+        "blendshapes": _safe_call(_blendshape_records),
         "module_build_order": list(graph.get("build_order", [])),
         "module_graph": {
             "valid": graph.get("valid", True),

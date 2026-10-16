@@ -6,7 +6,7 @@ try:
 except ImportError:
     unreal = cast(Any, None)
 
-from . import control_shapes, graph_layout, graph_utils
+from . import blendshapes, control_shapes, graph_layout, graph_utils
 from .context import RigContext
 from .logger import RigLogger
 from . import manifest_schema
@@ -766,6 +766,13 @@ class RigBuilder:
             late = [n for n in graph_layout.node_names(context.model) if n not in nodes_before]
             if late:
                 layout_groups.append(("Follow spaces (owner module missing)", "Shared", late))
+            # Morph targets driven by the Maya sliders (after every module, so
+            # their controls exist).
+            nodes_before = set(graph_layout.node_names(context.model))
+            blendshapes.build(context, (self.manifest or {}).get("blendshapes") or [], self.logger.log)
+            morph_nodes = [n for n in graph_layout.node_names(context.model) if n not in nodes_before]
+            if morph_nodes:
+                layout_groups.append(("Blendshapes (morph targets)", "Blendshapes", morph_nodes))
             graph_layout.arrange(context.graph_controller, context.model, layout_groups, self.logger.log)
         self.logger.pop()
 

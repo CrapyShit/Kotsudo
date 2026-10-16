@@ -38,6 +38,8 @@ except ImportError:
 from . import control_shapes, graph_utils
 
 TIERS = (("T0", 0.01, 0.01), ("T1", 0.1, 0.5))
+# Blendshape weight difference (weights are 0..1 for a full shape).
+MORPH_TOLERANCE = 0.001
 CALIBRATION_TOLERANCE_CM = 0.1
 # Uncertainty of a limb's slack (A + B - reach) from the poses file itself:
 # positions are written to 1e-4 cm, and the slack combines three rounded
@@ -235,6 +237,12 @@ class RigInstance:
                 return child
         return None
 
+    def curve_value(self, key):
+        try:
+            return float(self.hierarchy.get_curve_value(key))
+        except Exception:
+            return float("nan")
+
     def set_float(self, key, value):
         self.hierarchy.set_control_value(
             key, unreal.RigHierarchy.make_control_value_from_float(float(value)),
@@ -382,6 +390,17 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
             limbs.append((module.get("module_name"), chain, _distance(root, mid), _distance(mid, tip)))
     straight = {}
 
+    # Morph target curves to compare with Maya's blendshape weights.
+    morph_keys = {}
+    if any("blendshapes" in p for p in poses):
+        for name in sorted({m for p in poses for m in (p.get("blendshapes") or {})}):
+            key = instance.key("CURVE", name)
+            if key is not None:
+                morph_keys[name] = key
+    morph_errors = {name: [] for name in morph_keys}
+    morph_worst = {}
+    morph_missing = sorted({m for p in poses for m in (p.get("blendshapes") or {})} - set(morph_keys))
+
     per_pose = []
     skipped = 0
     for pose in poses[1:]:
@@ -442,6 +461,14 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
             e_r = _q_angle(delta_ue, delta_maya)
             errors[name] = [e_p, e_r, p_ue]
         raw_max = max((e[0] for e in errors.values()), default=0.0)
+        for name, key in morph_keys.items():
+            maya_weight = (pose.get("blendshapes") or {}).get(name)
+            if maya_weight is None:
+                continue
+            error = abs(instance.curve_value(key) - float(maya_weight))
+            morph_errors[name].append(error)
+            if error > morph_worst.get(name, (0.0, None))[0]:
+                morph_worst[name] = (error, pose.get("name"))
         for module_name, (root, mid, tip), length_a, length_b in limbs:
             if not all(n in errors and n in pose["joints"] for n in (root, mid, tip)):
                 continue
@@ -524,7 +551,17 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
         "by_joint": joints_report,
         "by_control": _by_control(per_pose),
         "straight_limb": straight,
-        "verdict": _verdict(calibration_ok, per_module, skipped, tier, calibration["rest_offsets"], straight),
+        "blendshapes": {
+            "tolerance": MORPH_TOLERANCE,
+            "missing_curves": morph_missing,
+            "targets": {
+                name: {"max_error": round(max(errs), 6) if errs else None,
+                       "worst_pose": morph_worst.get(name, (0.0, None))[1]}
+                for name, errs in morph_errors.items()
+            },
+        } if (morph_keys or morph_missing) else None,
+        "verdict": _verdict(calibration_ok, per_module, skipped, tier, calibration["rest_offsets"], straight,
+                            morph_errors, morph_missing),
         "worst_poses": sorted(
             (p for p in per_pose if p["max_position_cm"] is not None),
             key=lambda p: -(p["max_position_cm"] + p["max_rotation_deg"] / 10.0),
@@ -576,7 +613,8 @@ def _by_control(per_pose):
                                                           + item[1]["max_rotation_deg"] / 10.0)))
 
 
-def _verdict(calibration_ok, per_module, skipped, tier, rest_offsets=(), straight=None):
+def _verdict(calibration_ok, per_module, skipped, tier, rest_offsets=(), straight=None,
+             morph_errors=None, morph_missing=()):
     if not calibration_ok:
         return "CALIBRATION FAILED - conversion error, fix before reading rig numbers"
     tiers = [tier(max(v["p"] or [0]), max(v["r"] or [0])) for v in per_module.values()]
@@ -586,6 +624,12 @@ def _verdict(calibration_ok, per_module, skipped, tier, rest_offsets=(), straigh
         text += f"; {len(rest_offsets)} joint(s) off at rest"
     if skipped:
         text += f"; {skipped} pose(s) could not be fully applied"
+    if morph_errors or morph_missing:
+        good = sum(1 for errs in (morph_errors or {}).values() if errs and max(errs) <= MORPH_TOLERANCE)
+        total = len(morph_errors or {}) + len(morph_missing or ())
+        text += f"; blendshapes {good}/{total} match"
+        if morph_missing:
+            text += f" ({len(morph_missing)} missing in Unreal)"
     if straight:
         text += (f"; {len(straight)} limb(s) near straight on some poses (middle joint scored on the error "
                  "its root/tip and the export precision do not explain)")
@@ -734,6 +778,12 @@ def _summarise(report, report_path, html_path=None):
     for module, data in sorted(report["by_module"].items()):
         p, r = data["position_cm"] or {}, data["rotation_deg"] or {}
         _log(f"  {module:18s} {data['tier']:9s} max {p.get('max', 0):.3f} cm / {r.get('max', 0):.3f} deg")
+    morphs = report.get("blendshapes") or {}
+    for name, data in sorted((morphs.get("targets") or {}).items()):
+        if data["max_error"] is None or data["max_error"] > morphs.get("tolerance", MORPH_TOLERANCE):
+            _log(f"  blendshape {name}: max weight error {data['max_error']} ({data['worst_pose']})")
+    if morphs.get("missing_curves"):
+        _log("  blendshapes with no curve in Unreal: " + ", ".join(morphs["missing_curves"]))
     for module, data in sorted((report.get("straight_limb") or {}).items()):
         _log(f"  near-straight {module}: {data['joint']} raw max {data['max_raw_cm']:.3f} cm on {data['poses']} "
              f"pose(s), unexplained max {data['max_unexplained_cm']:.3f} cm ({data['worst_pose']})")
