@@ -3940,6 +3940,90 @@ def _controller_summary(record):
     }
 
 
+def _weight_text(weight):
+    if 'attr' in (weight or {}):
+        plug = '{}.{}'.format(weight.get('control'), weight.get('attr'))
+        return '1 - {}'.format(plug) if weight.get('invert') else plug
+    return '{:g}'.format(float((weight or {}).get('value', 1.0)))
+
+
+def _module_setup(module, records):
+    """[(label, value, status)] describing how a module is rigged in Maya."""
+    rows = []
+    params = module.get('params') or {}
+    kind = module.get('module_type')
+    mine = [r for r in records if r.get('module_name') == module.get('module_name')]
+
+    def first(roles):
+        return next((r.get('ue_control_name') or r.get('name') for r in mine if r.get('role') in roles), None)
+
+    if kind == 'IKFKSwitch':
+        switch = params.get('switch') or {}
+        control = switch.get('control') or {}
+        control_name = control.get('name') if isinstance(control, dict) else control
+        if switch.get('attribute'):
+            rows.append(('IK/FK switch', '{}.{}  (IK = {:g}, FK = {:g})'.format(
+                control_name, switch['attribute'], float(switch.get('ik_value', 0)),
+                float(switch.get('fk_value', 1))), 'green'))
+        else:
+            rows.append(('IK/FK switch', 'not found: Unreal uses a fixed blend', 'orange'))
+        rows.append(('Chains', 'IK root {}  /  FK root {}'.format(
+            _short_node_name(params.get('ik_chain_root') or '?'), _short_node_name(params.get('fk_chain_root') or '?')),
+            'green'))
+        if params.get('blend_node_type'):
+            rows.append(('Blend', '{} ({})'.format(params['blend_node_type'], params.get('blend_node', '')), 'green'))
+        effector, pole = first(('ik_effector', 'effector')), first(('pole_vector', 'pv'))
+        rows.append(('IK control', effector or 'not found', 'green' if effector else 'orange'))
+        rows.append(('Pole vector', pole or 'not found', 'green' if pole else 'orange'))
+        rows.append(('End joint in IK', 'follows the IK control' if params.get('ik_end_orient')
+                     else 'keeps its own rotation (does not follow the IK control)', 'gray'))
+        rows.append(('Root joint', 'rides on its parent joint (chains blended locally)' if params.get('root_local_blend')
+                     else 'placed in world space by a constraint', 'gray'))
+
+    if kind == 'SplineIK':
+        spline = params.get('spline') or {}
+        controls = [c.get('ue_control_name') or c.get('name') for c in spline.get('controls') or []]
+        rows.append(('Spline IK', 'handle {}, curve {} (degree {}, {} points)'.format(
+            spline.get('ik_handle', '?'), spline.get('curve', '?'), spline.get('degree', '?'),
+            spline.get('cv_count', len(spline.get('cvs') or []))), 'green' if controls else 'red'))
+        rows.append(('Controls', ', '.join(controls) or 'none found', 'green' if controls else 'red'))
+        for index, cv in enumerate(spline.get('cvs') or []):
+            weights = cv.get('weights') or []
+            parts = ['{} {:.0f}%'.format(controls[i] if i < len(controls) else i, w * 100)
+                     for i, w in enumerate(weights) if w >= 0.005]
+            rows.append(('Curve point {}'.format(index), ' / '.join(parts) or 'no weight', 'green' if parts else 'red'))
+        rows.append(('Stretch', 'yes (bones stretch along the curve)' if params.get('stretch_enabled')
+                     else 'no (bones keep their length)', 'gray'))
+
+    for constraint in params.get('constraints') or []:
+        targets = []
+        for target in constraint.get('targets') or []:
+            name = (target.get('controller') or {}).get('name', '?')
+            sub = (target.get('target') or {}).get('name')
+            targets.append('{} (via {})'.format(name, sub) if sub else name)
+        rows.append(('Constraint', '{}: {} -> {}'.format(
+            _short_node_name(constraint.get('bone', '?')), constraint.get('type', '?'), ', '.join(targets)), 'green'))
+
+    for record in mine:
+        blend = record.get('parent_space_blend') or {}
+        if not blend.get('targets'):
+            continue
+        name = record.get('ue_control_name') or record.get('name')
+        rows.append(('Parent space', '{}: blend of {}'.format(name, ', '.join(
+            '{} (weight {})'.format(t.get('controller'), _weight_text(t.get('weight'))) for t in blend['targets'])),
+            'green'))
+        rest = (blend.get('rest') or {}).get('position')
+        for target in blend['targets']:
+            solo = (target.get('solo') or {}).get('position')
+            if rest and solo:
+                shift = math.sqrt(sum((a - b) ** 2 for a, b in zip(rest, solo)))
+                if shift > 0.01:
+                    rows.append(('Per-target offset', '{} moves {:.3f} cm when only {} drives it '
+                                 '(Maya keeps one offset per target; Unreal reproduces it)'.format(
+                                     name, shift, target.get('controller')), 'gray'))
+    return rows
+
+
 def scene_analysis(rig_name, modules_config):
     """Controllers per module and pre-export checks, from an in-memory manifest.
 
@@ -4044,9 +4128,11 @@ def scene_analysis(rig_name, modules_config):
                 check(target['status'], 'Blendshapes', '{}.{}'.format(item['blendshape'], target['target']),
                       target['message'])
 
+    setup = {module.get('module_name'): _module_setup(module, records) for module in manifest.get('modules') or []}
+
     order = {'red': 0, 'orange': 1, 'gray': 2}
     checks.sort(key=lambda c: (order.get(c['status'], 3), c['category'], c['subject']))
-    return {'controllers': controllers, 'checks': checks, 'manifest': manifest}
+    return {'controllers': controllers, 'setup': setup, 'checks': checks, 'manifest': manifest}
 
 
 def validate_manifest_or_raise(manifest):
@@ -4189,6 +4275,10 @@ def export_fbx(fbx_path, export_nodes):
 # Main entry point
 # ---------------------------------------------------------------------------
 
+# What the last export() wrote, for the tool's "Export Complete" message.
+LAST_EXPORT_SUMMARY = {}
+
+
 def export(export_dir, filename_base, rig_name, modules_config):
     """
     Full export pipeline:
@@ -4276,9 +4366,23 @@ def export(export_dir, filename_base, rig_name, modules_config):
 
     # Controller shapes travel as mesh-only FBXs (tube meshes built from the
     # Maya curves). A failure here must not lose the rig export.
+    LAST_EXPORT_SUMMARY.clear()
+    LAST_EXPORT_SUMMARY.update({
+        'fbx': fbx_path,
+        'modules': len(manifest.get('modules') or []),
+        'blendshapes': len(manifest.get('blendshapes') or []),
+        'shapes_expected': len(_SHAPE_RAW),
+        'shapes_exported': 0,
+        'shapes_failed': [],
+        'poses': None,
+    })
     if _SHAPE_RAW:
         try:
-            export_control_shapes_fbx(shapes_dir)
+            exported_shapes = export_control_shapes_fbx(shapes_dir) or []
+            LAST_EXPORT_SUMMARY['shapes_exported'] = len(exported_shapes)
+            LAST_EXPORT_SUMMARY['shapes_failed'] = sorted(
+                set(_SHAPE_RAW) - {os.path.splitext(os.path.basename(str(x)))[0].replace(SHAPE_MESH_PREFIX, '')
+                                   for x in exported_shapes})
         except Exception as exc:
             print("[RigManifest] Shapes FBX export failed ({}). The rig FBX is unaffected; "
                   "Unreal will use built-in shapes.".format(exc))
@@ -4296,9 +4400,20 @@ def export(export_dir, filename_base, rig_name, modules_config):
         importlib.invalidate_caches()
         import export_test_poses
         importlib.reload(export_test_poses)
-        export_test_poses.export_test_poses(
+        poses_path = export_test_poses.export_test_poses(
             os.path.join(export_dir, manifest["poses_file"]), manifest
         )
+        with open(poses_path) as handle:
+            poses_document = json.load(handle)
+        poses = poses_document.get("poses") or []
+        LAST_EXPORT_SUMMARY['poses'] = {
+            'count': max(0, len(poses) - 1),
+            'still': sum(1 for pose in poses[1:]
+                         if (pose.get('maya_motion') or {}).get('cm', 1) < 1e-3
+                         and (pose.get('maya_motion') or {}).get('deg', 1) < 1e-3
+                         and not any((pose.get('blendshapes') or {}).values())),
+            'switches': len(poses_document.get('switches') or []),
+        }
     except Exception as exc:
         import traceback
         traceback.print_exc()

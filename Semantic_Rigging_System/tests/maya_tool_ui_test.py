@@ -90,6 +90,24 @@ names = [branch.child(i).text(0) for i in range(branch.childCount())]
 print("UI Spine controllers:", branch.text(0), names)
 assert set(names) == {"Pelvis_IKctrl", "spine_ctrl_01", "chest_ctrl"}
 
+# --- 2-5: Setup branch (IK/FK, spline, constraints, parent spaces) ----------
+def setup_rows(module):
+    row = module_row("  " + module)
+    group = next(row.child(i) for i in range(row.childCount()) if row.child(i).text(0).startswith("Setup"))
+    return [(group.child(i).text(0), group.child(i).text(2)) for i in range(group.childCount())]
+
+
+leg = dict(setup_rows("L_LegLeaf"))
+print("UI leg setup:", leg)
+assert leg["IK/FK switch"].startswith("L_Leg_IKFK_Switch.IK_FK") and leg["Pole vector"] == "L_LegPV"
+spine_rows = setup_rows("Spine")
+print("UI spine setup:", spine_rows)
+assert any(label == "Curve point 1" and "%" in value for label, value in spine_rows)
+assert any(label == "Constraint" and value.startswith("Spine4: orient -> chest_ctrl") for label, value in spine_rows)
+toe = setup_rows("L_LegLeafToe")
+print("UI toe setup:", toe)
+assert any(label == "Per-target offset" and "1.011 cm" in value for label, value in toe)
+
 # --- 7: Unreal report next to the export ------------------------------------
 folder = tempfile.mkdtemp()
 with open(os.path.join(folder, "uitest.harness_report.json"), "w") as handle:
@@ -110,6 +128,13 @@ face = next(window._bs_tree.topLevelItem(i) for i in range(window._bs_tree.topLe
 cells = {face.child(i).text(0): face.child(i).text(4) for i in range(face.childCount())}
 print("UI morph column:", cells)
 assert cells["Head_BS_CloseMouth"].startswith("max error") and cells["Head_BS_Omouth"] == "no curve in Unreal"
+
+# --- 9: export summary (real export into the temp folder) -----------------
+cmds.loadPlugin("fbxmaya", quiet=True)
+erm.export(folder, "uitest", "murakami", rig_tagger_tool.read_all_tagged_modules())
+summary_text = window._export_summary_text(0)
+print("UI export summary:", summary_text.replace(chr(10), " | "))
+assert "Test poses for the Unreal pose check:" in summary_text and "Controller shapes:" in summary_text
 
 # --- 8: export fields remembered ---------------------------------------------
 second = rig_tagger_tool.RigTaggerWindow()

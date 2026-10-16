@@ -1050,6 +1050,7 @@ class RigTaggerWindow(QtWidgets.QDialog):
                     ])
                     module_item.addChild(joint_item)
 
+                self._add_setup_rows(module_item, module_name)
                 self._add_controller_rows(module_item, module_name)
 
                 if module_def.get("module_type") == "IKFKSwitch":
@@ -1401,6 +1402,21 @@ class RigTaggerWindow(QtWidgets.QDialog):
         if name and cmds.objExists(name):
             cmds.select(name, replace=True)
 
+    def _add_setup_rows(self, module_item, module_name):
+        rows = ((self._analysis or {}).get("setup") or {}).get(module_name)
+        if not rows:
+            return
+        group = QtWidgets.QTreeWidgetItem(["Setup ({})".format(len(rows)), "Analysis", "", "", ""])
+        group.setIcon(0, self._status_icon(_worst_status([r[2] for r in rows if r[2] != "gray"])))
+        module_item.addChild(group)
+        for label, value, status in rows:
+            row = QtWidgets.QTreeWidgetItem([label, "", value, "", ""])
+            row.setIcon(0, self._status_icon(status))
+            row.setToolTip(2, value)
+            if status in ("orange", "red"):
+                row.setForeground(2, QtGui.QColor(STATUS_COLORS[status]))
+            group.addChild(row)
+
     def _add_controller_rows(self, module_item, module_name):
         controllers = ((self._analysis or {}).get("controllers") or {}).get(module_name)
         if controllers is None:
@@ -1600,9 +1616,31 @@ class RigTaggerWindow(QtWidgets.QDialog):
         QtWidgets.QMessageBox.information(
             self,
             "Export Complete",
-            "Exported to:\n{}\n\nUE5 build order:\n{}\n\nBlendshape targets exported: {}".format(
-                fbx_path, build_order, blendshape_count),
+            "Exported to:\n{}\n\nUE5 build order:\n{}\n\n{}".format(
+                fbx_path, build_order, self._export_summary_text(blendshape_count)),
         )
+
+    def _export_summary_text(self, blendshape_count):
+        summary = getattr(erm, "LAST_EXPORT_SUMMARY", {}) or {}
+        lines = ["Modules: {}".format(summary.get("modules", "?")),
+                 "Blendshape targets: {}".format(summary.get("blendshapes", blendshape_count))]
+        expected = summary.get("shapes_expected", 0)
+        if expected:
+            line = "Controller shapes: {}/{} exported".format(summary.get("shapes_exported", 0), expected)
+            failed = summary.get("shapes_failed") or []
+            if failed:
+                line += " ({} failed: Unreal uses default shapes for them)".format(len(failed))
+            lines.append(line)
+        poses = summary.get("poses")
+        if poses:
+            line = "Test poses for the Unreal pose check: {} ({} IK/FK switch(es))".format(
+                poses["count"], poses["switches"])
+            if poses["still"]:
+                line += "; {} probe(s) move nothing in Maya".format(poses["still"])
+            lines.append(line)
+        elif summary:
+            lines.append("Test poses: NOT written (see the Script Editor); the Unreal pose check will be skipped")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Helpers
