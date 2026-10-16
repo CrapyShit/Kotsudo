@@ -557,6 +557,8 @@ class RigTaggerWindow(QtWidgets.QDialog):
         self._last_graph = {}
 
         self._refreshing_blendshapes = False
+        self._analysis = None          # scene_analysis() result, from "Analyze Scene"
+        self._report = None            # last Unreal pose-check report, if found
 
         self._build_ui()
         self.refresh_module_list()
@@ -580,6 +582,8 @@ class RigTaggerWindow(QtWidgets.QDialog):
         self._modules_layout = main_layout
         self._tabs.addTab(modules_page, "Modules")
         self._tabs.addTab(self._build_blendshape_page(), "Blendshapes")
+        self._checks_page = self._build_checks_page()
+        self._tabs.addTab(self._checks_page, "Checks")
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
         main_layout.addWidget(self._section_label("1. Define the module chain"))
@@ -608,12 +612,13 @@ class RigTaggerWindow(QtWidgets.QDialog):
 
         main_layout.addWidget(self._section_label("3. Tagged modules in this scene"))
         self._module_tree = QtWidgets.QTreeWidget()
-        self._module_tree.setColumnCount(4)
+        self._module_tree.setColumnCount(5)
         self._module_tree.setHeaderLabels([
             "Module / Joint",
             "Type / Role",
             "Validation",
             "UE5 Attachment",
+            "Unreal pose check",
         ])
         self._module_tree.setAlternatingRowColors(True)
         self._module_tree.setRootIsDecorated(True)
@@ -635,6 +640,10 @@ class RigTaggerWindow(QtWidgets.QDialog):
         collapse_btn.clicked.connect(self._module_tree.collapseAll)
         untag_btn = QtWidgets.QPushButton("Untag Module")
         untag_btn.clicked.connect(self._untag_current_item)
+        analyze_btn = QtWidgets.QPushButton("Analyze Scene")
+        analyze_btn.setToolTip("Find every module's controllers and run the pre-export checks (no file written).")
+        analyze_btn.clicked.connect(self._analyze_scene)
+        list_buttons.addWidget(analyze_btn)
         list_buttons.addWidget(refresh_btn)
         list_buttons.addWidget(select_btn)
         list_buttons.addWidget(load_btn)
@@ -650,6 +659,15 @@ class RigTaggerWindow(QtWidgets.QDialog):
         self._build_order_box.setMaximumHeight(115)
         self._build_order_box.setPlaceholderText("No modules tagged.")
         main_layout.addWidget(self._build_order_box)
+
+        report_row = QtWidgets.QHBoxLayout()
+        self._report_label = QtWidgets.QLabel("")
+        self._report_label.setWordWrap(True)
+        report_row.addWidget(self._report_label, 1)
+        self._report_button = QtWidgets.QPushButton("Open Pose Report")
+        self._report_button.clicked.connect(self._open_report)
+        report_row.addWidget(self._report_button)
+        main_layout.addLayout(report_row)
 
         outer_layout.addWidget(self._section_label("Export"))
         outer_layout.addLayout(self._build_export_form())
@@ -712,17 +730,35 @@ class RigTaggerWindow(QtWidgets.QDialog):
             grid.addWidget(button, 0, column)
         return grid
 
+    # Export fields are remembered between sessions (Maya option variables).
+    _OPTION_VARS = {"rig_name": "kotsudoRigName", "filename": "kotsudoFilename", "export_dir": "kotsudoExportDir"}
+
+    def _remembered(self, key, default):
+        name = self._OPTION_VARS[key]
+        return cmds.optionVar(query=name) if cmds.optionVar(exists=name) else default
+
+    def _save_export_fields(self):
+        for key, field in (("rig_name", self._rig_name_field), ("filename", self._filename_field),
+                           ("export_dir", self._export_dir_field)):
+            cmds.optionVar(stringValue=(self._OPTION_VARS[key], field.text().strip()))
+
+    def _on_export_field_edited(self):
+        self._save_export_fields()
+        self.refresh_module_list()          # the report lives next to the export
+
     def _build_export_form(self):
         form = QtWidgets.QFormLayout()
 
-        self._rig_name_field = QtWidgets.QLineEdit("MultiModule")
+        self._rig_name_field = QtWidgets.QLineEdit(self._remembered("rig_name", "MultiModule"))
         form.addRow("Rig Name:", self._rig_name_field)
 
-        self._filename_field = QtWidgets.QLineEdit("MultiModule")
+        self._filename_field = QtWidgets.QLineEdit(self._remembered("filename", "MultiModule"))
         form.addRow("Filename:", self._filename_field)
 
         dir_row = QtWidgets.QHBoxLayout()
-        self._export_dir_field = QtWidgets.QLineEdit(getattr(erm, "EXPORT_DIR", ""))
+        self._export_dir_field = QtWidgets.QLineEdit(self._remembered("export_dir", getattr(erm, "EXPORT_DIR", "")))
+        for field in (self._rig_name_field, self._filename_field, self._export_dir_field):
+            field.editingFinished.connect(self._on_export_field_edited)
         browse_btn = QtWidgets.QPushButton("Browse...")
         browse_btn.clicked.connect(self._browse_export_dir)
         dir_row.addWidget(self._export_dir_field)
@@ -912,6 +948,7 @@ class RigTaggerWindow(QtWidgets.QDialog):
         return keys
 
     def refresh_module_list(self):
+        self._report = self._load_report()
         expanded_keys = self._expanded_keys()
         modules_config = read_all_tagged_modules()
         graph = erm.analyze_module_graph(modules_config)
@@ -978,12 +1015,16 @@ class RigTaggerWindow(QtWidgets.QDialog):
                 else:
                     attachment_text = "Root module"
 
+                pose_text, pose_status, pose_tip = self._pose_check_for(module_name)
                 module_item = QtWidgets.QTreeWidgetItem([
                     "{}  {}".format(order_text, module_name),
                     module_def.get("module_type", ""),
                     "{} — {}".format(STATUS_LABELS[status], message),
                     attachment_text,
+                    pose_text,
                 ])
+                module_item.setForeground(4, QtGui.QColor(STATUS_COLORS[pose_status]))
+                module_item.setToolTip(4, pose_tip)
                 module_item.setIcon(0, self._status_icon(status))
                 module_item.setData(0, USER_ROLE, module_def)
                 module_item.setToolTip(2, message)
@@ -1008,6 +1049,8 @@ class RigTaggerWindow(QtWidgets.QDialog):
                         "",
                     ])
                     module_item.addChild(joint_item)
+
+                self._add_controller_rows(module_item, module_name)
 
                 if module_def.get("module_type") == "IKFKSwitch":
                     params = module_def.get("params") or {}
@@ -1037,12 +1080,14 @@ class RigTaggerWindow(QtWidgets.QDialog):
         self._module_tree.resizeColumnToContents(0)
         self._module_tree.resizeColumnToContents(1)
         self._module_tree.resizeColumnToContents(2)
+        self._module_tree.resizeColumnToContents(4)
         try:
             header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
         except AttributeError:
             header.setResizeMode(3, QtWidgets.QHeaderView.Stretch)
 
         self._update_build_order_box(graph)
+        self._update_report_label()
 
     def _update_build_order_box(self, graph):
         lines = []
@@ -1121,8 +1166,8 @@ class RigTaggerWindow(QtWidgets.QDialog):
         layout.addWidget(intro)
 
         self._bs_tree = QtWidgets.QTreeWidget()
-        self._bs_tree.setColumnCount(4)
-        self._bs_tree.setHeaderLabels(["Blendshape / Target", "Driver", "Maths", "Validation"])
+        self._bs_tree.setColumnCount(5)
+        self._bs_tree.setHeaderLabels(["Blendshape / Target", "Driver", "Maths", "Validation", "Unreal"])
         self._bs_tree.setAlternatingRowColors(True)
         self._bs_tree.setUniformRowHeights(True)
         self._bs_tree.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -1197,6 +1242,9 @@ class RigTaggerWindow(QtWidgets.QDialog):
                     if not registered:
                         child.setDisabled(True)
                     child.setIcon(0, self._status_icon(status))
+                    unreal_text, unreal_status = self._morph_check_for(target["morph"])
+                    child.setText(4, unreal_text)
+                    child.setForeground(4, QtGui.QColor(STATUS_COLORS[unreal_status]))
                     child.setForeground(3, QtGui.QColor(STATUS_COLORS[status]))
                     child.setToolTip(3, message)
                     child.setData(0, USER_ROLE, {"kind": "target", "item": item, "target": target})
@@ -1275,6 +1323,183 @@ class RigTaggerWindow(QtWidgets.QDialog):
             cmds.select(driver["control"], replace=True)
 
     # ------------------------------------------------------------------
+    # Scene analysis: controllers per module + pre-export checks
+    # ------------------------------------------------------------------
+
+    def _build_checks_page(self):
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(6, 6, 6, 6)
+        intro = QtWidgets.QLabel(
+            "Pre-export checks: things Unreal would get wrong or not get at all. Red would break the "
+            "export, orange needs a look, gray is information. Click Analyze Scene after changing the rig."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self._checks_tree = QtWidgets.QTreeWidget()
+        self._checks_tree.setColumnCount(3)
+        self._checks_tree.setHeaderLabels(["Check", "Subject", "Details"])
+        self._checks_tree.setAlternatingRowColors(True)
+        self._checks_tree.setRootIsDecorated(False)
+        self._checks_tree.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._checks_tree.itemDoubleClicked.connect(self._select_check_subject)
+        layout.addWidget(self._checks_tree, 1)
+        row = QtWidgets.QHBoxLayout()
+        self._checks_summary = QtWidgets.QLabel("Not analyzed yet.")
+        row.addWidget(self._checks_summary, 1)
+        analyze_btn = QtWidgets.QPushButton("Analyze Scene")
+        analyze_btn.clicked.connect(self._analyze_scene)
+        row.addWidget(analyze_btn)
+        layout.addLayout(row)
+        return page
+
+    def _analyze_scene(self, *args, quiet=False):
+        """Run the analysis; returns it (None on failure)."""
+        modules_config = read_all_tagged_modules()
+        rig_name = self._rig_name_field.text().strip() or "rig"
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            self._analysis = erm.scene_analysis(rig_name, modules_config)
+        except Exception as exc:
+            self._analysis = None
+            if not quiet:
+                self._warn("Analysis failed: {}".format(exc))
+            return None
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self._fill_checks()
+        self.refresh_module_list()
+        return self._analysis
+
+    def _fill_checks(self):
+        self._checks_tree.clear()
+        checks = (self._analysis or {}).get("checks") or []
+        counts = {"red": 0, "orange": 0, "gray": 0}
+        for check in checks:
+            status = check["status"]
+            counts[status] = counts.get(status, 0) + 1
+            item = QtWidgets.QTreeWidgetItem([check["category"], check["subject"], check["message"]])
+            item.setIcon(0, self._status_icon(status))
+            item.setForeground(2, QtGui.QColor(STATUS_COLORS.get(status, STATUS_COLORS["gray"])))
+            item.setToolTip(2, check["message"])
+            item.setData(0, USER_ROLE, check)
+            self._checks_tree.addTopLevelItem(item)
+        for column in range(2):
+            self._checks_tree.resizeColumnToContents(column)
+        if not checks:
+            self._checks_summary.setText("No issue found.")
+        else:
+            self._checks_summary.setText("{} error(s), {} to review, {} note(s).".format(
+                counts["red"], counts["orange"], counts["gray"]))
+        index = self._tabs.indexOf(self._checks_page)
+        self._tabs.setTabText(index, "Checks ({})".format(counts["red"] + counts["orange"])
+                              if counts["red"] + counts["orange"] else "Checks")
+
+    def _select_check_subject(self, item, column=0):
+        check = item.data(0, USER_ROLE) or {}
+        name = check.get("subject", "").split(".")[0]
+        if name and cmds.objExists(name):
+            cmds.select(name, replace=True)
+
+    def _add_controller_rows(self, module_item, module_name):
+        controllers = ((self._analysis or {}).get("controllers") or {}).get(module_name)
+        if controllers is None:
+            return
+        group = QtWidgets.QTreeWidgetItem([
+            "Controllers ({})".format(len(controllers)), "Analysis",
+            "" if controllers else "no controller found", "", ""])
+        module_item.addChild(group)
+        for controller in controllers:
+            details = "pivot: {}; {}".format(controller["pivot"] or "?", controller["follows"])
+            if controller["channels"]:
+                details += "; sliders: {}".format(", ".join(controller["channels"]))
+            row = QtWidgets.QTreeWidgetItem([
+                controller["name"], controller["role"], details,
+                "drives {}; shape: {}".format(controller["driven_bone"], controller["shape"]), ""])
+            row.setToolTip(2, details)
+            group.addChild(row)
+
+    # ------------------------------------------------------------------
+    # Unreal pose-check report
+    # ------------------------------------------------------------------
+
+    def _report_path(self):
+        export_dir = self._export_dir_field.text().strip()
+        filename = self._filename_field.text().strip()
+        if not export_dir or not filename:
+            return None
+        return os.path.join(export_dir, "{}.harness_report.json".format(filename))
+
+    def _load_report(self):
+        path = self._report_path() if hasattr(self, "_export_dir_field") else None
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            import json
+            with open(path) as handle:
+                report = json.load(handle)
+            report["_path"] = path
+            report["_mtime"] = os.path.getmtime(path)
+            fbx = path.replace(".harness_report.json", ".fbx")
+            report["_stale"] = os.path.isfile(fbx) and os.path.getmtime(fbx) > report["_mtime"]
+            return report
+        except Exception:
+            return None
+
+    def _pose_check_for(self, module_name):
+        """(text, status colour, tooltip) for a module from the last report."""
+        if not self._report:
+            return "", "gray", ""
+        data = (self._report.get("by_module") or {}).get(module_name)
+        if not data:
+            return "not in report", "gray", "This module was not in the last Unreal pose check."
+        tier = data.get("tier", "?")
+        p = (data.get("position_cm") or {}).get("max", 0.0)
+        r = (data.get("rotation_deg") or {}).get("max", 0.0)
+        status = {"T0": "green", "T1": "green"}.get(tier, "red")
+        tip = "Max error {:.3f} cm / {:.3f} deg over every pose (T1 = 0.1 cm / 0.5 deg).".format(p, r)
+        straight = (self._report.get("straight_limb") or {}).get(module_name)
+        if straight:
+            tip += " Near-straight limb: raw {} cm on {}, {} cm unexplained.".format(
+                straight["max_raw_cm"], straight["joint"], straight["max_unexplained_cm"])
+        return "{}  ({:.3f} cm / {:.2f} deg)".format(tier, p, r), status, tip
+
+    def _morph_check_for(self, morph):
+        if not self._report:
+            return "", "gray"
+        data = ((self._report.get("blendshapes") or {}).get("targets") or {}).get(morph)
+        if data is None:
+            missing = morph in ((self._report.get("blendshapes") or {}).get("missing_curves") or [])
+            return ("no curve in Unreal", "red") if missing else ("not in report", "gray")
+        error = data.get("max_error")
+        tolerance = (self._report.get("blendshapes") or {}).get("tolerance", 0.001)
+        if error is None:
+            return "not checked", "gray"
+        return "max error {:.4f}".format(error), "green" if error <= tolerance else "red"
+
+    def _update_report_label(self):
+        if not self._report:
+            path = self._report_path()
+            self._report_label.setText("Unreal pose check: no report yet ({}).".format(
+                os.path.basename(path) if path else "set the export fields"))
+            self._report_button.setEnabled(False)
+            return
+        import time
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(self._report["_mtime"]))
+        text = "Unreal pose check ({}): {}".format(when, self._report.get("verdict", ""))
+        if self._report.get("_stale"):
+            text += "  —  older than the last export: rebuild in Unreal to update it."
+        self._report_label.setText(text)
+        self._report_button.setEnabled(True)
+
+    def _open_report(self):
+        if not self._report:
+            return
+        html = self._report["_path"].replace(".json", ".html")
+        target = html if os.path.isfile(html) else self._report["_path"]
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+
+    # ------------------------------------------------------------------
     # Export
     # ------------------------------------------------------------------
 
@@ -1285,6 +1510,7 @@ class RigTaggerWindow(QtWidgets.QDialog):
         )
         if chosen:
             self._export_dir_field.setText(chosen)
+            self._on_export_field_edited()
 
     def _export(self):
         modules_config = read_all_tagged_modules()
@@ -1322,6 +1548,16 @@ class RigTaggerWindow(QtWidgets.QDialog):
         except Exception as exc:
             orange_items.append("blendshapes could not be checked: {}".format(exc))
 
+        analysis = self._analyze_scene(quiet=True)
+        for check in (analysis or {}).get("checks") or []:
+            if check["category"] == "Blendshapes":
+                continue        # listed above
+            text = "{} {}: {}".format(check["category"], check["subject"], check["message"])
+            if check["status"] == "red":
+                red_items.append(text)
+            elif check["status"] == "orange":
+                orange_items.append(text)
+
         if red_items:
             proceed = QtWidgets.QMessageBox.warning(
                 self,
@@ -1352,12 +1588,14 @@ class RigTaggerWindow(QtWidgets.QDialog):
             self._warn("Rig Name, Filename, and Export Dir are all required.")
             return
 
+        self._save_export_fields()
         try:
             fbx_path = erm.export(export_dir, filename, rig_name, modules_config)
         except Exception as exc:
             self._warn("Export failed: {}".format(exc))
             return
 
+        self.refresh_module_list()
         build_order = " → ".join(graph.get("build_order", []))
         QtWidgets.QMessageBox.information(
             self,

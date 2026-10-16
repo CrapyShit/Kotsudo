@@ -3881,6 +3881,174 @@ def _manifest_schema_module():
     return importlib.reload(manifest_schema)
 
 
+# ---------------------------------------------------------------------------
+# Scene analysis for the Rig Tagger (no file is written)
+# ---------------------------------------------------------------------------
+
+_NETWORK_MAX_DEPTH = 12
+REST_POSE_REPORT_CM = 0.01
+REST_POSE_REPORT_DEG = 0.05
+
+
+def _transforms_driven_by(plug):
+    """Transforms whose translate/rotate/scale ``plug`` reaches through nodes.
+
+    Stops at blendShape nodes (exported separately) and at other transforms
+    (their own children are a different hierarchy, not a network).
+    """
+    hits, seen = set(), set()
+    pending = [(plug, 0)]
+    while pending:
+        current, depth = pending.pop()
+        for target in cmds.listConnections(current, source=False, destination=True, plugs=True,
+                                           skipConversionNodes=True) or []:
+            if target in seen or depth > _NETWORK_MAX_DEPTH:
+                continue
+            seen.add(target)
+            node, attribute = target.split('.', 1)
+            if cmds.objectType(node, isAType='transform'):
+                if attribute.startswith(('translate', 'rotate', 'scale')):
+                    hits.add(_short_node_name(node))
+                continue
+            if cmds.nodeType(node) == 'blendShape':
+                continue
+            outputs = cmds.listConnections(node, source=False, destination=True, plugs=True,
+                                           connections=True, skipConversionNodes=True) or []
+            pending.extend((out, depth + 1) for out in outputs[0::2])
+    return sorted(hits)
+
+
+def _controller_summary(record):
+    """What the tool shows for one controller record."""
+    blend = record.get('parent_space_blend') or {}
+    if blend.get('targets'):
+        follows = 'blend of {}'.format(', '.join(t.get('controller', '?') for t in blend['targets']))
+    elif record.get('parent_space_bone'):
+        follows = 'follows bone {}'.format(record['parent_space_bone'])
+    elif record.get('parent_controllers'):
+        follows = 'under {}'.format(record['parent_controllers'][0])
+    else:
+        follows = 'world'
+    return {
+        'name': record.get('ue_control_name') or record.get('name'),
+        'role': record.get('role') or '',
+        'driven_bone': record.get('driven_bone') or record.get('anchor_bone') or '',
+        'pivot': record.get('origin_source') or '',
+        'follows': follows,
+        'channels': [a.get('name') for a in record.get('attributes') or [] if a.get('name')],
+        'shape': 'exported' if record.get('shape_id') else 'default shape',
+    }
+
+
+def scene_analysis(rig_name, modules_config):
+    """Controllers per module and pre-export checks, from an in-memory manifest.
+
+    Returns {'controllers': {module: [summary]}, 'checks': [{'status',
+    'category', 'subject', 'message'}], 'manifest': manifest}. Statuses:
+    red (export would fail or be wrong), orange (review), gray (information).
+    """
+    import export_test_poses
+
+    manifest = build_manifest(rig_name, modules_config)
+    checks = []
+
+    def check(status, category, subject, message):
+        checks.append({'status': status, 'category': category, 'subject': subject, 'message': message})
+
+    # Controllers per module (bone drivers, IK/FK controls, spline controls).
+    controllers = {}
+    seen = set()
+    records = [r for recs in (manifest.get('bone_controllers') or {}).values() for r in recs]
+    for module in manifest.get('modules') or []:
+        spline = (module.get('params') or {}).get('spline') or {}
+        for record in spline.get('controls') or []:
+            records.append(dict(record, module_name=module.get('module_name')))
+    for record in records:
+        summary = _controller_summary(record)
+        key = (record.get('module_name'), summary['name'])
+        if key in seen:
+            continue
+        seen.add(key)
+        controllers.setdefault(record.get('module_name') or '', []).append(summary)
+        node = (cmds.ls(record.get('shape_source') or record.get('name') or '', long=True) or [None])[0]
+        # Pole vectors get Unreal's stock sphere on purpose.
+        if summary['shape'] == 'default shape' and node and _has_controller_shape(node)                 and summary['role'] not in ('pole_vector', 'pv'):
+            check('orange', 'Controller shape', summary['name'],
+                  'curve shape could not be exported; Unreal will use a default shape')
+
+    # Joints of FK chains with no controller found.
+    driven = {r.get('driven_bone') for r in records}
+    for module in manifest.get('modules') or []:
+        if module.get('module_type') != 'FKChain' or (module.get('params') or {}).get('constraints'):
+            continue
+        for bone in module.get('chain') or []:
+            if _short_node_name(bone) not in driven:
+                check('orange', 'Missing controller', _short_node_name(bone),
+                      "no controller drives this joint in module '{}'; Unreal creates a default control"
+                      .format(module.get('module_name')))
+
+    # Manifest validation (the same check the export runs).
+    try:
+        errors, warnings = _manifest_schema_module().validate_manifest(manifest)
+    except Exception as exc:
+        errors, warnings = ['validation could not run: {}'.format(exc)], []
+    for error in errors:
+        check('red', 'Manifest', 'schema', error)
+    for warning in warnings:
+        check('orange', 'Manifest', 'schema', warning)
+
+    # Bind pose vs rest pose (handled by the builder, reported for awareness).
+    moved = []
+    for name, state in (manifest.get('rest_pose') or {}).items():
+        if not state.get('bind_t'):
+            continue
+        distance = math.sqrt(sum((a - b) ** 2 for a, b in zip(state['t'], state['bind_t'])))
+        dot = min(1.0, abs(sum(a * b for a, b in zip(state['q'], state['bind_q']))))
+        angle = math.degrees(2.0 * math.acos(dot))
+        if distance > REST_POSE_REPORT_CM or angle > REST_POSE_REPORT_DEG:
+            moved.append((distance, angle, name))
+    if moved:
+        moved.sort(reverse=True)
+        check('gray', 'Rest pose', '{} joint(s)'.format(len(moved)),
+              'rest pose differs from the skin bind pose (largest: {} {:.4f} cm / {:.3f} deg); '
+              'Unreal starts these bones from the Maya rest pose automatically'.format(
+                  moved[0][2], moved[0][0], moved[0][1]))
+
+    # Controller sliders that move transforms through a node network.
+    switches = {(sw['control'], sw['attribute']) for sw in export_test_poses.switches(manifest)}
+    morph_drivers = {(e['driver']['control'], e['driver']['attr'])
+                     for e in manifest.get('blendshapes') or [] if e.get('driver')}
+    # Every controller in the scene, not only module ones: a settings control
+    # (Head_Settings_Ctrl) often belongs to no module.
+    scene_controllers = sorted({n for n in cmds.ls(type='transform', long=True) or [] if _has_controller_shape(n)})
+    for node in scene_controllers:
+        name = _short_node_name(node)
+        for attribute in _controller_attributes(node):
+            attr = attribute.get('name')
+            if not attr or (name, attr) in switches or (name, attr) in morph_drivers:
+                continue
+            reached = _transforms_driven_by('{}.{}'.format(node, attr))
+            if reached:
+                check('orange', 'Not transferred', '{}.{}'.format(name, attr),
+                      'moves {} transform(s) ({}{}) through a node network; not transferred to Unreal yet'
+                      .format(len(reached), ', '.join(reached[:4]), ', ...' if len(reached) > 4 else ''))
+
+    # Blendshapes.
+    for item in blendshape_inventory():
+        if not item['registered']:
+            check('gray', 'Blendshapes', item['blendshape'],
+                  'not registered: its {} target(s) will not be exported'.format(len(item['targets'])))
+            continue
+        for target in item['targets']:
+            if target['included'] and target['status'] in ('red', 'orange'):
+                check(target['status'], 'Blendshapes', '{}.{}'.format(item['blendshape'], target['target']),
+                      target['message'])
+
+    order = {'red': 0, 'orange': 1, 'gray': 2}
+    checks.sort(key=lambda c: (order.get(c['status'], 3), c['category'], c['subject']))
+    return {'controllers': controllers, 'checks': checks, 'manifest': manifest}
+
+
 def validate_manifest_or_raise(manifest):
     """Validate against schema/kotsudo_manifest.schema.json before anything is written."""
     errors, warnings = _manifest_schema_module().validate_manifest(manifest)

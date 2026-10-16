@@ -34,7 +34,7 @@ for blendshape in cmds.ls(type="blendShape"):
 
 window = rig_tagger_tool.RigTaggerWindow()
 tabs = [window._tabs.tabText(i) for i in range(window._tabs.count())]
-assert tabs == ["Modules", "Blendshapes"], tabs
+assert tabs == ["Modules", "Blendshapes", "Checks"], tabs
 assert window._module_tree.topLevelItemCount() > 0, "modules tab is empty"
 tree = window._bs_tree
 nodes = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
@@ -62,5 +62,59 @@ window._register_all_blendshapes()
 app.processEvents()
 assert len(erm._blendshape_records()) == 9                     # Smile still excluded
 print("UI summary after Register All:", window._bs_summary.text())
+# --- 1 + 6: Analyze Scene -> controllers per module, Checks tab (twice) -----
+import json
+import tempfile
+for _ in range(2):
+    window._analyze_scene(quiet=True)
+    app.processEvents()
+checks = [window._checks_tree.topLevelItem(i) for i in range(window._checks_tree.topLevelItemCount())]
+subjects = [c.text(1) for c in checks]
+print("UI checks:", window._checks_summary.text(), subjects[:5])
+assert "Head_Settings_Ctrl.Petal_Translate" in subjects and "Head_Settings_Ctrl.Petal_Rotation" in subjects
+assert window._tabs.tabText(2).startswith("Checks (")
+
+
+def module_row(name):
+    for g in range(window._module_tree.topLevelItemCount()):
+        group = window._module_tree.topLevelItem(g)
+        for m in range(group.childCount()):
+            if group.child(m).text(0).endswith(name):
+                return group.child(m)
+    raise AssertionError(name)
+
+
+spine = module_row("  Spine")
+branch = next(spine.child(i) for i in range(spine.childCount()) if spine.child(i).text(0).startswith("Controllers"))
+names = [branch.child(i).text(0) for i in range(branch.childCount())]
+print("UI Spine controllers:", branch.text(0), names)
+assert set(names) == {"Pelvis_IKctrl", "spine_ctrl_01", "chest_ctrl"}
+
+# --- 7: Unreal report next to the export ------------------------------------
+folder = tempfile.mkdtemp()
+with open(os.path.join(folder, "uitest.harness_report.json"), "w") as handle:
+    json.dump({"verdict": "21/21 module(s) within T1",
+               "by_module": {"Spine": {"tier": "T1", "position_cm": {"max": 0.0564}, "rotation_deg": {"max": 0.05}}},
+               "blendshapes": {"tolerance": 0.001, "missing_curves": ["Head_BS_Omouth"],
+                               "targets": {"Head_BS_CloseMouth": {"max_error": 0.0002, "worst_pose": "x"}}}}, handle)
+window._export_dir_field.setText(folder)
+window._filename_field.setText("uitest")
+window._on_export_field_edited()
+app.processEvents()
+spine = module_row("  Spine")
+print("UI pose column:", spine.text(4), "|", window._report_label.text())
+assert spine.text(4).startswith("T1") and "21/21" in window._report_label.text()
+window.refresh_blendshapes()
+face = next(window._bs_tree.topLevelItem(i) for i in range(window._bs_tree.topLevelItemCount())
+            if window._bs_tree.topLevelItem(i).text(0).startswith("Face"))
+cells = {face.child(i).text(0): face.child(i).text(4) for i in range(face.childCount())}
+print("UI morph column:", cells)
+assert cells["Head_BS_CloseMouth"].startswith("max error") and cells["Head_BS_Omouth"] == "no curve in Unreal"
+
+# --- 8: export fields remembered ---------------------------------------------
+second = rig_tagger_tool.RigTaggerWindow()
+assert second._filename_field.text() == "uitest" and second._export_dir_field.text() == folder
+for name in rig_tagger_tool.RigTaggerWindow._OPTION_VARS.values():
+    cmds.optionVar(remove=name)
 print("TOOL UI OK")
 maya.standalone.uninitialize()
