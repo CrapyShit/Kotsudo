@@ -903,72 +903,113 @@ def _constraint_targets(constraint):
 
 
 def _weight_source(constraint, index):
-    """What drives one constraint target's weight: {'value': w}, or
-    {'control', 'attr', 'invert'} for a control attribute used directly or
-    through a reverse node (the usual IK/FK blend). None when unsupported."""
+    """What drives one constraint target's weight.
+
+    {'value': w} for a constant, else {'control', 'attr', 'ops'}: the
+    controller attribute and the maths turning it into the weight (any wiring
+    the attribute walker understands -- condition nodes for an enum space
+    switch, driven keys, a reverse for an IK/FK blend...). 'invert' is kept
+    for the plain and reversed cases (older builders read it). None when the
+    wiring is not supported.
+    """
     plug = '{}.target[{}].targetWeight'.format(constraint, index)
-    sources = cmds.listConnections(plug, source=True, destination=False, plugs=True,
-                                   skipConversionNodes=True) or []
-    if not sources:
+    source = _source_plug(plug)
+    # Usually fed by the constraint's own weight attribute ('chest_ctrlW1'):
+    # a constant unless something drives that attribute in turn.
+    if source is None or (cmds.objectType(source.split('.')[0], isAType='constraint')
+                          and _source_plug(source) is None):
         return {'value': float(cmds.getAttr(plug))}
-    node, attr = sources[0].split('.', 1)
-    if cmds.nodeType(node) == 'reverse':
-        axis = attr[-1].upper() if attr[-1].upper() in 'XYZ' else 'X'
-        inputs = cmds.listConnections('{}.input{}'.format(node, axis), source=True, destination=False,
-                                      plugs=True, skipConversionNodes=True) or []
-        if inputs:
-            source_node, source_attr = inputs[0].split('.', 1)
-            if cmds.objectType(source_node, isAType='transform'):
-                return {'control': _short_node_name(source_node), 'attr': source_attr, 'invert': True}
+    control, attribute, ops = _attribute_driver(plug)
+    if control is None:
         return None
-    if cmds.objectType(node, isAType='transform'):
-        return {'control': _short_node_name(node), 'attr': attr, 'invert': False}
-    return None
+    weight = {'control': control, 'attr': attribute, 'ops': ops}
+    if not ops:
+        weight['invert'] = False
+    elif ops == [{'op': 'reverse'}]:
+        weight['invert'] = True
+    return weight
 
 
-def _parent_space_blend(node):
-    """The constraint that replaces a controller's parent space, as a blend.
+_SPACE_CONSTRAINT_KINDS = {'parentConstraint': 'parent', 'orientConstraint': 'orient', 'pointConstraint': 'point'}
 
-    Walks up like _parent_space; at the first constraint-driven group (before
-    any controller) returns {'kind': 'parent', 'targets': [{'controller',
-    'weight'}]} -- e.g. a foot FK group parent-constrained to the IK and FK
-    foot controls, weighted by the IK/FK switch and its reverse. None when
-    the space is not a fully describable parentConstraint.
+
+def _space_target(node):
+    """What a space target follows in the rebuilt rig: the nearest controller
+    above it, else the nearest exported joint above it, else the world."""
+    controller = _nearest_controller_transform(node)
+    if controller:
+        return {'controller': _short_node_name(controller)}
+    exported = set(_exported_joints())
+    current = _full_dag_path(node)
+    while current:
+        if current in exported:
+            return {'bone': _short_node_name(current)}
+        current = (cmds.listRelatives(current, parent=True, fullPath=True) or [None])[0]
+    return {'world': True}
+
+
+def describe_space(node):
+    """(blend, reason) for the constraint that replaces a controller's space.
+
+    Walks up from the controller through its groups; at the first group a
+    constraint drives (before any parent controller) returns the blend:
+    {'kind': 'parent'|'orient'|'point', 'group', 'constraint', 'targets':
+    [{'controller'|'bone'|'world', 'weight'}], 'rest', per-target 'solo'
+    poses, and 'switch' (driver attribute, enum labels, value per target)}.
+    (None, reason) when no group is constrained or the space cannot be
+    described -- the reason is reported instead of guessing silently.
     """
     current = (cmds.listRelatives(node, parent=True, fullPath=True) or [None])[0]
     while current:
         if cmds.objectType(current, isAType='transform') and _has_controller_shape(current):
-            return None
+            return None, None
         constraints = sorted({
             source for attribute in _DRIVEN_ATTRS
-            if cmds.attributeQuery(attribute, node=current, exists=True)
+            if cmds.attributeQuery(attribute.split('.')[0], node=current, exists=True)
             for source in (cmds.listConnections('{}.{}'.format(current, attribute), source=True,
                                                 destination=False, skipConversionNodes=True) or [])
             if cmds.objectType(source, isAType='constraint')
         })
         if constraints:
+            group = _short_node_name(current)
+            if len(constraints) != 1:
+                return None, '{} is driven by several constraints ({})'.format(
+                    group, ', '.join(_short_node_name(c) for c in constraints))
             constraint = constraints[0]
-            if len(constraints) != 1 or cmds.nodeType(constraint) != 'parentConstraint':
-                return None
+            kind = _SPACE_CONSTRAINT_KINDS.get(cmds.nodeType(constraint))
+            if kind is None:
+                return None, '{} is driven by a {}'.format(group, cmds.nodeType(constraint))
             targets = []
             for index in cmds.getAttr('{}.target'.format(constraint), multiIndices=True) or []:
                 sources = cmds.listConnections('{}.target[{}].targetParentMatrix'.format(constraint, index),
                                                source=True, destination=False) or []
+                if not sources:
+                    continue
                 weight = _weight_source(constraint, index)
-                if not sources or weight is None:
-                    return None
-                controller = _nearest_controller_transform(sources[0]) or sources[0]
-                targets.append({'controller': _short_node_name(controller), 'weight': weight})
+                if weight is None:
+                    return None, 'the weight of {} target {} uses wiring that is not supported'.format(
+                        _short_node_name(constraint), _short_node_name(sources[0]))
+                target = _space_target(sources[0])
+                target.update({'node': _short_node_name(sources[0]), 'weight': weight, 'index': index})
+                targets.append(target)
             if not targets:
-                return None
-            blend = {'kind': 'parent', 'targets': targets}
+                return None, '{} has no target'.format(_short_node_name(constraint))
+            blend = {'kind': kind, 'group': group, 'constraint': _short_node_name(constraint), 'targets': targets}
             try:
                 _measure_solo_targets(node, blend)
-            except Exception:
-                pass
-            return blend
+            except Exception as exc:
+                blend['solo_error'] = str(exc)
+            return blend, None
+        if cmds.attributeQuery('offsetParentMatrix', node=current, exists=True) and \
+                _source_plug(current + '.offsetParentMatrix') is not None:
+            return None, '{} follows its space through a matrix network (offsetParentMatrix)'.format(
+                _short_node_name(current))
         current = (cmds.listRelatives(current, parent=True, fullPath=True) or [None])[0]
-    return None
+    return None, None
+
+
+def _parent_space_blend(node):
+    return describe_space(node)[0]
 
 
 def _world_pose_unreal(node):
@@ -980,43 +1021,117 @@ def _world_pose_unreal(node):
     }
 
 
-def _measure_solo_targets(node, blend):
-    """Record where the controller sits with each target alone ('solo').
+_SOLO_MAX_ASSIGNMENTS = 512
 
-    A Maya parentConstraint keeps one offset PER TARGET, set when it was
-    made; they need not agree at the current pose (Murakami's foot FK group
-    drops 1 cm when the switch goes from IK to FK at rest). Unreal's maintain
-    offset measures a single relation from the rest pose, so the per-target
-    poses are exported and rebuilt as one offset each. Only channel-weighted
-    targets that can be made the sole driver are measured; the channels are
-    restored afterwards.
+
+def enum_entries(node, attribute):
+    """[(label, value)] of an enum attribute, honouring explicit values ('High=10')."""
+    entries, value = [], 0
+    for item in ((cmds.attributeQuery(attribute, node=node, listEnum=True) or [''])[0]).split(':'):
+        if not item:
+            continue
+        label = item
+        if '=' in item:
+            label, number = item.rsplit('=', 1)
+            try:
+                value = int(number)
+            except ValueError:
+                pass
+        entries.append((label, float(value)))
+        value += 1
+    return entries
+
+
+def _driver_candidates(plug, ops):
+    """Values worth trying on a driver plug to isolate each space."""
+    node, attribute = plug.split('.', 1)
+    values = [0.0, 1.0]
+    try:
+        if cmds.getAttr(plug, type=True) == 'enum':
+            values += [value for _, value in enum_entries(node, attribute)]
+        for flag, exists in (('minimum', 'minExists'), ('maximum', 'maxExists')):
+            if cmds.attributeQuery(attribute, node=node, **{exists: True}):
+                values += [float(v) for v in cmds.attributeQuery(attribute, node=node, **{flag: True})]
+    except Exception:
+        pass
+    for op in ops or []:
+        if op.get('op') == 'compare':
+            values += [op['value'], op['value'] + 1.0, op['value'] - 1.0]
+        elif op.get('op') == 'curve':
+            values += [k[0] for k in op.get('keys') or []]
+        elif op.get('op') == 'remap':
+            values += list(op.get('from') or [])
+    unique = []
+    for value in values:
+        if all(abs(value - u) > 1e-9 for u in unique):
+            unique.append(value)
+    return unique
+
+
+def _measure_solo_targets(node, blend):
+    """Record where the controller sits with each space (target) alone.
+
+    A Maya constraint keeps one offset PER TARGET, set when it was made, and
+    they need not agree at the current pose (Murakami's foot FK group drops
+    1 cm from IK to FK). Each space is isolated by trying driver values (enum
+    entries, slider limits, the numbers in the weight maths) and reading the
+    constraint's ACTUAL weights, so any wiring works. Also records the
+    switch: driver attribute, enum labels, and the value selecting each
+    space. Every touched attribute is restored.
     """
     targets = blend['targets']
-    plugs = {}
+    constraint = blend['constraint']
+    plugs = []
     for target in targets:
         weight = target['weight']
-        if 'attr' not in weight:
-            return
-        plugs['{}.{}'.format(weight['control'], weight['attr'])] = None
-    for plug in plugs:
-        plugs[plug] = cmds.getAttr(plug)
-    blend['rest'] = _world_pose_unreal(node)
-    try:
-        for target in targets:
-            weight = target['weight']
+        if 'attr' in weight:
             plug = '{}.{}'.format(weight['control'], weight['attr'])
-            cmds.setAttr(plug, 0.0 if weight.get('invert') else 1.0)
-            values = {p: cmds.getAttr(p) for p in plugs}
-            others = [
-                (1.0 - values['{}.{}'.format(o['weight']['control'], o['weight']['attr'])])
-                if o['weight'].get('invert') else values['{}.{}'.format(o['weight']['control'], o['weight']['attr'])]
-                for o in targets if o is not target
-            ]
-            if all(abs(w) < 1e-6 for w in others):
-                target['solo'] = _world_pose_unreal(node)
+            if plug not in [p for p, _ in plugs]:
+                plugs.append((plug, weight.get('ops')))
+    blend['rest'] = _world_pose_unreal(node)
+    if not plugs:
+        return
+    candidates = [_driver_candidates(plug, ops) for plug, ops in plugs]
+    assignments = [[]]
+    for values in candidates:
+        assignments = [a + [v] for a in assignments for v in values]
+        if len(assignments) > _SOLO_MAX_ASSIGNMENTS:
+            raise RuntimeError('too many driver combinations to isolate each space')
+    previous = {plug: cmds.getAttr(plug) for plug, _ in plugs}
+
+    def weights():
+        return [float(cmds.getAttr('{}.target[{}].targetWeight'.format(constraint, t['index']))) for t in targets]
+
+    selected = {}
+    try:
+        for assignment in assignments:
+            try:
+                for (plug, _), value in zip(plugs, assignment):
+                    cmds.setAttr(plug, value)
+            except Exception:
+                continue
+            current = weights()
+            for index, target in enumerate(targets):
+                if index in selected or current[index] <= 1e-6:
+                    continue
+                if all(w <= 1e-6 for j, w in enumerate(current) if j != index):
+                    target['solo'] = _world_pose_unreal(node)
+                    selected[index] = list(assignment)
     finally:
-        for plug, value in plugs.items():
+        for plug, value in previous.items():
             cmds.setAttr(plug, value)
+    if len(plugs) == 1:
+        plug = plugs[0][0]
+        control, attribute = plug.split('.', 1)
+        switch = {'control': _short_node_name(control), 'attr': attribute,
+                  'values': [selected.get(i, [None])[0] for i in range(len(targets))]}
+        try:
+            if cmds.getAttr(plug, type=True) == 'enum':
+                by_value = {value: label for label, value in enum_entries(control, attribute)}
+                switch['labels'] = [by_value.get(v, '?') if v is not None else '?' for v in switch['values']]
+        except Exception:
+            pass
+        blend['switch'] = switch
 
 
 def _is_driven_space(node):
@@ -1090,15 +1205,38 @@ def _source_plug(plug):
     return sources[0] if sources else None
 
 
-def _blendshape_driver(plug, depth=0):
+_COMPARE_TESTS = {0: 'eq', 1: 'ne', 2: 'gt', 3: 'ge', 4: 'lt', 5: 'le'}
+_COMPARE_SWAPPED = {'eq': 'eq', 'ne': 'ne', 'gt': 'lt', 'ge': 'le', 'lt': 'gt', 'le': 'ge'}
+
+
+def _ui_unit_scale(plug):
+    """Internal units per UI unit of a plug: radians per degree for angles,
+    cm per scene unit for distances, 1 for plain numbers."""
+    try:
+        kind = cmds.getAttr(plug, type=True)
+    except Exception:
+        return 1.0
+    if kind == 'doubleAngle':
+        return math.pi / 180.0
+    if kind == 'doubleLinear':
+        return _maya_linear_to_centimeters_scale()
+    return 1.0
+
+
+def _attribute_driver(plug, depth=0):
     """(control, attribute, ops) of whatever drives ``plug``.
 
-    ``ops`` are applied in order to the controller attribute's value:
+    Shared by blendshape weights, constraint (space) weights and driven
+    group channels. Values are in UI units at both ends: the driver as the
+    animator reads it, the result as the driven channel shows it (degrees,
+    scene units, weights). ``ops`` are applied in order to the driver value:
     {'op': 'mul'|'div'|'pow'|'add', 'value': v}, {'op': 'reverse'} (1 - x),
     {'op': 'clamp', 'min', 'max'}, {'op': 'remap', 'from': [a, b],
-    'to': [c, d]} (clamped) and {'op': 'curve', 'keys': [[in, out], ...]}
-    (driven keys, linear, constant outside the keys). Unsupported wiring
-    returns (None, None, reason).
+    'to': [c, d]} (clamped), {'op': 'curve', 'keys': [[in, out], ...]}
+    (driven keys, linear, constant outside the keys) and {'op': 'compare',
+    'test': 'eq'|'ne'|'gt'|'ge'|'lt'|'le', 'value', 'true', 'false'}
+    (condition nodes: the usual way an enum switches space weights).
+    Unsupported wiring returns (None, None, reason).
     """
     if depth > _BLENDSHAPE_MAX_DEPTH:
         return None, None, 'wiring too deep'
@@ -1109,7 +1247,7 @@ def _blendshape_driver(plug, depth=0):
     kind = cmds.nodeType(node)
 
     def follow(input_plug, ops):
-        control, attr, upstream = _blendshape_driver(input_plug, depth + 1)
+        control, attr, upstream = _attribute_driver(input_plug, depth + 1)
         if control is None:
             return control, attr, upstream
         return control, attr, upstream + ops
@@ -1117,21 +1255,40 @@ def _blendshape_driver(plug, depth=0):
     def connected(input_plug):
         return _source_plug(input_plug) is not None
 
+    if cmds.objectType(node, isAType='constraint'):
+        # A constraint's own weight attribute (e.g. 'chest_ctrlW1') feeding
+        # its target slot: the real driver is upstream of it.
+        return follow(source, []) if _source_plug(source) is not None else (
+            None, None, 'constraint weight not driven')
+
     if cmds.objectType(node, isAType='transform'):
         return _short_node_name(node), attribute.split('[')[0], []
 
     if kind == 'unitConversion':
-        # The factor applies to Maya's INTERNAL unit; drivers are read (and
-        # shown in Unreal) in UI units. Angles: internal radians, shown in
-        # degrees. Distances: internal cm, shown in the scene unit.
+        # The factor works on Maya's INTERNAL units (radians, cm); ops work in
+        # UI units at both ends. Between a plain number and an angle or
+        # distance this is 1: Maya reads the number in UI units.
         factor = float(cmds.getAttr(node + '.conversionFactor'))
         upstream = _source_plug(node + '.input')
-        kind_in = cmds.getAttr(upstream, type=True) if upstream else None
-        if kind_in == 'doubleAngle':
-            factor *= math.pi / 180.0
-        elif kind_in == 'doubleLinear':
-            factor *= _maya_linear_to_centimeters_scale()
-        return follow(node + '.input', [{'op': 'mul', 'value': factor}])
+        factor *= (_ui_unit_scale(upstream) if upstream else 1.0) / _ui_unit_scale(plug)
+        ops = [] if abs(factor - 1.0) < 1e-9 else [{'op': 'mul', 'value': factor}]
+        return follow(node + '.input', ops)
+
+    if kind == 'condition':
+        channel = attribute[-1] if attribute.startswith('outColor') else 'R'
+        first, second = node + '.firstTerm', node + '.secondTerm'
+        when_true, when_false = node + '.colorIfTrue' + channel, node + '.colorIfFalse' + channel
+        if connected(when_true) or connected(when_false):
+            return None, None, 'condition with driven result colours'
+        test = _COMPARE_TESTS.get(cmds.getAttr(node + '.operation'))
+        if connected(first) and not connected(second):
+            driven, constant = first, second
+        elif connected(second) and not connected(first):
+            driven, constant, test = second, first, _COMPARE_SWAPPED.get(test)
+        else:
+            return None, None, 'condition with two driven terms'
+        return follow(driven, [{'op': 'compare', 'test': test, 'value': float(cmds.getAttr(constant)),
+                                'true': float(cmds.getAttr(when_true)), 'false': float(cmds.getAttr(when_false))}])
 
     if kind == 'multiplyDivide':
         axis = attribute[-1]
@@ -1216,6 +1373,9 @@ BLENDSHAPE_EXCLUDED_ATTR = 'rigTag_excludedTargets'
 _TRANSFORM_CHANNELS = tuple('{}{}'.format(k, a) for k in ('translate', 'rotate', 'scale') for a in 'XYZ')
 
 
+_blendshape_driver = _attribute_driver     # former name, kept for callers
+
+
 def blendshape_registered(blendshape):
     plug = '{}.{}'.format(blendshape, BLENDSHAPE_EXPORT_ATTR)
     return bool(cmds.objExists(plug) and cmds.getAttr(plug))
@@ -1281,6 +1441,9 @@ def describe_ops(ops):
             parts.append('remap {}..{} -> {}..{}'.format(*[num(v) for v in op['from'] + op['to']]))
         elif kind == 'curve':
             parts.append('driven keys ({})'.format(len(op.get('keys') or [])))
+        elif kind == 'compare':
+            symbol = {'eq': '==', 'ne': '!=', 'gt': '>', 'ge': '>=', 'lt': '<', 'le': '<='}.get(op.get('test'), '?')
+            parts.append('{} if x {} {} else {}'.format(num(op['true']), symbol, num(op['value']), num(op['false'])))
     return ', '.join(parts) if parts else 'direct'
 
 
@@ -1608,16 +1771,20 @@ def _query_transform_snapshot(node, role, module_name, driven_bone, anchor_bone,
     except Exception:
         rotate_order = None
 
-    parent_controllers, parent_space_bone, parent_space_blend = [], None, None
+    parent_controllers, parent_space_bone, parent_space_blend, space_note = [], None, None, None
     try:
         parent_controllers, parent_space_bone = _parent_space(node)
         if parent_space_bone:
-            parent_space_blend = _parent_space_blend(node)
-    except Exception:
-        pass
+            parent_space_blend, space_note = describe_space(node)
+            if parent_space_blend is None:
+                space_note = '{}; Unreal follows the nearest joint ({}) instead'.format(
+                    space_note or 'space could not be described', parent_space_bone)
+    except Exception as exc:
+        space_note = 'space detection failed: {}'.format(exc)
 
     return dict(local_fields, **{
         'parent_space_blend': parent_space_blend,
+        'parent_space_note': space_note,
         'name': _short_node_name(node),
         'dag_path': node,
         'node_type': cmds.nodeType(node),
@@ -3921,10 +4088,16 @@ def _transforms_driven_by(plug):
 def _controller_summary(record):
     """What the tool shows for one controller record."""
     blend = record.get('parent_space_blend') or {}
-    if blend.get('targets'):
-        follows = 'blend of {}'.format(', '.join(t.get('controller', '?') for t in blend['targets']))
+    names = [t.get('controller') or t.get('bone') or 'world' for t in blend.get('targets') or []]
+    switch = blend.get('switch') or {}
+    if switch.get('labels'):
+        follows = '{} space switch on {}.{}: {}'.format(blend.get('kind', 'parent'), switch['control'], switch['attr'],
+                                                      ' / '.join(switch['labels']))
+    elif blend.get('targets'):
+        follows = '{} blend of {}'.format(blend.get('kind', 'parent'), ', '.join(names))
     elif record.get('parent_space_bone'):
-        follows = 'follows bone {}'.format(record['parent_space_bone'])
+        follows = 'follows bone {}{}'.format(record['parent_space_bone'],
+                                             ' (fallback)' if record.get('parent_space_note') else '')
     elif record.get('parent_controllers'):
         follows = 'under {}'.format(record['parent_controllers'][0])
     else:
@@ -3943,6 +4116,8 @@ def _controller_summary(record):
 def _weight_text(weight):
     if 'attr' in (weight or {}):
         plug = '{}.{}'.format(weight.get('control'), weight.get('attr'))
+        if weight.get('ops'):
+            return '{} ({})'.format(plug, describe_ops(weight['ops']))
         return '1 - {}'.format(plug) if weight.get('invert') else plug
     return '{:g}'.format(float((weight or {}).get('value', 1.0)))
 
@@ -4005,13 +4180,20 @@ def _module_setup(module, records):
             _short_node_name(constraint.get('bone', '?')), constraint.get('type', '?'), ', '.join(targets)), 'green'))
 
     for record in mine:
+        if record.get('parent_space_note'):
+            rows.append(('Parent space', '{}: {}'.format(record.get('ue_control_name') or record.get('name'),
+                                                         record['parent_space_note']), 'orange'))
         blend = record.get('parent_space_blend') or {}
         if not blend.get('targets'):
             continue
         name = record.get('ue_control_name') or record.get('name')
-        rows.append(('Parent space', '{}: blend of {}'.format(name, ', '.join(
-            '{} (weight {})'.format(t.get('controller'), _weight_text(t.get('weight'))) for t in blend['targets'])),
-            'green'))
+        switch = blend.get('switch') or {}
+        labels = switch.get('labels') or []
+        rows.append(('Space switch' if labels else 'Parent space', '{}: {} space, {}'.format(
+            name, blend.get('kind', 'parent'), ', '.join(
+                '{}{} (weight {})'.format('{} = '.format(labels[i]) if i < len(labels) else '',
+                                          t.get('controller') or t.get('bone') or 'world', _weight_text(t.get('weight')))
+                for i, t in enumerate(blend['targets']))), 'green'))
         rest = (blend.get('rest') or {}).get('position')
         for target in blend['targets']:
             solo = (target.get('solo') or {}).get('position')
@@ -4059,6 +4241,15 @@ def scene_analysis(rig_name, modules_config):
         if summary['shape'] == 'default shape' and node and _has_controller_shape(node)                 and summary['role'] not in ('pole_vector', 'pv'):
             check('orange', 'Controller shape', summary['name'],
                   'curve shape could not be exported; Unreal will use a default shape')
+
+    # Spaces that could not be described (Unreal falls back to a bone).
+    noted = set()
+    for record in records:
+        note = record.get('parent_space_note')
+        name = record.get('ue_control_name') or record.get('name')
+        if note and name not in noted:
+            noted.add(name)
+            check('orange', 'Space switch', name, note)
 
     # Joints of FK chains with no controller found.
     driven = {r.get('driven_bone') for r in records}

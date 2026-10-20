@@ -51,6 +51,10 @@ def apply_ops(value, ops):
                     if x0 <= value <= x1:
                         value = y0 + (y1 - y0) * (value - x0) / (x1 - x0)
                         break
+        elif kind == "compare":
+            ok = {"eq": value == op["value"], "ne": value != op["value"], "gt": value > op["value"],
+                  "ge": value >= op["value"], "lt": value < op["value"], "le": value <= op["value"]}[op["test"]]
+            value = op["true"] if ok else op["false"]
         else:
             raise ValueError(kind)
     return value
@@ -60,7 +64,7 @@ def build_scene():
     cmds.file(new=True, force=True)
     base = cmds.polyCube(name="Base")[0]
     names = ["direct", "md_mul", "md_div", "reverse", "pma_sub", "pma_avg", "adl", "clamp", "setrange",
-             "sdk", "unitconv", "unsupported"]
+             "sdk", "unitconv", "cond_eq", "cond_swapped", "unsupported"]
     targets = []
     for n in names:
         t = cmds.duplicate(base, name="T_" + n)[0]
@@ -124,10 +128,51 @@ def build_scene():
                            inTangentType="linear", outTangentType="linear")
     loc = cmds.spaceLocator(name="drv")[0]
     cmds.connectAttr(loc + ".rotateX", w("unitconv"))     # adds a unitConversion node
+    cmds.addAttr(ctrl, longName="space", attributeType="enum", enumName="World:Chest:Head", keyable=True)
+    eq = cmds.createNode("condition")
+    cmds.connectAttr(ctrl + ".space", eq + ".firstTerm")
+    cmds.setAttr(eq + ".secondTerm", 2)
+    cmds.setAttr(eq + ".operation", 0)
+    cmds.setAttr(eq + ".colorIfTrueR", 1)
+    cmds.setAttr(eq + ".colorIfFalseR", 0)
+    cmds.connectAttr(eq + ".outColorR", w("cond_eq"))
+    sw = cmds.createNode("condition")
+    cmds.setAttr(sw + ".firstTerm", 1.5)
+    cmds.connectAttr(ctrl + ".b", sw + ".secondTerm")
+    cmds.setAttr(sw + ".operation", 2)            # 1.5 > b  ->  b < 1.5
+    cmds.setAttr(sw + ".colorIfTrueG", 0.25)
+    cmds.setAttr(sw + ".colorIfFalseG", 0.75)
+    cmds.connectAttr(sw + ".outColorG", w("cond_swapped"))
     cond = cmds.createNode("condition")
     cmds.connectAttr(ctrl + ".a", cond + ".firstTerm")
+    cmds.connectAttr(ctrl + ".b", cond + ".secondTerm")
     cmds.connectAttr(cond + ".outColorR", w("unsupported"))
     return bs, ctrl, loc
+
+
+def driven_channels():
+    """Slider -> maths -> a group's translate/rotate (the petals), in cm and in m scenes."""
+    for unit in ("cm", "m"):
+        cmds.file(new=True, force=True)
+        cmds.currentUnit(linear=unit)
+        ctrl = cmds.circle(name="settings")[0]
+        cmds.addAttr(ctrl, longName="open", attributeType="double", minValue=0, maxValue=10, keyable=True)
+        group = cmds.group(empty=True, name="petal_offset")
+        md = cmds.createNode("multiplyDivide")
+        cmds.connectAttr(ctrl + ".open", md + ".input1X")
+        cmds.setAttr(md + ".input2X", 0.2)
+        cmds.connectAttr(ctrl + ".open", md + ".input1Z")
+        cmds.setAttr(md + ".input2Z", 8.0)
+        cmds.connectAttr(md + ".outputX", group + ".translateY")     # Maya adds unitConversion nodes
+        cmds.connectAttr(md + ".outputZ", group + ".rotateX")
+        for channel in ("translateY", "rotateX"):
+            control, attribute, ops = erm._attribute_driver("{}.{}".format(group, channel))
+            assert (control, attribute) == ("settings", "open"), (control, attribute, ops)
+            for value in (0.0, 3.7, 10.0):
+                cmds.setAttr(ctrl + ".open", value)
+                got, want = apply_ops(value, ops), cmds.getAttr("{}.{}".format(group, channel))
+                assert abs(got - want) < 1e-6, (unit, channel, ops, value, got, want)
+    print("DRIVEN CHANNELS OK (cm and m scenes)")
 
 
 def main():
@@ -139,6 +184,7 @@ def main():
     worst = 0.0
     for _ in range(40):
         values = {"a": rng.uniform(-10, 10), "b": rng.uniform(-10, 10), "rotateX": rng.uniform(-90, 90)}
+        cmds.setAttr(ctrl + ".space", rng.randint(0, 2))
         cmds.setAttr(ctrl + ".a", values["a"])
         cmds.setAttr(ctrl + ".b", values["b"])
         cmds.setAttr(loc + ".rotateX", values["rotateX"])
@@ -151,6 +197,7 @@ def main():
             got = apply_ops(plug_value, record["ops"])
             worst = max(worst, abs(got - expected))
             assert abs(got - expected) < 1e-5, (target, record["ops"], plug_value, got, expected)
+    driven_channels()
     print("BLENDSHAPE DRIVERS OK ({} supported targets, worst difference {:.2e})".format(
         sum(1 for r in records.values() if r.get("driver")), worst))
 

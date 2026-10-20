@@ -341,24 +341,28 @@ def export_test_poses(path, manifest):
         for control_name, node, channel in plan:
             plug = "{}.{}".format(node, channel)
             is_custom = channel not in _ROTATE + _TRANSLATE
-            if not is_custom:
-                _set_mode(control_name)
             current = cmds.getAttr(plug)
             info = attribute_info.get((control_name, channel), {})
-            if not _set(node, channel, _probe_value(channel, current, info, unit_scale)):
+            # An enum (space switch, mode...) is probed on every other value:
+            # probing only its maximum would skip the middle spaces.
+            values = [_probe_value(channel, current, info, unit_scale)]
+            if is_custom and info.get("type") == "enum":
+                values = [v for _, v in erm.enum_entries(node, channel) if abs(v - current) > 1e-6] or values
+            for value in values:
+                if not is_custom:
+                    _set_mode(control_name)
+                if not _set(node, channel, value):
+                    _restore()
+                    continue
+                channels = _switch_channels(found_switches)
+                if is_custom:
+                    channels["{}.{}".format(control_name, channel)] = float(cmds.getAttr(plug))
+                name = "{}.{}".format(control_name, channel) + ("={:g}".format(value) if len(values) > 1 else "")
+                pose = _capture(joints, {} if is_custom else {control_name: node}, channels, name, "probe")
+                pose["probe"] = {"control": control_name, "channel": channel,
+                                 "mode": modes.get(control_name, (None, None))[1] if not is_custom else None}
+                _add(pose)
                 _restore()
-                continue
-            channels = _switch_channels(found_switches)
-            if is_custom:
-                channels["{}.{}".format(control_name, channel)] = float(cmds.getAttr(plug))
-            pose = _capture(
-                joints, {} if is_custom else {control_name: node}, channels,
-                "{}.{}".format(control_name, channel), "probe",
-            )
-            pose["probe"] = {"control": control_name, "channel": channel,
-                             "mode": modes.get(control_name, (None, None))[1] if not is_custom else None}
-            _add(pose)
-            _restore()
 
         # Random multi-control poses, each limb in a random mode; only the
         # controls active in their limb's mode are posed.
