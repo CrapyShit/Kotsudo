@@ -666,6 +666,10 @@ class RigBuilder:
                 params = module_definition.get("params") or {}
                 shape_ids.update((params.get("shape_table") or {}).keys())
                 shapes_dir = shapes_dir or params.get("shapes_dir")
+            for record in (self.manifest or {}).get("settings_controls") or []:
+                if record.get("shape_id"):
+                    shape_ids.add(record["shape_id"])
+            shapes_dir = shapes_dir or (self.manifest or {}).get("shapes_dir")
             if shape_ids:
                 preview_mesh = None
                 try:
@@ -688,6 +692,13 @@ class RigBuilder:
                 f"{removed_nodes} graph node(s)."
             )
             self.apply_maya_rest_pose(context)
+            manifest = self.manifest or {}
+            context.settings_records = {r["name"]: r for r in manifest.get("settings_controls") or [] if r.get("name")}
+            context.settings_shapes = {
+                r["shape_id"]: (manifest.get("control_shapes") or {}).get(r["shape_id"])
+                for r in context.settings_records.values()
+                if r.get("shape_id") and (manifest.get("control_shapes") or {}).get(r["shape_id"])
+            }
             # Which module drives each bone: follow spaces emit their update
             # right after that module (RigContext.follow_space).
             context.bone_owner = {

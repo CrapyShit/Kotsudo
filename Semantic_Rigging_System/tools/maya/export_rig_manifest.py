@@ -1134,6 +1134,78 @@ def _measure_solo_targets(node, blend):
         blend['switch'] = switch
 
 
+# ---------------------------------------------------------------------------
+# Offset / zero groups
+#
+# The groups between a controller and its parent controller. A static group
+# only holds the rest pose (Unreal: the control's offset transform). A group
+# whose channels are driven by controller sliders through a node network
+# (set-driven-key / "auto" groups, Murakami's petal groups) must move in
+# Unreal too: it becomes a null whose local transform is rebuilt every frame
+# from the same channels (see rig_builder/driven_groups.py).
+# ---------------------------------------------------------------------------
+
+_GROUP_CHANNELS = ('translateX', 'translateY', 'translateZ', 'rotateX', 'rotateY', 'rotateZ',
+                   'scaleX', 'scaleY', 'scaleZ')
+_ROTATE_ORDERS = ('xyz', 'yzx', 'zxy', 'xzy', 'yxz', 'zyx')
+
+
+def _group_entry(group):
+    """One offset group: its kind and, when driven, what the builder needs."""
+    entry = {'name': _short_node_name(group), 'node_type': cmds.nodeType(group), 'kind': 'static'}
+    driven, problems = {}, []
+    for channel in _GROUP_CHANNELS:
+        plug = '{}.{}'.format(group, channel)
+        source = _source_plug(plug) or _source_plug('{}.{}'.format(group, channel[:-1]))
+        if source is None:
+            continue
+        if cmds.objectType(source.split('.')[0], isAType='constraint'):
+            entry['kind'] = 'space'
+            continue
+        control, attribute, ops = _attribute_driver(plug)
+        if control is None:
+            problems.append('{}: {}'.format(channel, ops))
+        elif channel.startswith('scale'):
+            problems.append('{}: driven scale is not transferred yet'.format(channel))
+        else:
+            driven[channel] = {'control': control, 'attr': attribute, 'ops': ops}
+    if _source_plug(group + '.offsetParentMatrix') is not None:
+        entry['kind'] = 'matrix'
+        problems.append('placed by a matrix network (offsetParentMatrix)')
+    if entry['kind'] == 'static' and (driven or problems):
+        entry['kind'] = 'driven'
+    if driven or problems:
+        entry['driven'] = driven
+        entry['problems'] = problems
+    if entry['kind'] == 'driven':
+        pivots = [cmds.getAttr('{}.{}'.format(group, a))[0] for a in ('rotatePivot', 'scalePivot',
+                                                                         'rotatePivotTranslate')]
+        if any(abs(c) > 1e-6 for p in pivots for c in p):
+            problems.append('moved pivots are not transferred yet (the group turns about its origin)')
+        is_joint = cmds.nodeType(group) == 'joint'
+        entry.update({
+            'rest_world': _world_pose_unreal(group),
+            'rest': {c: float(cmds.getAttr('{}.{}'.format(group, c))) for c in _GROUP_CHANNELS[:6]},
+            'rotate_order': _ROTATE_ORDERS[cmds.getAttr(group + '.rotateOrder')],
+            'rotate_axis': list(cmds.getAttr(group + '.rotateAxis')[0]),
+            'joint_orient': list(cmds.getAttr(group + '.jointOrient')[0]) if is_joint else [0.0, 0.0, 0.0],
+            'axes_unreal': {a: _maya_vector_to_unreal(v, apply_unit_scale=False)
+                            for a, v in (('x', [1, 0, 0]), ('y', [0, 1, 0]), ('z', [0, 0, 1]))},
+            'unit_scale': _maya_linear_to_centimeters_scale(),
+        })
+    return entry
+
+
+def offset_stack(node):
+    """Groups between a controller and its parent controller, nearest first."""
+    stack = []
+    current = (cmds.listRelatives(node, parent=True, fullPath=True) or [None])[0]
+    while current and not (cmds.objectType(current, isAType='transform') and _has_controller_shape(current)):
+        stack.append(_group_entry(current))
+        current = (cmds.listRelatives(current, parent=True, fullPath=True) or [None])[0]
+    return stack
+
+
 def _is_driven_space(node):
     """True when a constraint or matrix input replaces the node's space."""
     return _space_drivers(node) is not None
@@ -1532,6 +1604,33 @@ def _blendshape_records(only_registered=True):
     return records
 
 
+def _settings_controls(modules_config):
+    """Controllers that belong to no module but whose sliders drive exported
+    things (driven offset groups, blendshapes): Unreal must build them so
+    the sliders exist (Murakami's Head_Settings_Ctrl)."""
+    module_controls = set()
+    drivers = set()
+    for bone_records in collect_bone_controller_manifest(modules_config).values():
+        for record in bone_records:
+            module_controls.add(record.get('name'))
+            for group in record.get('offset_stack') or []:
+                for channel in (group.get('driven') or {}).values():
+                    drivers.add(channel['control'])
+    for entry in _blendshape_records():
+        if entry.get('driver'):
+            drivers.add(entry['driver']['control'])
+    exported = [j for j in _exported_joints()]
+    records = []
+    for name in sorted(drivers - module_controls):
+        node = (cmds.ls(name, long=True) or [None])[0]
+        if not node or not _has_controller_shape(node) or not exported:
+            continue
+        snapshot = _snapshot_for_chain(node, 'settings', '', exported)
+        if snapshot:
+            records.append(snapshot)
+    return records
+
+
 def _rest_pose_unreal():
     """{joint: {'t', 'q', 'bind_t', 'bind_q'}} for every exported joint
     (Unreal axes, cm): the frame as the scene stands and the frame the skin
@@ -1785,6 +1884,7 @@ def _query_transform_snapshot(node, role, module_name, driven_bone, anchor_bone,
     return dict(local_fields, **{
         'parent_space_blend': parent_space_blend,
         'parent_space_note': space_note,
+        'offset_stack': _safe_call(offset_stack, node),
         'name': _short_node_name(node),
         'dag_path': node,
         'node_type': cmds.nodeType(node),
@@ -3848,6 +3948,7 @@ def build_manifest(rig_name, modules_config):
         "units": {"linear": "cm", "angular": "deg"},
         "coordinate_system": _coordinate_system_manifest(),
         "rest_pose": _safe_call(_rest_pose_unreal),
+        "settings_controls": _safe_call(_settings_controls, modules_config),
         "blendshapes": _safe_call(_blendshape_records),
         "module_build_order": list(graph.get("build_order", [])),
         "module_graph": {
@@ -4102,6 +4203,16 @@ def _controller_summary(record):
         follows = 'under {}'.format(record['parent_controllers'][0])
     else:
         follows = 'world'
+    groups = []
+    for group in record.get('offset_stack') or []:
+        if group.get('kind') == 'driven' and group.get('driven'):
+            groups.append('{} driven ({})'.format(group['name'], ', '.join(
+                '{} <- {}.{} {}'.format(c, d['control'], d['attr'], describe_ops(d.get('ops')))
+                for c, d in group['driven'].items())))
+        else:
+            groups.append('{} ({})'.format(group.get('name'), group.get('kind')))
+    if groups:
+        follows += '; groups: ' + ' > '.join(groups)
     return {
         'name': record.get('ue_control_name') or record.get('name'),
         'role': record.get('role') or '',
@@ -4291,6 +4402,19 @@ def scene_analysis(rig_name, modules_config):
 
     # Controller sliders that move transforms through a node network.
     switches = {(sw['control'], sw['attribute']) for sw in export_test_poses.switches(manifest)}
+    # Sliders driving offset groups are transferred (driven groups), as are
+    # constraint (space) weights; only what drives nothing exported is flagged.
+    group_drivers = set()
+    for record in records + list(manifest.get('settings_controls') or []):
+        for group in record.get('offset_stack') or []:
+            for driver in (group.get('driven') or {}).values():
+                group_drivers.add((driver['control'], driver['attr']))
+            for problem in group.get('problems') or []:
+                check('orange', 'Offset group', '{} ({})'.format(group['name'], record.get('name')), problem)
+        for target in (record.get('parent_space_blend') or {}).get('targets') or []:
+            weight = target.get('weight') or {}
+            if 'attr' in weight:
+                group_drivers.add((weight['control'], weight['attr']))
     morph_drivers = {(e['driver']['control'], e['driver']['attr'])
                      for e in manifest.get('blendshapes') or [] if e.get('driver')}
     # Every controller in the scene, not only module ones: a settings control
@@ -4300,7 +4424,7 @@ def scene_analysis(rig_name, modules_config):
         name = _short_node_name(node)
         for attribute in _controller_attributes(node):
             attr = attribute.get('name')
-            if not attr or (name, attr) in switches or (name, attr) in morph_drivers:
+            if not attr or (name, attr) in switches or (name, attr) in morph_drivers or (name, attr) in group_drivers:
                 continue
             reached = _transforms_driven_by('{}.{}'.format(node, attr))
             if reached:

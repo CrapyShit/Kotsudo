@@ -37,6 +37,13 @@ class RigContext:
         self.maya_controls = {}
         # Maya controller short name -> UE control name chosen for it.
         self._maya_name_map = {}
+        # Settings controllers (sliders driving groups/blendshapes, in no
+        # module): built on first use. Set by the builder from the manifest.
+        self.settings_records = {}
+        self.settings_shapes = {}
+        self._settings_in_progress = set()
+        # Driven offset groups already built, per controller record.
+        self._driven_parents = {}
 
         # Follow spaces (see follow_space): bone -> null name, bones whose
         # update waits for their owning module, and bone -> owning module.
@@ -67,13 +74,65 @@ class RigContext:
             key = unreal.RigElementKey(type=unreal.RigElementType.CONTROL, name=str(name))
             if self.hierarchy.contains(key):
                 return key
+        if maya_name in self.settings_records and maya_name not in self._settings_in_progress:
+            return self.ensure_settings_control(maya_name)
         return None
+
+    def ensure_settings_control(self, maya_name):
+        """Build a settings controller (a control whose sliders drive offset
+        groups or blendshapes but which belongs to no module) the first time
+        something needs it. Returns its key, or None."""
+        from . import control_shapes, graph_utils
+
+        record = self.settings_records.get(maya_name)
+        if not record:
+            return None
+        self._settings_in_progress.add(maya_name)
+        try:
+            anchor = record.get("anchor_bone") or record.get("driven_bone")
+            placement = graph_utils.record_transform(self.hierarchy, record, anchor, label=maya_name)
+            parent = self.resolve_control_parent(record, self.world_key())
+            name = self.control_name(record, f"RB_{graph_utils.sanitize_name(maya_name)}")
+            color = graph_utils.record_color(record, unreal.LinearColor(1.0, 0.9, 0.2, 1.0))
+            shape_name, shape_rotation, shape_scale = control_shapes.resolve_control_shape(
+                self.rig, {"ShapeTable": self.settings_shapes}, record,
+                graph_utils.get_transform_rotation(placement), "Circle_Thick", (1.0, 1.0, 1.0),
+            )
+            location = graph_utils.transform_to_location(placement)
+            key = graph_utils.create_control(
+                self.hierarchy, self.hierarchy_controller, parent, name, location, color, shape_scale,
+                shape_name=shape_name, shape_rotation=shape_rotation, global_transform=placement,
+                locked_channels=record.get("locked_channels"),
+            )
+            graph_utils.attach_record_attributes(self.hierarchy, self.hierarchy_controller, key, record, name,
+                                                 location, color)
+            self.maya_controls[maya_name] = key
+            print(f"[RigBuilder] Settings controller '{maya_name}' built (its sliders drive "
+                  "offset groups or blendshapes).")
+            return key
+        except Exception as exc:
+            self._warn(f"Settings controller '{maya_name}' could not be built: {exc}")
+            return None
+        finally:
+            self._settings_in_progress.discard(maya_name)
 
     def world_key(self):
         from . import graph_utils
         return graph_utils.get_world_parent_key(self.hierarchy, self.hierarchy_controller)
 
     def resolve_control_parent(self, record, default_key):
+        """Parent for a controller's UE control (see _resolve_parent), with its
+        driven offset groups inserted in between (driven_groups)."""
+        parent = self._resolve_parent(record, default_key)
+        if not record or not any(g.get("kind") == "driven" for g in record.get("offset_stack") or []):
+            return parent
+        identity = record.get("dag_path") or record.get("name")
+        if identity not in self._driven_parents:
+            from . import driven_groups
+            self._driven_parents[identity] = driven_groups.insert_groups(self, record, parent)
+        return self._driven_parents[identity]
+
+    def _resolve_parent(self, record, default_key):
         """Parent for the UE control of a Maya controller record.
 
         1. The nearest Maya parent controller (through static groups) that

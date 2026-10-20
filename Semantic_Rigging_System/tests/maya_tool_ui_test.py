@@ -71,8 +71,8 @@ for _ in range(2):
 checks = [window._checks_tree.topLevelItem(i) for i in range(window._checks_tree.topLevelItemCount())]
 subjects = [c.text(1) for c in checks]
 print("UI checks:", window._checks_summary.text(), subjects[:5])
-assert "Head_Settings_Ctrl.Petal_Translate" in subjects and "Head_Settings_Ctrl.Petal_Rotation" in subjects
-assert window._tabs.tabText(2).startswith("Checks (")
+# The petal sliders drive offset groups, which are transferred now: not flagged.
+assert not any(s.startswith("Head_Settings_Ctrl.Petal") for s in subjects), subjects
 
 
 def module_row(name):
@@ -89,6 +89,12 @@ branch = next(spine.child(i) for i in range(spine.childCount()) if spine.child(i
 names = [branch.child(i).text(0) for i in range(branch.childCount())]
 print("UI Spine controllers:", branch.text(0), names)
 assert set(names) == {"Pelvis_IKctrl", "spine_ctrl_01", "chest_ctrl"}
+petal = module_row("  PetalPurple")
+petal_branch = next(petal.child(i) for i in range(petal.childCount())
+                    if petal.child(i).text(0).startswith("Controllers"))
+petal_details = petal_branch.child(0).text(2)
+print("UI petal controller:", petal_details)
+assert "pedal_NULLctrl_01 driven (translateY <- Head_Settings_Ctrl.Petal_Translate x 0.2" in petal_details
 
 # --- 2-5: Setup branch (IK/FK, spline, constraints, parent spaces) ----------
 def setup_rows(module):
