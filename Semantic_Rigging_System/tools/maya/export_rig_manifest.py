@@ -1604,6 +1604,116 @@ def _blendshape_records(only_registered=True):
     return records
 
 
+# ---------------------------------------------------------------------------
+# Materials
+#
+# Unreal's importer creates a material per Maya material, but its colour is
+# unreliable: a lambert's visible colour is color x diffuse (0.8 by default),
+# a standardSurface's is baseColor x base, and with colour management the
+# values are in Maya's rendering space (ACEScg by default in recent Maya),
+# not Unreal's linear sRGB. Each material is described here; the builder
+# makes a matching material instance and assigns it to the mesh slot of the
+# same name (rig_builder/materials.py).
+# ---------------------------------------------------------------------------
+
+_COLOR_ATTRIBUTES = (
+    # (shader types, colour attribute, weight attribute)
+    (('lambert', 'blinn', 'phong', 'phongE', 'anisotropic'), 'color', 'diffuse'),
+    (('standardSurface', 'aiStandardSurface', 'openPBRSurface'), 'baseColor', 'base'),
+    (('usdPreviewSurface',), 'diffuseColor', None),
+)
+
+
+# Colour-space conversions to Unreal's working space (linear Rec.709/sRGB
+# primaries). ACEScg (AP1) -> linear sRGB, Bradford-adapted D60 -> D65.
+_ACESCG_TO_LINEAR_SRGB = (
+    (1.70505, -0.62179, -0.08326),
+    (-0.13026, 1.14080, -0.01055),
+    (-0.02400, -0.12897, 1.15297),
+)
+_LINEAR_SRGB_NAMES = ('scene-linear rec.709-srgb', 'scene-linear rec 709/srgb', 'linear rec.709 (srgb)',
+                      'lin_rec709', 'linear srgb', 'utility - linear - srgb')
+
+
+def to_linear_srgb(color, space):
+    """(rgb in Unreal's linear sRGB, problem or None) from a Maya colour."""
+    name = str(space or '').strip().lower()
+    if name in ('acescg', 'aces - acescg', 'acescg (ap1)'):
+        rgb = [sum(row[i] * color[i] for i in range(3)) for row in _ACESCG_TO_LINEAR_SRGB]
+        return [round(max(0.0, c), 6) for c in rgb], None
+    if name in _LINEAR_SRGB_NAMES or 'rec.709' in name or 'rec 709' in name:
+        return [round(float(c), 6) for c in color], None
+    return [round(float(c), 6) for c in color], 'unknown rendering space "{}": colour copied as is'.format(space)
+
+
+def _color_space():
+    """Maya's rendering space when colour management is on, else linear sRGB."""
+    try:
+        if cmds.colorManagementPrefs(query=True, cmEnabled=True):
+            return str(cmds.colorManagementPrefs(query=True, renderingSpaceName=True) or 'scene-linear Rec.709-sRGB')
+    except Exception:
+        pass
+    return 'scene-linear Rec.709-sRGB'
+
+
+def material_records(meshes=None):
+    """[{name, type, color, weight, transparency, texture, color_space, meshes,
+    problems}] for every material assigned to an exported mesh."""
+    meshes = meshes if meshes is not None else collect_visible_mesh_transforms()
+    space = _color_space()
+    by_material = {}
+    for transform in meshes:
+        for shape in cmds.listRelatives(transform, shapes=True, fullPath=True, noIntermediate=True) or []:
+            for engine in set(cmds.listConnections(shape, type='shadingEngine') or []):
+                # Maya keeps an empty connection to a shading group whose faces
+                # were all reassigned: only real members count.
+                members = cmds.ls(cmds.sets(engine, query=True) or [], long=True, objectsOnly=True) or []
+                if shape not in members and transform not in members:
+                    continue
+                for material in cmds.listConnections(engine + '.surfaceShader', source=True, destination=False) or []:
+                    record = by_material.setdefault(material, {'name': _short_node_name(material).split(':')[-1],
+                                                               'meshes': []})
+                    mesh_name = _short_node_name(transform)
+                    if mesh_name not in record['meshes']:
+                        record['meshes'].append(mesh_name)
+    records = []
+    for material, record in sorted(by_material.items()):
+        kind = cmds.nodeType(material)
+        record.update({'type': kind, 'color_space': space, 'problems': []})
+        color_attr = weight_attr = None
+        for kinds, color_name, weight_name in _COLOR_ATTRIBUTES:
+            if kind in kinds:
+                color_attr, weight_attr = color_name, weight_name
+                break
+        if color_attr is None or not cmds.attributeQuery(color_attr, node=material, exists=True):
+            record['problems'].append('{} shader: no known colour attribute, Unreal keeps a grey material'.format(kind))
+            records.append(record)
+            continue
+        record['color'] = [round(float(c), 6) for c in cmds.getAttr('{}.{}'.format(material, color_attr))[0]]
+        record['weight'] = (round(float(cmds.getAttr('{}.{}'.format(material, weight_attr))), 6)
+                            if weight_attr and cmds.attributeQuery(weight_attr, node=material, exists=True) else 1.0)
+        effective = [c * record['weight'] for c in record['color']]
+        record['color_unreal'], problem = to_linear_srgb(effective, space)
+        if problem:
+            record['problems'].append(problem)
+        textures = cmds.listConnections('{}.{}'.format(material, color_attr), source=True, destination=False) or []
+        if textures:
+            record['texture'] = _short_node_name(textures[0])
+            path = None
+            if cmds.attributeQuery('fileTextureName', node=textures[0], exists=True):
+                path = cmds.getAttr(textures[0] + '.fileTextureName')
+            record['texture_path'] = path
+            record['problems'].append('colour comes from a texture ({}); only the flat colour is transferred yet'.format(
+                record['texture']))
+        if cmds.attributeQuery('transparency', node=material, exists=True):
+            transparency = cmds.getAttr(material + '.transparency')[0]
+            record['transparency'] = [round(float(c), 6) for c in transparency]
+            if any(c > 1e-3 for c in transparency):
+                record['problems'].append('transparency is not transferred yet (the material stays opaque)')
+        records.append(record)
+    return records
+
+
 def _settings_controls(modules_config):
     """Controllers that belong to no module but whose sliders drive exported
     things (driven offset groups, blendshapes): Unreal must build them so
@@ -2927,7 +3037,13 @@ def auto_discover_modules():
 # ---------------------------------------------------------------------------
 
 def collect_visible_mesh_transforms():
-    """Return transform nodes for every non-intermediate mesh in the scene."""
+    """Return transform nodes for every non-intermediate mesh in the scene.
+
+    Blendshape target meshes are kept on purpose: without them in the
+    export, the FBX keeps the blendshape but loses its target names
+    ('weight[0]' instead of 'Head_BS_Smile'), and Unreal names its morph
+    targets from those names (tests/maya_materials_test.py checks this).
+    """
     mesh_transforms = []
     # Full DAG paths throughout: short names are ambiguous when several nodes
     # share a name, and cmds.select() then fails with "More than one object
@@ -3949,6 +4065,7 @@ def build_manifest(rig_name, modules_config):
         "coordinate_system": _coordinate_system_manifest(),
         "rest_pose": _safe_call(_rest_pose_unreal),
         "settings_controls": _safe_call(_settings_controls, modules_config),
+        "materials": _safe_call(material_records),
         "blendshapes": _safe_call(_blendshape_records),
         "module_build_order": list(graph.get("build_order", [])),
         "module_graph": {
@@ -4431,6 +4548,16 @@ def scene_analysis(rig_name, modules_config):
                 check('orange', 'Not transferred', '{}.{}'.format(name, attr),
                       'moves {} transform(s) ({}{}) through a node network; not transferred to Unreal yet'
                       .format(len(reached), ', '.join(reached[:4]), ', ...' if len(reached) > 4 else ''))
+
+    # Materials.
+    materials = manifest.get('materials') or []
+    if materials:
+        check('gray', 'Materials', '{} material(s)'.format(len(materials)),
+              'transferred as flat colours ({}): {}'.format(
+                  materials[0].get('color_space', '?'), ', '.join(m['name'] for m in materials)))
+    for material in materials:
+        for problem in material.get('problems') or []:
+            check('orange', 'Materials', material['name'], problem)
 
     # Blendshapes.
     for item in blendshape_inventory():
