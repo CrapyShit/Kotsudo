@@ -1,3 +1,4 @@
+import math
 from typing import Any, cast
 
 try:
@@ -5,7 +6,7 @@ try:
 except ImportError:
     unreal = cast(Any, None)
 
-from . import control_shapes, graph_utils
+from . import blendshapes, control_shapes, graph_layout, graph_utils
 from .context import RigContext
 from .logger import RigLogger
 from . import manifest_schema
@@ -22,6 +23,23 @@ from .modules.ik_module import IKModule
 from .modules.ikfk_module import IKFKModule
 from .modules.rig_module import RigModule
 from .modules.spline_ik_module import SplineIKModule
+
+
+def _quat(values):
+    """[x, y, z, w] normalised (the export is rounded)."""
+    norm = math.sqrt(sum(float(c) * float(c) for c in values)) or 1.0
+    return [float(c) / norm for c in values]
+
+
+def _quat_mul(a, b):
+    """Hamilton product a x b ([x, y, z, w]): b applied first, then a."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return [aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz]
+
 
 MODULE_REGISTRY = {
     "FKChain": FKModule,
@@ -575,6 +593,8 @@ class RigBuilder:
         source_asset = self.load_source_asset()
         skeleton = self.resolve_skeleton(source_asset)
         skeletal_mesh = source_asset if isinstance(source_asset, unreal.SkeletalMesh) else None
+        # Where the imported FBX came from: the pose check finds its poses file there.
+        self.source_assets = [skeletal_mesh, skeleton]
 
         self.logger.log("[RigBuilder] Reading metadata")
         metadata = {}
@@ -646,6 +666,10 @@ class RigBuilder:
                 params = module_definition.get("params") or {}
                 shape_ids.update((params.get("shape_table") or {}).keys())
                 shapes_dir = shapes_dir or params.get("shapes_dir")
+            for record in (self.manifest or {}).get("settings_controls") or []:
+                if record.get("shape_id"):
+                    shape_ids.add(record["shape_id"])
+            shapes_dir = shapes_dir or (self.manifest or {}).get("shapes_dir")
             if shape_ids:
                 preview_mesh = None
                 try:
@@ -667,6 +691,14 @@ class RigBuilder:
                 f"[RigBuilder] Cleared previous build: {removed_elements} element(s), "
                 f"{removed_nodes} graph node(s)."
             )
+            self.apply_maya_rest_pose(context)
+            manifest = self.manifest or {}
+            context.settings_records = {r["name"]: r for r in manifest.get("settings_controls") or [] if r.get("name")}
+            context.settings_shapes = {
+                r["shape_id"]: (manifest.get("control_shapes") or {}).get(r["shape_id"])
+                for r in context.settings_records.values()
+                if r.get("shape_id") and (manifest.get("control_shapes") or {}).get(r["shape_id"])
+            }
             # Which module drives each bone: follow spaces emit their update
             # right after that module (RigContext.follow_space).
             context.bone_owner = {
@@ -682,8 +714,16 @@ class RigBuilder:
             )
         self.logger.push("[RigBuilder] Building modules")
         built_modules = []
+        # Graph nodes per module (what appeared while it was built, its
+        # follow-space updates included), for the layout at the end.
+        layout_groups = []
+        if context:
+            start = [n for n in (graph_utils.find_forwards_solve_node_name(context.model),
+                                 graph_utils.SOLVE_STAGE_NODE) if n]
+            layout_groups.append(("Start (Forwards Solve, solve order)", "Start", start))
         for module_definition in detected_modules:
             module_name = module_definition["module_name"]
+            nodes_before = set(graph_layout.node_names(context.model)) if context else set()
 
             # Cascading skip: if this module's declared parent already failed
             # or was skipped, don't build this module detached at world
@@ -723,15 +763,119 @@ class RigBuilder:
                 context.mark_failed(module_name)
             # Follow spaces waiting on this module's bones update now, after it.
             context.module_finished(module_name)
+            failed = " - FAILED" if context.is_failed(module_name) else ""
+            layout_groups.append((
+                f"{module_name}  ({module_definition['module_type']}){failed}",
+                module_definition["module_type"],
+                [n for n in graph_layout.node_names(context.model) if n not in nodes_before],
+            ))
 
         if context:
+            nodes_before = set(graph_layout.node_names(context.model))
             context.begin_stage("primary")
             context.flush_follow_spaces()
+            late = [n for n in graph_layout.node_names(context.model) if n not in nodes_before]
+            if late:
+                layout_groups.append(("Follow spaces (owner module missing)", "Shared", late))
+            # Morph targets driven by the Maya sliders (after every module, so
+            # their controls exist).
+            nodes_before = set(graph_layout.node_names(context.model))
+            blendshapes.build(context, (self.manifest or {}).get("blendshapes") or [], self.logger.log)
+            morph_nodes = [n for n in graph_layout.node_names(context.model) if n not in nodes_before]
+            if morph_nodes:
+                layout_groups.append(("Blendshapes (morph targets)", "Blendshapes", morph_nodes))
+            graph_layout.arrange(context.graph_controller, context.model, layout_groups, self.logger.log)
         self.logger.pop()
 
         if built_modules and self.rig:
             self.logger.log("[RigBuilder] Compiling rig")
             self.compile_rig()
+            if context and self.bake_rest_corrections(context):
+                self.compile_rig()
 
         return built_modules
+
+    # Bones whose bind pose differs less than this from Maya's rest are left
+    # alone (export rounding).
+    REST_POSE_TOLERANCE_CM = 0.002
+    REST_POSE_TOLERANCE_DEG = 0.01
+
+    def apply_maya_rest_pose(self, context):
+        """Start the rig from the pose Maya's rig rests in.
+
+        The imported skeleton is the skin's BIND pose; a rig can rest
+        elsewhere (Murakami's toes sit 1.01 cm above where they were bound).
+        Every module places its controls from the bones' initial transforms,
+        so those are set to the exported Maya rest first. Bones keep their
+        children's globals (each bone is set from the export).
+        """
+        rest = (self.manifest or {}).get("rest_pose") or {}
+        if not rest:
+            return
+        hierarchy = context.hierarchy
+        moved = []
+        for name, state in rest.items():
+            key = graph_utils.make_key(unreal.RigElementType.BONE, name)
+            if not hierarchy.contains(key) or not all(state.get(k) for k in ("t", "q", "bind_q")):
+                continue
+            current = hierarchy.get_global_transform(key, True)
+            # Rotation as a DELTA (rest x bind^-1, both converted the same
+            # way, as the pose check replays motion) applied on top of the
+            # imported bone rotation, so no absolute axis convention is
+            # assumed. Position: the exported rest point (validated mapping).
+            bind_x, bind_y, bind_z, bind_w = _quat(state["bind_q"])
+            delta = _quat(_quat_mul(_quat(state["q"]), [-bind_x, -bind_y, -bind_z, bind_w]))
+            q0 = graph_utils.get_transform_rotation(current)
+            rotated = _quat(_quat_mul(delta, [q0.x, q0.y, q0.z, q0.w]))
+            target = unreal.Transform(location=unreal.Vector(*[float(c) for c in state["t"]]))
+            target.rotation = unreal.Quat(*rotated)
+            target.scale3d = current.scale3d
+            distance = graph_utils.vector_length(graph_utils.vector_sub(
+                graph_utils.transform_to_location(target), graph_utils.transform_to_location(current)))
+            angle = math.degrees(2.0 * math.acos(min(1.0, abs(delta[3]))))
+            if distance <= self.REST_POSE_TOLERANCE_CM and angle <= self.REST_POSE_TOLERANCE_DEG:
+                continue
+            moved.append((name, distance, angle, target))
+        for name, _, _, target in moved:
+            key = graph_utils.make_key(unreal.RigElementType.BONE, name)
+            for initial in (True, False):
+                hierarchy.set_global_transform(key, target, initial, False)
+        if moved:
+            worst = max(moved, key=lambda item: item[1])
+            self.logger.log(
+                f"[RigBuilder] {len(moved)} bone(s) start from Maya's rest pose instead of the skin's bind "
+                f"pose (largest: '{worst[0]}' {worst[1]:.4f} cm / {worst[2]:.3f} deg)."
+            )
+
+    def bake_rest_corrections(self, context):
+        """Measure where the solved rig puts each rest-corrected bone at rest
+        and store the offset that brings it back onto the bind pose.
+        Returns True when pin defaults changed (the rig must recompile)."""
+        corrections = getattr(context, "rest_corrections", None) or []
+        if not corrections:
+            return False
+        try:
+            from . import pose_harness
+            instance = pose_harness.RigInstance(self.rig)
+            instance.reset()
+            for _ in range(3):
+                instance.run()
+        except Exception as exc:
+            self.logger.log(f"[RigBuilder] Rest correction skipped (rig could not be evaluated: {exc}).")
+            return False
+        worst = 0.0
+        for bone, node in corrections:
+            key = instance.key("BONE", bone)
+            if key is None:
+                continue
+            solved = instance.global_transform(key)
+            initial = instance.global_transform(key, True)
+            offset = unreal.MathLibrary.compose_transforms(initial, unreal.MathLibrary.invert_transform(solved))
+            worst = max(worst, graph_utils.vector_length(graph_utils.vector_sub(
+                graph_utils.transform_to_location(solved), graph_utils.transform_to_location(initial))))
+            graph_utils.set_pin_default(context.graph_controller, context.model, f"{node}.Local",
+                                        graph_utils.transform_pin_string(offset))
+        self.logger.log(f"[RigBuilder] Spline rest correction baked for {len(corrections)} bone(s) "
+                        f"(largest rest offset {worst:.4f} cm).")
+        return True
 

@@ -37,6 +37,13 @@ class RigContext:
         self.maya_controls = {}
         # Maya controller short name -> UE control name chosen for it.
         self._maya_name_map = {}
+        # Settings controllers (sliders driving groups/blendshapes, in no
+        # module): built on first use. Set by the builder from the manifest.
+        self.settings_records = {}
+        self.settings_shapes = {}
+        self._settings_in_progress = set()
+        # Driven offset groups already built, per controller record.
+        self._driven_parents = {}
 
         # Follow spaces (see follow_space): bone -> null name, bones whose
         # update waits for their owning module, and bone -> owning module.
@@ -67,13 +74,65 @@ class RigContext:
             key = unreal.RigElementKey(type=unreal.RigElementType.CONTROL, name=str(name))
             if self.hierarchy.contains(key):
                 return key
+        if maya_name in self.settings_records and maya_name not in self._settings_in_progress:
+            return self.ensure_settings_control(maya_name)
         return None
+
+    def ensure_settings_control(self, maya_name):
+        """Build a settings controller (a control whose sliders drive offset
+        groups or blendshapes but which belongs to no module) the first time
+        something needs it. Returns its key, or None."""
+        from . import control_shapes, graph_utils
+
+        record = self.settings_records.get(maya_name)
+        if not record:
+            return None
+        self._settings_in_progress.add(maya_name)
+        try:
+            anchor = record.get("anchor_bone") or record.get("driven_bone")
+            placement = graph_utils.record_transform(self.hierarchy, record, anchor, label=maya_name)
+            parent = self.resolve_control_parent(record, self.world_key())
+            name = self.control_name(record, f"RB_{graph_utils.sanitize_name(maya_name)}")
+            color = graph_utils.record_color(record, unreal.LinearColor(1.0, 0.9, 0.2, 1.0))
+            shape_name, shape_rotation, shape_scale = control_shapes.resolve_control_shape(
+                self.rig, {"ShapeTable": self.settings_shapes}, record,
+                graph_utils.get_transform_rotation(placement), "Circle_Thick", (1.0, 1.0, 1.0),
+            )
+            location = graph_utils.transform_to_location(placement)
+            key = graph_utils.create_control(
+                self.hierarchy, self.hierarchy_controller, parent, name, location, color, shape_scale,
+                shape_name=shape_name, shape_rotation=shape_rotation, global_transform=placement,
+                locked_channels=record.get("locked_channels"),
+            )
+            graph_utils.attach_record_attributes(self.hierarchy, self.hierarchy_controller, key, record, name,
+                                                 location, color)
+            self.maya_controls[maya_name] = key
+            print(f"[RigBuilder] Settings controller '{maya_name}' built (its sliders drive "
+                  "offset groups or blendshapes).")
+            return key
+        except Exception as exc:
+            self._warn(f"Settings controller '{maya_name}' could not be built: {exc}")
+            return None
+        finally:
+            self._settings_in_progress.discard(maya_name)
 
     def world_key(self):
         from . import graph_utils
         return graph_utils.get_world_parent_key(self.hierarchy, self.hierarchy_controller)
 
     def resolve_control_parent(self, record, default_key):
+        """Parent for a controller's UE control (see _resolve_parent), with its
+        driven offset groups inserted in between (driven_groups)."""
+        parent = self._resolve_parent(record, default_key)
+        if not record or not any(g.get("kind") == "driven" for g in record.get("offset_stack") or []):
+            return parent
+        identity = record.get("dag_path") or record.get("name")
+        if identity not in self._driven_parents:
+            from . import driven_groups
+            self._driven_parents[identity] = driven_groups.insert_groups(self, record, parent)
+        return self._driven_parents[identity]
+
+    def _resolve_parent(self, record, default_key):
         """Parent for the UE control of a Maya controller record.
 
         1. The nearest Maya parent controller (through static groups) that
@@ -90,6 +149,11 @@ class RigContext:
             return default_key
         for name in record.get("parent_controllers") or []:
             key = self.control_key_for_maya(name)
+            if key is not None:
+                return key
+        blend = record.get("parent_space_blend")
+        if blend:
+            key = self.blended_space(record, blend)
             if key is not None:
                 return key
         space_bone = self._acyclic_space_bone(record, record.get("parent_space_bone"))
@@ -150,6 +214,170 @@ class RigContext:
             current, depth = self._bone_parent(current), depth + 1
         return space_bone
 
+    # Constraint per space kind. Per-space nulls carry Maya's per-target
+    # offsets, so the plain units are used without maintain offset; without
+    # them (older exports) the maintain-offset variants keep the rest pose.
+    _SPACE_UNITS = {
+        "parent": ("RigUnit_ParentConstraint",),
+        "orient": ("RigUnit_RotationConstraint", "RigUnit_RotationConstraintLocalSpaceOffset"),
+        "point": ("RigUnit_PositionConstraint", "RigUnit_PositionConstraintLocalSpaceOffset"),
+    }
+
+    def _space_target_key(self, target):
+        """Element a space target follows: its controller, a follow space on its
+        bone, or None for the world (the per-space null then stays put)."""
+        if target.get("world"):
+            return "world"
+        if target.get("bone"):
+            return self.follow_space(str(target["bone"]))
+        return self.control_key_for_maya(target.get("controller"))
+
+    def blended_space(self, record, blend):
+        """A null driven like the Maya group that replaces a controller's
+        space: one null per space (target) where Maya puts the controller
+        with that space alone, and a Parent / Rotation / Position constraint
+        (Maya's parent / orient / point) whose weights come from the
+        controller channels through the exported maths (an enum space switch,
+        a reversed IK/FK blend...). Returns its key, or None when it cannot be
+        built -- the reason is logged and the caller falls back."""
+        from . import constraints, driver_ops, graph_utils
+
+        name = str(record.get("name") or "space")
+
+        def fallback(reason):
+            self._warn(f"Space of '{name}' not rebuilt as in Maya ({reason}); falling back to the bone it follows.")
+            return None
+
+        kind = blend.get("kind", "parent")
+        parents = []
+        for target in blend.get("targets") or []:
+            key = self._space_target_key(target)
+            weight = target.get("weight") or {"value": 1.0}
+            if key is None:
+                return fallback(f"target '{target.get('controller') or target.get('bone') or target.get('node')}'"
+                                " is not in the rig")
+            # Every weight source must already exist (a switch weighting its
+            # own parent group cannot: the control is being created now).
+            if "attr" in weight and self.control_key_for_maya(weight.get("control")) is None:
+                return fallback(f"its weight is driven by '{weight.get('control')}', which is not built yet")
+            parents.append((key, weight))
+        unit = None
+        for unit_name in self._SPACE_UNITS.get(kind, ()):
+            unit = getattr(unreal, unit_name, None)
+            if unit is not None:
+                break
+        if not parents or unit is None:
+            return fallback(f"no Control Rig constraint for a '{kind}' space")
+
+        label = graph_utils.sanitize_name(name)
+        anchor = record.get("anchor_bone") or record.get("driven_bone")
+        placement = graph_utils.record_transform(self.hierarchy, record, anchor, label=label)
+        # A parent space replaces the whole transform; an orient/point space
+        # only half of it, the other half still follows the Maya parent.
+        holder = self.world_key()
+        if kind != "parent":
+            for parent_name in record.get("parent_controllers") or []:
+                key = self.control_key_for_maya(parent_name)
+                if key is not None:
+                    holder = key
+                    break
+        null = graph_utils.create_follow_null(
+            self.hierarchy, self.hierarchy_controller, f"RB_{label}_Space", placement, holder
+        )
+        if not null:
+            return fallback("its space null could not be created")
+
+        items = self._solo_target_nulls(blend, parents, placement, label)
+        x = self.claim_module_column(width=900)
+        node = f"RB_{label}_SpaceBlend"
+        graph_utils.create_unit_node(self.graph_controller, self.model, node, unit, unreal.Vector2D(x + 500, -700))
+        graph_utils.set_key_pin(self.graph_controller, self.model, node, ["Child"], "Null", null)
+        graph_utils.set_any_pin(self.graph_controller, self.model, node, ["bMaintainOffset", "MaintainOffset"],
+                                "False" if items else "True")
+        graph_utils.set_any_pin(self.graph_controller, self.model, node, ["Weight"], "1.0")
+        for index, (key, weight) in enumerate(parents):
+            if not constraints._insert_array_element(self.graph_controller, self.model, f"{node}.Parents"):
+                return fallback("the constraint's Parents pin is not available")
+            base = f"{node}.Parents.{index}"
+            if items:
+                item_type, item_name = items[index]
+            elif key == "world":
+                return fallback("a world-space target needs the per-space poses (re-export from Maya)")
+            else:
+                item_type = {unreal.RigElementType.NULL: "Null", unreal.RigElementType.BONE: "Bone"}.get(
+                    key.type, "Control")
+                item_name = str(key.name)
+            graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Item.Type"], item_type)
+            graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Item.Name"], item_name)
+            try:
+                pin = driver_ops.driver_pin(self, f"{node}_W{index}", weight)
+            except Exception as exc:
+                return fallback(f"weight {index}: {exc}")
+            if pin:
+                graph_utils.connect_pins(self.graph_controller, self.model, pin, f"{base}.Weight")
+            else:
+                graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Weight"],
+                                        str(float(weight.get("value", 1.0))))
+        tail = self.get_exec_tail() or graph_utils.find_forwards_solve_node_name(self.model)
+        graph_utils.connect_exec(self.graph_controller, self.model, tail, node)
+        self.set_exec_tail(node)
+        names = [t.get("controller") or t.get("bone") or "world" for t in blend.get("targets") or []]
+        switch = blend.get("switch") or {}
+        if switch.get("labels"):
+            spaces = ", ".join(f"{label_}={names[i]}" for i, label_ in enumerate(switch["labels"])
+                               if i < len(names))
+            print(f"[RigBuilder] Controller '{name}': {kind} space switch on "
+                  f"{switch['control']}.{switch['attr']} ({spaces}).")
+        else:
+            print(f"[RigBuilder] Controller '{name}': {kind} space blended between {', '.join(names)}.")
+        return unreal.RigElementKey(type=unreal.RigElementType.NULL, name=str(null))
+
+    def _solo_target_nulls(self, blend, parents, placement, label):
+        """[(type, name)] per target, or None when the export has no solo poses.
+
+        null_i = space_rest * ctrl_rest^-1 * ctrl_i: the space moved by the
+        controller's Maya motion from rest to "target i alone". The null of a
+        world-space target stays at the world (no parent).
+        """
+        from . import graph_utils
+
+        targets = blend.get("targets") or []
+        rest = blend.get("rest")
+        if not rest or len(targets) != len(parents) or not all(t.get("solo") for t in targets):
+            return None
+
+        def pose(data):
+            rotation = graph_utils.record_rotation({"world_axes_unreal": data.get("axes")})
+            if rotation is None or not data.get("position"):
+                return None
+            result = unreal.Transform(location=unreal.Vector(*[float(c) for c in data["position"]]))
+            result.rotation = rotation
+            return result
+
+        ctrl_rest = pose(rest)
+        if ctrl_rest is None:
+            return None
+        to_space = unreal.MathLibrary.compose_transforms(placement, unreal.MathLibrary.invert_transform(ctrl_rest))
+        items = []
+        for index, (target, (key, _)) in enumerate(zip(targets, parents)):
+            ctrl_solo = pose(target["solo"])
+            if ctrl_solo is None:
+                return None
+            name = graph_utils.create_follow_null(
+                self.hierarchy, self.hierarchy_controller, f"RB_{label}_Space_T{index}",
+                unreal.MathLibrary.compose_transforms(to_space, ctrl_solo), None if key == "world" else key,
+            )
+            if not name:
+                return None
+            items.append(("Null", str(name)))
+            shift = graph_utils.vector_length(graph_utils.vector_sub(
+                graph_utils.transform_to_location(ctrl_solo), graph_utils.transform_to_location(ctrl_rest)))
+            if shift > 0.01:
+                who = "the world" if key == "world" else f"'{key.name}'"
+                print(f"[RigBuilder] Controller '{label}': with only {who} driving it, Maya moves "
+                      f"it {shift:.3f} cm from rest (per-target offset kept).")
+        return items
+
     def follow_space(self, bone):
         """A null that tracks ``bone``'s FINAL transform every evaluation.
 
@@ -174,6 +402,9 @@ class RigContext:
                 return None
             self._follow_spaces[bone] = name
             owner = self.bone_owner.get(bone)
+            if not owner and self.bone_owner:
+                self._warn(f"Follow space on '{bone}', which no module drives: controls under it "
+                           "will not move (re-export: the exporter now prefers module joints).")
             if owner and owner not in self._finished_modules:
                 self._pending_follow.setdefault(owner, []).append(bone)
             else:

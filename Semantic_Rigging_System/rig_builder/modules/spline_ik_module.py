@@ -5,7 +5,7 @@ try:
 except ImportError:
     unreal = cast(Any, None)
 
-from .. import graph_utils
+from .. import constraints, graph_utils
 from .rig_module import RigModule
 
 # ---------------------------------------------------------------------------
@@ -374,7 +374,7 @@ class SplineIKModule(RigModule):
         back to distributed-FK automatically).
     ControlScale : float  (default 1.0)
         Uniform scale multiplier for all control shapes.
-    StretchEnabled : bool  (default True)
+    StretchEnabled : bool  (default False -- Maya's spline IK keeps joint lengths)
         Whether the chain should stretch/compress to fully reach the
         spline's length (Alignment = Stretched) or hold bone lengths fixed
         and only bend (Alignment = Front).
@@ -473,7 +473,9 @@ class SplineIKModule(RigModule):
         control_scale = graph_utils.compute_chain_scale(
             hierarchy, self.chain, fraction=0.35, multiplier=scale_multiplier
         )
-        stretch_enabled = bool(recipe_data.get("StretchEnabled", True))
+        # Maya spline IK keeps joint lengths unless a stretch network exists
+        # (exported as stretch_enabled); default to Maya's behaviour.
+        stretch_enabled = graph_utils.recipe_bool(recipe_data.get("StretchEnabled"), False)
         # The axis of each bone that runs along the chain is read from the
         # imported skeleton. A hard-coded "X" twists every bone 90 degrees when
         # the joints actually run along Y/Z (a Maya Y-up spine with no joint
@@ -784,6 +786,19 @@ class SplineIKModule(RigModule):
                         "build -- squash skipped, stretch still applied."
                     )
 
+            # Rest correction: Fit Chain does not land exactly on the bind
+            # pose (a few hundredths of a cm), and every limb riding on the
+            # spine inherits it -- a straight leg then has slack and its knee
+            # never bends where Maya's does. Each bone is re-applied with a
+            # local offset the builder measures at rest after compiling
+            # (identity until then).
+            correction_nodes, last_exec = self._build_rest_correction(
+                controller, model, module_prefix, x_origin, self.context.get_exec_tail())
+            if correction_nodes:
+                all_nodes.extend(correction_nodes)
+                self.context.set_exec_tail(last_exec)
+                primary_node = last_exec
+
         if not native_built:
             # ----- Fallback: distributed-FK (native spline units unavailable,
             #       or NumControls < 4, which Control Rig's own spline
@@ -801,6 +816,20 @@ class SplineIKModule(RigModule):
             )
             self.context.set_exec_tail(last_exec)
             primary_node = last_exec
+
+        # Maya constraints layered on the chain (a top joint orient-constrained
+        # to the chest control...) run after the spline fit, as in Maya.
+        records = constraints.constraint_records(recipe_data)
+        if records:
+            builder = constraints.ConstraintBuilder(
+                self, recipe_data, parent_key, module_prefix,
+                float(recipe_data.get("ControlScale") or 1.0),
+            )
+            self.context.set_exec_tail(builder.build(records, forwards_solve, x_origin + 2400))
+            all_nodes.extend(builder.nodes)
+            if self.logger:
+                self.logger.log(f"[SplineIKModule] {self.name}: {len(records)} extra constraint(s) "
+                                f"on the chain ({', '.join(r['bone'] for r in records)}).")
 
         if self.logger:
             self.logger.pop()
@@ -831,6 +860,53 @@ class SplineIKModule(RigModule):
     # ------------------------------------------------------------------
     # Squash / stretch volume preservation
     # ------------------------------------------------------------------
+
+    def _build_rest_correction(self, controller, model, prefix, x_origin, exec_tail):
+        """Per bone: Global = RestOffset x (solved Global), RestOffset baked later.
+
+        Returns (node names, last exec node). Registers (bone, MakeAbsolute
+        node) on the context for the builder's rest bake.
+        """
+        absolute = None
+        for name in ("RigVMFunction_MathTransformMakeAbsolute", "RigUnit_MathTransformMakeAbsolute"):
+            absolute = getattr(unreal, name, None)
+            if absolute is not None:
+                break
+        if absolute is None or exec_tail is None:
+            return [], exec_tail
+        nodes = []
+        registry = getattr(self.context, "rest_corrections", None)
+        if registry is None:
+            registry = self.context.rest_corrections = []
+        for index, bone in enumerate(self.chain):
+            y = 900 + index * 220
+            get_node, abs_node, set_node = (f"{prefix}_RestFix{index}_Get", f"{prefix}_RestFix{index}_Offset",
+                                            f"{prefix}_RestFix{index}_Set")
+            graph_utils.create_unit_node(controller, model, get_node, unreal.RigUnit_GetTransform,
+                                         unreal.Vector2D(x_origin + 1400, y))
+            graph_utils.set_key_pin(controller, model, get_node, ["Item"], "Bone", bone)
+            graph_utils.set_any_pin(controller, model, get_node, ["Space"], "GlobalSpace")
+            graph_utils.set_any_pin(controller, model, get_node, ["bInitial", "Initial"], "False")
+            graph_utils.create_unit_node(controller, model, abs_node, absolute, unreal.Vector2D(x_origin + 1650, y))
+            graph_utils.create_unit_node(controller, model, set_node, unreal.RigUnit_SetTransform,
+                                         unreal.Vector2D(x_origin + 1900, y))
+            graph_utils.set_key_pin(controller, model, set_node, ["Item"], "Bone", bone)
+            graph_utils.set_any_pin(controller, model, set_node, ["Space"], "GlobalSpace")
+            graph_utils.set_any_pin(controller, model, set_node, ["bInitial", "Initial"], "False")
+            graph_utils.set_any_pin(controller, model, set_node, ["Weight"], "1.0")
+            # Children keep their global transforms: the next bone is read
+            # as Fit Chain left it.
+            graph_utils.set_any_pin(controller, model, set_node, ["bPropagateToChildren", "PropagateToChildren"],
+                                    "False")
+            if not (graph_utils.connect_pins(controller, model, f"{get_node}.Transform", f"{abs_node}.Parent")
+                    and graph_utils.connect_pins(controller, model, f"{abs_node}.Global", f"{set_node}.Value")):
+                unreal.log_warning(f"[SplineIKModule] {self.name}: rest correction could not be wired; skipped.")
+                return nodes, exec_tail
+            graph_utils.connect_exec(controller, model, exec_tail, set_node)
+            exec_tail = set_node
+            nodes.extend([get_node, abs_node, set_node])
+            registry.append((bone, abs_node))
+        return nodes, exec_tail
 
     def _build_squash_factor_network(
         self, controller, model, module_prefix, spline_points_node,
@@ -1033,10 +1109,21 @@ class SplineIKModule(RigModule):
         positions = []
         for record in records:
             anchor = record.get("anchor_bone") or record.get("driven_bone") or self.chain[0]
-            position = graph_utils.controller_origin_position(
-                hierarchy, record, anchor, min_offset=0.0,
-                label=record.get("ue_control_name") or record.get("name"),
-            )
+            label = record.get("ue_control_name") or record.get("name")
+            # The control stands for the animator controller (chest_ctrl), so
+            # it sits at that controller's origin when exported; the record
+            # itself is the influence joint under it, whose position only
+            # matters for the curve points (placed from the CVs).
+            position = None
+            origin = record.get("ue_control_origin")
+            if isinstance(origin, dict):
+                position = graph_utils.controller_origin_position(
+                    hierarchy, origin, origin.get("anchor_bone") or anchor, min_offset=0.0, label=label,
+                )
+            if position is None:
+                position = graph_utils.controller_origin_position(
+                    hierarchy, record, anchor, min_offset=0.0, label=label,
+                )
             if position is None:
                 graph_utils._log_warning(
                     f"Spline '{self.name}': could not place Maya controller "
@@ -1064,11 +1151,11 @@ class SplineIKModule(RigModule):
         return {"records": records, "positions": positions, "cvs": cvs}
 
     @staticmethod
-    def _influences_of(cv, limit=2, minimum=0.01):
+    def _influences_of(cv, limit=None, minimum=0.01):
         """Indices of the controls influencing a CV, strongest first."""
         weights = cv.get("weights") or []
         order = sorted(range(len(weights)), key=lambda j: -float(weights[j]))
-        chosen = [j for j in order[:limit] if float(weights[j]) >= minimum]
+        chosen = [j for j in (order[:limit] if limit else order) if float(weights[j]) >= minimum]
         return chosen or order[:1]
 
     def _create_cv_drivers(self, hierarchy, hierarchy_controller, module_prefix, plan, control_keys):
@@ -1093,8 +1180,12 @@ class SplineIKModule(RigModule):
     def _build_cv_sources(self, controller, model, module_prefix, plan, drivers, x_origin, all_nodes):
         """Graph pins giving each spline point (one per Maya CV).
 
-        A CV influenced by two controls is a vector lerp between the two
-        driver nulls, weighted by the Maya skin weights.
+        A CV is the Maya skin-weighted average of its driver nulls (one per
+        influencing control, riding on it -- so control rotation counts too).
+        Any number of influences, as a chain of lerps: after adding influence
+        i the running result has weight W_i, and the lerp towards p_i uses
+        w_i / W_i -- exactly the weighted average. Dropping the weakest
+        influence (an earlier two-control limit) bent the curve unlike Maya's.
         """
         lerp_unit = None
         for candidate in ("RigUnit_MathVectorLerp", "RigUnit_MathVectorInterpolate", "RigUnit_MathVectorMix"):
@@ -1120,21 +1211,26 @@ class SplineIKModule(RigModule):
                 sources.append(pins[0][0])
                 continue
 
-            lerp_node = f"{module_prefix}_CV{cv_index:02d}_Lerp"
-            graph_utils.create_unit_node(
-                controller, model, lerp_node, lerp_unit,
-                unreal.Vector2D(x_origin - 100, 60 + cv_index * 200),
-            )
-            graph_utils.connect_pins(controller, model, pins[0][0], f"{lerp_node}.A")
-            graph_utils.connect_pins(controller, model, pins[1][0], f"{lerp_node}.B")
-            total = pins[0][1] + pins[1][1]
-            graph_utils.set_any_pin(
-                controller, model, lerp_node, ["T", "Alpha", "Ratio", "W"],
-                str(round(pins[1][1] / total, 6) if total > 1e-9 else 0.0),
-            )
-            all_nodes.append(lerp_node)
-            result = _find_pin_among(model, lerp_node, ["Result", "Value", "ReturnValue"])
-            sources.append(f"{lerp_node}.{result}" if result else pins[0][0])
+            running_pin, running_weight = pins[0]
+            for step, (pin, weight) in enumerate(pins[1:], start=1):
+                lerp_node = f"{module_prefix}_CV{cv_index:02d}_Lerp" + (f"{step}" if step > 1 else "")
+                graph_utils.create_unit_node(
+                    controller, model, lerp_node, lerp_unit,
+                    unreal.Vector2D(x_origin - 100 + (step - 1) * 220, 60 + cv_index * 200),
+                )
+                graph_utils.connect_pins(controller, model, running_pin, f"{lerp_node}.A")
+                graph_utils.connect_pins(controller, model, pin, f"{lerp_node}.B")
+                running_weight += weight
+                graph_utils.set_any_pin(
+                    controller, model, lerp_node, ["T", "Alpha", "Ratio", "W"],
+                    str(round(weight / running_weight, 6) if running_weight > 1e-9 else 0.0),
+                )
+                all_nodes.append(lerp_node)
+                result = _find_pin_among(model, lerp_node, ["Result", "Value", "ReturnValue"])
+                if not result:
+                    break
+                running_pin = f"{lerp_node}.{result}"
+            sources.append(running_pin)
         return sources
 
     def read_recipe(self):
@@ -1145,15 +1241,17 @@ class SplineIKModule(RigModule):
             "ChainAxes": None,
             "NumControls": 4,
             "ControlScale": 1.0,
-            "StretchEnabled": True,
+            "StretchEnabled": False,
             "PrimaryAxis": None,
             "UsePoleVector": False,
             "SecondaryAxis": "Y",
             "SamplingPrecision": 16,
             "SquashEnabled": False,
             "SquashAmount": 1.0,
+            "Constraints": None,
         }
         fallback_names = {
+            "Constraints": ["constraints"],
             "ModuleType": ["module_type"],
             "SplineData": ["spline", "spline_data", "splinedata"],
             "ChainAxes": ["chain_axes"],

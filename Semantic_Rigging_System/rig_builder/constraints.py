@@ -164,8 +164,9 @@ class ConstraintBuilder:
     def control_for(self, record):
         """UE control for a Maya controller record (created once)."""
         maya_name = record.get("name")
-        existing = self.context.maya_controls.get(maya_name)
-        if existing is not None and self.hierarchy.contains(existing):
+        existing = self.context.control_key_for_maya(maya_name) or self.context.control_key_for_maya(
+            record.get("ue_control_name") or record.get("shape_source"))
+        if existing is not None:
             return existing
 
         if "parent_controllers" in record:

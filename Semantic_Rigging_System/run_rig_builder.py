@@ -85,6 +85,8 @@ SOURCE_ASSET_PATH = None  # None = auto-derive skeleton from the open Control Ri
                           # Set to a path string to override, e.g.:
                           # "/Game/.../MyCharacter_Skeleton.MyCharacter_Skeleton"
 CONTROL_RIG_PATH = None
+RUN_POSE_CHECK = True     # False = build only (skip the Maya pose comparison)
+APPLY_MATERIALS = True    # Colour the skeletal mesh with the Maya materials (flat colours)
 RECIPE_ASSET_PATHS = {
     "IKLimb": "/Game/KotsudoProject/Python_Tests/MetadataTags_Tests/20260309/DA_IKLimb.DA_IKLimb",
 }
@@ -115,7 +117,17 @@ def main():
     )
 
     built_modules = builder.run()
-    print("Built modules:", built_modules)
+    print("Built modules:", [m.get("module_name") for m in built_modules or [] if isinstance(m, dict)])
+
+    if APPLY_MATERIALS:
+        from rig_builder import materials
+        materials.apply_after_build(getattr(builder, "source_assets", []), builder.manifest)
+
+    # Pose check: replay the Maya test poses on the fresh rig and report how
+    # far each joint lands from Maya (log summary + JSON/HTML next to the FBX).
+    if RUN_POSE_CHECK:
+        from rig_builder import pose_harness
+        pose_harness.run_after_build(rig, getattr(builder, "source_assets", []), builder.manifest)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,16 @@ except ImportError:
 from . import control_shapes, graph_utils
 
 TIERS = (("T0", 0.01, 0.01), ("T1", 0.1, 0.5))
+# Blendshape weight difference (weights are 0..1 for a full shape).
+MORPH_TOLERANCE = 0.001
 CALIBRATION_TOLERANCE_CM = 0.1
+# Uncertainty of a limb's slack (A + B - reach) from the poses file itself:
+# positions are written to 1e-4 cm, and the slack combines three rounded
+# lengths. On a nearly straight limb the middle joint's offset from the
+# root-tip line is ~sqrt(2 k slack), so this alone leaves a straight 7 m arm's
+# elbow undetermined by ~0.4 cm.
+SLACK_ROUNDING_CM = 5e-4
+LIMB_MODULE_TYPES = ("IKFKSwitch", "IKLimb")
 
 
 def _log(message):
@@ -77,8 +86,56 @@ def _q_inv(q):
 
 
 def _q_angle(a, b):
-    dot = abs(sum(x * y for x, y in zip(a, b)))
-    return math.degrees(2.0 * math.acos(max(-1.0, min(1.0, dot))))
+    # Normalised, then atan2 instead of acos(dot): the poses file stores
+    # rounded quaternions (|q| off by ~3e-7), and acos near 1 turns that
+    # rounding into a fake ~0.1 deg error.
+    a = _q_unit(a)
+    b = _q_unit(b)
+    d = _q_mul(_q_inv(a), b)
+    return math.degrees(2.0 * math.atan2(math.sqrt(d[0] ** 2 + d[1] ** 2 + d[2] ** 2), abs(d[3])))
+
+
+def _q_unit(q):
+    n = math.sqrt(sum(c * c for c in q)) or 1.0
+    return tuple(c / n for c in q)
+
+
+def _triangle_height(a, b, reach):
+    """Distance of the middle joint from the root-tip line for bone lengths
+    a, b and a root-tip distance ``reach`` (0 when the limb is straight)."""
+    if reach <= 1e-9 or reach >= a + b:
+        return 0.0
+    if reach <= abs(a - b):
+        return min(a, b)
+    half = (a + b + reach) / 2.0
+    area2 = max(0.0, half * (half - a) * (half - b) * (half - reach))
+    return 2.0 * math.sqrt(area2) / reach
+
+
+def _line_distance(point, start, end):
+    axis = [end[i] - start[i] for i in range(3)]
+    length = math.sqrt(sum(c * c for c in axis))
+    rel = [point[i] - start[i] for i in range(3)]
+    if length < 1e-9:
+        return math.sqrt(sum(c * c for c in rel))
+    t = sum(rel[i] * axis[i] for i in range(3)) / (length * length)
+    return _distance(point, [start[i] + axis[i] * t for i in range(3)])
+
+
+def _bend_explained(a, b, reach_ue, reach_maya, h_maya):
+    """How far the middle joint may differ between Unreal and Maya purely
+    because the two reaches differ (and the export rounding).
+
+    Range of possible bend heights on each side -- Unreal from its measured
+    reach, Maya from its reach and its measured height -- and the largest gap
+    between them. Near straight this is large (the bend is extremely
+    sensitive to the reach); on a bent limb it shrinks to almost nothing, so
+    real errors are still scored.
+    """
+    eps = SLACK_ROUNDING_CM
+    ue = [_triangle_height(a, b, reach_ue - eps), _triangle_height(a, b, reach_ue + eps)]
+    maya = [_triangle_height(a, b, reach_maya - eps), _triangle_height(a, b, reach_maya + eps), h_maya]
+    return max(abs(max(ue) - min(maya)), abs(max(maya) - min(ue)))
 
 
 def _distance(a, b):
@@ -97,13 +154,37 @@ def _stats(values):
 # Rig instance
 # ---------------------------------------------------------------------------
 
+def _make_rig_instance(rig_blueprint):
+    """A Control Rig object to drive: a fresh instance when the API offers
+    one, else the editor's preview/debug instance (reset before every pose,
+    so replaying on it is equally valid)."""
+    tried = []
+    for getter in ("create_control_rig", "get_preview_instance", "get_debugged_control_rig",
+                   "get_object_being_debugged"):
+        method = getattr(rig_blueprint, getter, None)
+        if method is None:
+            continue
+        tried.append(getter)
+        try:
+            rig = method()
+        except Exception as exc:
+            _warn(f"{getter}() failed: {exc}")
+            continue
+        if rig is not None and hasattr(rig, "get_hierarchy"):
+            if getter != "create_control_rig":
+                _log(f"Using the editor's rig instance ({getter}).")
+            return rig
+    raise RuntimeError(
+        "Could not get a Control Rig instance from the blueprint (tried: "
+        f"{', '.join(tried) or 'nothing available'}). Compile the rig and keep it open."
+    )
+
+
 class RigInstance:
     """A runtime instance of a Control Rig blueprint driven from Python."""
 
     def __init__(self, rig_blueprint):
-        self.rig = rig_blueprint.create_control_rig()
-        if self.rig is None:
-            raise RuntimeError("ControlRigBlueprint.create_control_rig() returned None.")
+        self.rig = _make_rig_instance(rig_blueprint)
         self.rig.request_init()
         events = [str(e) for e in (self.rig.get_supported_events() or [])]
         self.forward = next((e for e in events if "forward" in e.lower()), None) or (
@@ -155,6 +236,12 @@ class RigInstance:
             if str(child.name).startswith(attribute):
                 return child
         return None
+
+    def curve_value(self, key):
+        try:
+            return float(self.hierarchy.get_curve_value(key))
+        except Exception:
+            return float("nan")
 
     def set_float(self, key, value):
         self.hierarchy.set_control_value(
@@ -215,16 +302,26 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
             module_of[bone] = module.get("module_name")
 
     # -- rest state in Unreal ------------------------------------------------
+    # Solved as many times as every pose is (3), so constraints and follow
+    # spaces that settle on their first evaluation do not make the rest
+    # reference differ from the poses by a constant.
     instance.reset()
-    instance.run()
+    for _ in range(3):
+        instance.run()
     joint_keys, ue_rest = {}, {}
+    # Only joints a module rebuilds are scored. Helper chains Maya exports
+    # but the Unreal rig does not drive (e.g. separate FK/IK joint chains
+    # behind a blended limb) would only add fake errors; they are listed.
+    not_rebuilt = sorted(n for n in rest["joints"] if module_of and n not in module_of)
     for name in rest["joints"]:
+        if name in not_rebuilt:
+            continue
         key = instance.key("BONE", name)
         if key is not None:
             joint_keys[name] = key
             transform = instance.global_transform(key)
             ue_rest[name] = (_to_p(transform), _to_q(transform))
-    missing_joints = sorted(set(rest["joints"]) - set(joint_keys))
+    missing_joints = sorted(set(rest["joints"]) - set(joint_keys) - set(not_rebuilt))
 
     control_names = document.get("controls") or []
     control_keys, missing_controls = {}, []
@@ -259,13 +356,23 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
     calibration["worst_controls"] = sorted(
         ((n, round(e, 4)) for n, e in control_errors.items()), key=lambda item: -item[1]
     )[:10]
-    calibration_ok = (calibration["joints_position_cm"] or {}).get("max", 0.0) <= CALIBRATION_TOLERANCE_CM
+    # The CONVERSION is wrong when the bulk of the joints is off (a wrong axis
+    # or unit moves nearly everything). A few joints off is rig placement,
+    # reported as rest offsets -- the pose errors below measure MOTION from
+    # rest, so they stay meaningful either way.
+    joint_stats = calibration["joints_position_cm"] or {}
+    calibration_ok = joint_stats.get("p95", 0.0) <= CALIBRATION_TOLERANCE_CM
+    calibration["rest_offsets"] = [
+        item for item in calibration["worst_joints"] if item[1] > CALIBRATION_TOLERANCE_CM
+    ]
     if not calibration_ok:
         _warn(
-            "Calibration FAILED: at rest, Unreal joints differ from the exported Maya positions by up "
-            f"to {calibration['joints_position_cm']['max']:.3f} cm -- the Maya->Unreal conversion is "
-            "wrong, rig error below is not meaningful. Worst: " + str(calibration["worst_joints"][:3])
+            "Calibration FAILED: at rest, most Unreal joints differ from the exported Maya positions "
+            f"(p95 {joint_stats.get('p95', 0):.3f} cm) -- the Maya->Unreal conversion is wrong. "
+            "Worst: " + str(calibration["worst_joints"][:3])
         )
+    elif calibration["rest_offsets"]:
+        _warn("Joints not at their Maya position at rest (cm): " + str(calibration["rest_offsets"][:5]))
     misplaced = [item for item in calibration["worst_controls"] if item[1] > CALIBRATION_TOLERANCE_CM]
     if misplaced:
         _warn("Controls not at their Maya origin at rest (cm): " + str(misplaced[:5]))
@@ -273,18 +380,41 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
     # -- poses -----------------------------------------------------------------
     per_joint = {n: {"p": [], "r": []} for n in joint_keys}
     per_group = {}
+    # Three-joint IK limbs: their middle joint is scored on the error its
+    # own root/tip and the reach do not explain (see _bend_explained).
+    limbs = []
+    for module in (manifest or {}).get("modules") or []:
+        chain = [str(b).split("|")[-1] for b in (module.get("chain") or [])]
+        if module.get("module_type") in LIMB_MODULE_TYPES and len(chain) == 3 and all(b in joint_keys for b in chain):
+            root, mid, tip = (rest["joints"][b]["t"] for b in chain)
+            limbs.append((module.get("module_name"), chain, _distance(root, mid), _distance(mid, tip)))
+    straight = {}
+
+    # Morph target curves to compare with Maya's blendshape weights.
+    morph_keys = {}
+    if any("blendshapes" in p for p in poses):
+        for name in sorted({m for p in poses for m in (p.get("blendshapes") or {})}):
+            key = instance.key("CURVE", name)
+            if key is not None:
+                morph_keys[name] = key
+    morph_errors = {name: [] for name in morph_keys}
+    morph_worst = {}
+    morph_missing = sorted({m for p in poses for m in (p.get("blendshapes") or {})} - set(morph_keys))
+
     per_pose = []
     skipped = 0
     for pose in poses[1:]:
         instance.reset()
         applied = True
+        targets = []
         for name, state in (pose.get("controls") or {}).items():
             key = control_keys.get(name)
             if key is None:
                 applied = False
                 continue
             rest_state = _maya_control_rest(document, name)
-            target = _posed_control(ue_control_rest[name], rest_state, state)
+            targets.append((key, _posed_control(ue_control_rest[name], rest_state, state)))
+        for key, target in targets:
             instance.set_global(key, target)
         for plug, value in (pose.get("channels") or {}).items():
             control_name, attribute = plug.split(".", 1)
@@ -297,29 +427,85 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
         if not applied:
             skipped += 1
         instance.run()
+        # A control under a rig-driven space (follow or blended null) was set
+        # against its parent's REST transform; the run above moved that parent.
+        # Re-apply the world targets against the updated parents and solve
+        # again (two passes cover a space driven by another posed control).
+        for _ in range(2):
+            if not targets:
+                break
+            for key, target in targets:
+                instance.set_global(key, target)
+            instance.run()
 
         pose_p, pose_r = [], []
+        worst = (0.0, None)
+        scored = []
+        errors = {}
         for name, key in joint_keys.items():
             transform = instance.global_transform(key)
             p_ue, q_ue = _to_p(transform), _to_q(transform)
             maya = pose["joints"].get(name)
             if not maya:
                 continue
-            e_p = _distance(p_ue, maya["t"])
+            # Motion error: Unreal's displacement from rest vs Maya's, so a
+            # joint placed slightly off at rest (reported in calibration) does
+            # not add the same constant to every pose.
+            rest_p = rest["joints"][name]["t"]
+            e_p = _distance(
+                [p_ue[i] - ue_rest[name][0][i] for i in range(3)],
+                [float(maya["t"][i]) - float(rest_p[i]) for i in range(3)],
+            )
             delta_ue = _q_mul(q_ue, _q_inv(ue_rest[name][1]))
             delta_maya = _q_mul(_q(maya["q"]), _q_inv(_q(rest["joints"][name]["q"])))
             e_r = _q_angle(delta_ue, delta_maya)
+            errors[name] = [e_p, e_r, p_ue]
+        raw_max = max((e[0] for e in errors.values()), default=0.0)
+        for name, key in morph_keys.items():
+            maya_weight = (pose.get("blendshapes") or {}).get(name)
+            if maya_weight is None:
+                continue
+            error = abs(instance.curve_value(key) - float(maya_weight))
+            morph_errors[name].append(error)
+            if error > morph_worst.get(name, (0.0, None))[0]:
+                morph_worst[name] = (error, pose.get("name"))
+        for module_name, (root, mid, tip), length_a, length_b in limbs:
+            if not all(n in errors and n in pose["joints"] for n in (root, mid, tip)):
+                continue
+            maya_root, maya_mid, maya_tip = (pose["joints"][n]["t"] for n in (root, mid, tip))
+            explained = _bend_explained(
+                length_a, length_b,
+                _distance(errors[root][2], errors[tip][2]), _distance(maya_root, maya_tip),
+                _line_distance(maya_mid, maya_root, maya_tip),
+            ) + max(errors[root][0], errors[tip][0])
+            raw = errors[mid][0]
+            errors[mid][0] = max(0.0, raw - explained)
+            if raw > TIERS[-1][1] and errors[mid][0] < raw:
+                entry = straight.setdefault(module_name, {"joint": mid, "poses": 0, "max_raw_cm": 0.0,
+                                                          "max_unexplained_cm": 0.0, "worst_pose": None})
+                entry["poses"] += 1
+                if raw > entry["max_raw_cm"]:
+                    entry["max_raw_cm"], entry["worst_pose"] = round(raw, 4), pose.get("name")
+                entry["max_unexplained_cm"] = round(max(entry["max_unexplained_cm"], errors[mid][0]), 4)
+        for name, (e_p, e_r, _p) in errors.items():
             per_joint[name]["p"].append(e_p)
             per_joint[name]["r"].append(e_r)
+            if e_p + e_r / 10.0 > worst[0]:
+                worst = (e_p + e_r / 10.0, name)
+            scored.append((e_p + e_r / 10.0, name, round(e_p, 3), round(e_r, 2)))
             pose_p.append(e_p)
             pose_r.append(e_r)
         group = per_group.setdefault(pose.get("group", "?"), {"p": [], "r": []})
         group["p"].extend(pose_p)
         group["r"].extend(pose_r)
         per_pose.append({
-            "name": pose.get("name"), "applied": applied,
+            "name": pose.get("name"), "group": pose.get("group"), "applied": applied,
+            "probe": pose.get("probe"), "maya_motion": pose.get("maya_motion"),
+            "worst_joint": worst[1],
+            "top_joints": [(n, p, r) for _, n, p, r in sorted(scored, reverse=True)[:3]],
             "max_position_cm": round(max(pose_p), 4) if pose_p else None,
             "max_rotation_deg": round(max(pose_r), 4) if pose_r else None,
+            "max_raw_position_cm": round(raw_max, 4),
         })
 
     # -- aggregate --------------------------------------------------------------
@@ -354,6 +540,7 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
             "matched_by_name": len(control_keys),
             "missing_controls": missing_controls,
             "missing_joints": missing_joints,
+            "joints_not_rebuilt": not_rebuilt,
         },
         "by_group": {g: {"position_cm": _stats(v["p"]), "rotation_deg": _stats(v["r"])} for g, v in per_group.items()},
         "by_module": {
@@ -362,16 +549,179 @@ def run(rig_blueprint, poses_path, manifest=None, report_path=None):
             for m, v in per_module.items()
         },
         "by_joint": joints_report,
+        "by_control": _by_control(per_pose),
+        "straight_limb": straight,
+        "blendshapes": {
+            "tolerance": MORPH_TOLERANCE,
+            "missing_curves": morph_missing,
+            "targets": {
+                name: {"max_error": round(max(errs), 6) if errs else None,
+                       "worst_pose": morph_worst.get(name, (0.0, None))[1]}
+                for name, errs in morph_errors.items()
+            },
+        } if (morph_keys or morph_missing) else None,
+        "verdict": _verdict(calibration_ok, per_module, skipped, tier, calibration["rest_offsets"], straight,
+                            morph_errors, morph_missing),
         "worst_poses": sorted(
             (p for p in per_pose if p["max_position_cm"] is not None),
             key=lambda p: -(p["max_position_cm"] + p["max_rotation_deg"] / 10.0),
         )[:15],
     }
     report_path = report_path or poses_path.replace(".poses.json", ".harness_report.json")
+    previous = _load_json(report_path)
+    report["compared_to_previous"] = _compare(previous, report) if previous else None
+    if previous:
+        with open(report_path.replace(".json", ".prev.json"), "w", encoding="utf-8") as handle:
+            json.dump(previous, handle, indent=1)
     with open(report_path, "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=1)
-    _summarise(report, report_path)
+    html_path = report_path.replace(".json", ".html")
+    try:
+        with open(html_path, "w", encoding="utf-8") as handle:
+            handle.write(_html(report))
+    except Exception as exc:
+        _warn(f"HTML report not written: {exc}")
+        html_path = None
+    _summarise(report, report_path, html_path)
     return report
+
+
+def _load_json(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+
+def _by_control(per_pose):
+    """Probe errors per posed control: the control whose probe breaks the most
+    joints points straight at the setup to fix."""
+    result = {}
+    for pose in per_pose:
+        probe = pose.get("probe") or {}
+        control = probe.get("control")
+        if not control or pose["max_position_cm"] is None:
+            continue
+        entry = result.setdefault(control, {"max_position_cm": 0.0, "max_rotation_deg": 0.0,
+                                            "worst_probe": None, "worst_joint": None, "mode": probe.get("mode")})
+        score = pose["max_position_cm"] + pose["max_rotation_deg"] / 10.0
+        if score >= entry["max_position_cm"] + entry["max_rotation_deg"] / 10.0:
+            entry.update(max_position_cm=pose["max_position_cm"], max_rotation_deg=pose["max_rotation_deg"],
+                         worst_probe=pose["name"], worst_joint=pose["worst_joint"])
+    return dict(sorted(result.items(), key=lambda item: -(item[1]["max_position_cm"]
+                                                          + item[1]["max_rotation_deg"] / 10.0)))
+
+
+def _verdict(calibration_ok, per_module, skipped, tier, rest_offsets=(), straight=None,
+             morph_errors=None, morph_missing=()):
+    if not calibration_ok:
+        return "CALIBRATION FAILED - conversion error, fix before reading rig numbers"
+    tiers = [tier(max(v["p"] or [0]), max(v["r"] or [0])) for v in per_module.values()]
+    failing = sum(1 for t in tiers if t == "above T1")
+    text = f"{len(tiers) - failing}/{len(tiers)} module(s) within T1"
+    if rest_offsets:
+        text += f"; {len(rest_offsets)} joint(s) off at rest"
+    if skipped:
+        text += f"; {skipped} pose(s) could not be fully applied"
+    if morph_errors or morph_missing:
+        good = sum(1 for errs in (morph_errors or {}).values() if errs and max(errs) <= MORPH_TOLERANCE)
+        total = len(morph_errors or {}) + len(morph_missing or ())
+        text += f"; blendshapes {good}/{total} match"
+        if morph_missing:
+            text += f" ({len(morph_missing)} missing in Unreal)"
+    if straight:
+        text += (f"; {len(straight)} limb(s) near straight on some poses (middle joint scored on the error "
+                 "its root/tip and the export precision do not explain)")
+    return text
+
+
+def _compare(previous, report):
+    """Per-module max error, previous run -> this run."""
+    changes = {}
+    old_modules = previous.get("by_module") or {}
+    for module, data in (report.get("by_module") or {}).items():
+        old = old_modules.get(module)
+        if not old:
+            continue
+        before = (old.get("position_cm") or {}).get("max", 0.0), (old.get("rotation_deg") or {}).get("max", 0.0)
+        after = (data.get("position_cm") or {}).get("max", 0.0), (data.get("rotation_deg") or {}).get("max", 0.0)
+        delta_p, delta_r = after[0] - before[0], after[1] - before[1]
+        if abs(delta_p) < 0.01 and abs(delta_r) < 0.05:
+            state = "same"
+        elif delta_p <= 0.01 and delta_r <= 0.05:
+            state = "better"
+        elif delta_p >= -0.01 and delta_r >= -0.05:
+            state = "WORSE"
+        else:
+            state = "mixed"
+        changes[module] = {"state": state, "position_cm": [round(before[0], 4), round(after[0], 4)],
+                           "rotation_deg": [round(before[1], 3), round(after[1], 3)]}
+    return changes
+
+
+def _html(report):
+    """Self-contained, readable report page."""
+    import html as _h
+
+    colors = {"T0": "#1f8f4e", "T1": "#5b8f1f", "above T1": "#b3261e"}
+
+    def row(cells):
+        return "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+
+    def tier_cell(t):
+        return f'<b style="color:{colors.get(t, "#333")}">{_h.escape(t)}</b>'
+
+    cal = report["calibration"]
+    parts = [
+        "<!doctype html><meta charset=utf-8><title>Pose report</title>",
+        "<style>body{font:14px system-ui,sans-serif;margin:24px;max-width:1100px;color:#222}"
+        "table{border-collapse:collapse;margin:8px 0 20px}td,th{border:1px solid #ddd;padding:4px 8px;"
+        "text-align:left}th{background:#f3f3f3}h2{margin-top:28px}.bad{color:#b3261e}</style>",
+        f"<h1>Pose report: {_h.escape(str(report.get('rig_name')))}</h1>",
+        f"<p><b>{_h.escape(report['verdict'])}</b> &middot; {report['poses']} poses &middot; "
+        f"controls matched {report['interface']['matched_by_name']}/{report['interface']['maya_controls']}</p>",
+        "<p>Tiers: T0 &le; 0.01 cm / 0.01&deg;, T1 &le; 0.1 cm / 0.5&deg;. Rotation = difference of the "
+        "rotation <i>change from rest</i> (Maya vs Unreal).</p>",
+        "<h2>Calibration (rest pose)</h2>",
+        f"<p class={'' if report['calibration_ok'] else 'bad'}>Joints max "
+        f"{(cal['joints_position_cm'] or {}).get('max', 0):.4f} cm; controls vs Maya origin max "
+        f"{(cal.get('controls_position_cm') or {}).get('max', 0):.4f} cm</p>",
+    ]
+    if cal.get("worst_controls"):
+        parts.append("<table><tr><th>Control not at its Maya origin</th><th>cm</th></tr>"
+                     + "".join(row([_h.escape(n), e]) for n, e in cal["worst_controls"] if e > 0.1)
+                     + "</table>")
+    parts.append("<h2>Modules</h2><table><tr><th>Module</th><th>Tier</th><th>max cm</th>"
+                 "<th>max deg</th><th>vs previous</th></tr>")
+    changes = report.get("compared_to_previous") or {}
+    for module, data in sorted(report["by_module"].items(), key=lambda i: i[0]):
+        change = changes.get(module)
+        parts.append(row([
+            _h.escape(module), tier_cell(data["tier"]),
+            f"{(data['position_cm'] or {}).get('max', 0):.3f}", f"{(data['rotation_deg'] or {}).get('max', 0):.3f}",
+            f"{change['state']} ({change['position_cm'][0]} &rarr; {change['position_cm'][1]} cm)" if change else "",
+        ]))
+    if report.get("straight_limb"):
+        parts.append("</table><h2>Near-straight limbs</h2><p>On these poses the limb is (almost) straight, so "
+                     "its middle joint moves a lot for a tiny change of reach. The tier uses only the part of the "
+                     "error that the limb's own root/tip error and the export precision do not explain.</p>"
+                     "<table><tr><th>Module</th><th>Joint</th><th>poses</th><th>max raw cm</th>"
+                     "<th>max unexplained cm</th><th>worst pose</th></tr>")
+        for module, data in sorted(report["straight_limb"].items()):
+            parts.append(row([_h.escape(module), _h.escape(data["joint"]), data["poses"], data["max_raw_cm"],
+                              data["max_unexplained_cm"], _h.escape(str(data["worst_pose"]))]))
+    parts.append("</table><h2>Controls whose probe breaks the most</h2><table><tr><th>Control</th>"
+                 "<th>mode</th><th>worst probe</th><th>worst joint</th><th>max cm</th><th>max deg</th></tr>")
+    for control, data in list(report["by_control"].items())[:25]:
+        parts.append(row([_h.escape(control), data.get("mode") or "", _h.escape(str(data["worst_probe"])),
+                          _h.escape(str(data["worst_joint"])), f"{data['max_position_cm']:.3f}",
+                          f"{data['max_rotation_deg']:.3f}"]))
+    parts.append("</table>")
+    missing = report["interface"]["missing_controls"]
+    if missing:
+        parts.append("<h2>Maya controls missing in Unreal</h2><p>" + ", ".join(map(_h.escape, missing)) + "</p>")
+    return "\n".join(parts)
 
 
 def _maya_control_rest(document, name):
@@ -404,8 +754,12 @@ def _posed_control(ue_rest, maya_rest, maya_posed):
     return _transform(new_p, new_q)
 
 
-def _summarise(report, report_path):
+def _summarise(report, report_path, html_path=None):
     interface = report["interface"]
+    _log(f"VERDICT: {report['verdict']}")
+    if interface.get("joints_not_rebuilt"):
+        _log(f"{len(interface['joints_not_rebuilt'])} exported joint(s) belong to no module and are not scored "
+             f"(e.g. {', '.join(interface['joints_not_rebuilt'][:4])}).")
     _log(
         f"{report['poses']} pose(s); controls matched by name "
         f"{interface['matched_by_name']}/{interface['maya_controls']}"
@@ -413,7 +767,7 @@ def _summarise(report, report_path):
     )
     cal = report["calibration"]["joints_position_cm"] or {}
     ctl = report["calibration"].get("controls_position_cm") or {}
-    _log(f"Calibration (rest): joints max {cal.get('max', 0):.4f} cm -> "
+    _log(f"Calibration (rest): joints p95 {cal.get('p95', 0):.4f} / max {cal.get('max', 0):.4f} cm -> "
          + ("OK" if report["calibration_ok"] else "FAILED")
          + f"; controls vs Maya origin max {ctl.get('max', 0):.4f} cm")
     for group, data in report["by_group"].items():
@@ -424,4 +778,36 @@ def _summarise(report, report_path):
     for module, data in sorted(report["by_module"].items()):
         p, r = data["position_cm"] or {}, data["rotation_deg"] or {}
         _log(f"  {module:18s} {data['tier']:9s} max {p.get('max', 0):.3f} cm / {r.get('max', 0):.3f} deg")
-    _log(f"Report: {report_path}")
+    morphs = report.get("blendshapes") or {}
+    for name, data in sorted((morphs.get("targets") or {}).items()):
+        if data["max_error"] is None or data["max_error"] > morphs.get("tolerance", MORPH_TOLERANCE):
+            _log(f"  blendshape {name}: max weight error {data['max_error']} ({data['worst_pose']})")
+    if morphs.get("missing_curves"):
+        _log("  blendshapes with no curve in Unreal: " + ", ".join(morphs["missing_curves"]))
+    for module, data in sorted((report.get("straight_limb") or {}).items()):
+        _log(f"  near-straight {module}: {data['joint']} raw max {data['max_raw_cm']:.3f} cm on {data['poses']} "
+             f"pose(s), unexplained max {data['max_unexplained_cm']:.3f} cm ({data['worst_pose']})")
+    for control, data in list(report["by_control"].items())[:5]:
+        _log(f"  worst control {control}: {data['max_position_cm']:.3f} cm / {data['max_rotation_deg']:.3f} deg "
+             f"({data['worst_probe']}, joint {data['worst_joint']})")
+    for pose in report.get("worst_poses", [])[:5]:
+        _log(f"  worst pose {pose['name']}: " + ", ".join(
+            f"{n} {p} cm/{r} deg" for n, p, r in pose.get("top_joints") or []))
+    for module, change in (report.get("compared_to_previous") or {}).items():
+        if change["state"] != "same":
+            _log(f"  vs previous run: {module} {change['state']} "
+                 f"({change['position_cm'][0]} -> {change['position_cm'][1]} cm)")
+    _log(f"Report: {report_path}" + (f"  |  open in a browser: {html_path}" if html_path else ""))
+
+
+def run_after_build(rig_blueprint, assets, manifest):
+    """Run the harness right after a build; never raises (the build stands)."""
+    try:
+        poses_path = find_poses_file(assets, (manifest or {}).get("poses_file"))
+        if not poses_path:
+            _log("No <name>.poses.json next to the FBX: pose check skipped (re-export from Maya).")
+            return None
+        return run(rig_blueprint, poses_path, manifest=manifest)
+    except Exception as exc:
+        _warn(f"Pose check failed to run ({type(exc).__name__}: {exc}); the rig build is unaffected.")
+        return None

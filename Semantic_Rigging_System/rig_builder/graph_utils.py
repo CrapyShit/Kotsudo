@@ -1187,7 +1187,11 @@ def pick_perpendicular_axis(primary_label, preferred_label=None):
 # ---------------------------------------------------------------------------
 
 # Offsets shorter than this (cm) are treated as "same origin as the bone".
-ORIGIN_OFFSET_TOLERANCE = 0.5
+# Export precision only (offsets are written to 1e-6): any real offset is
+# honoured, since the control's origin is the pivot the animator rotates
+# about (Murakami's neck controls sit 0.11-0.13 cm off their joints; a
+# former 0.5 cm threshold snapped them onto the bone).
+ORIGIN_OFFSET_TOLERANCE = 0.001
 # Maya->UE mapping is accepted when the reference bone direction agrees within
 # this angle (degrees).
 ORIGIN_MAPPING_ANGLE_TOLERANCE = 10.0
@@ -1235,6 +1239,11 @@ def controller_origin_position(hierarchy, record, anchor_bone, min_offset=None, 
     # affect it; it is validated the same way against a neighbour bone.
     local_result = _local_origin_position(hierarchy, record, anchor_bone, label)
     world_result = _world_origin_position(hierarchy, record, anchor_bone, label)
+    # A joint-local offset is only trusted once validated against a neighbour
+    # bone (reference_local); single-bone modules have none, so their
+    # validated world offset wins.
+    if local_result is not None and world_result is not None and not (record.get("reference_local") or {}).get("vector"):
+        local_result = None
     result = local_result or world_result
     if local_result is not None and world_result is not None:
         # Two independent encodings of the same point. When they agree the
@@ -1349,6 +1358,15 @@ def _world_origin_position(hierarchy, record, anchor_bone, label):
 
     scaled = vector_scale(offset, scale)
     return vector_add(anchor_position, scaled), scaled
+
+
+def transform_pin_string(transform):
+    """Pin default text for an FTransform."""
+    q = get_transform_rotation(transform)
+    t = transform_to_location(transform)
+    sc = transform.scale3d
+    return ("(Rotation=(X={:.9g},Y={:.9g},Z={:.9g},W={:.9g}),Translation=(X={:.9g},Y={:.9g},Z={:.9g}),"
+            "Scale3D=(X={:.9g},Y={:.9g},Z={:.9g}))").format(q.x, q.y, q.z, q.w, t.x, t.y, t.z, sc.x, sc.y, sc.z)
 
 
 def bone_aligned_transform_at(bone_transform, position):

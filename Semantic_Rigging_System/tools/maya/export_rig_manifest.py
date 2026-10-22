@@ -20,6 +20,7 @@ connections, and constraint queries -- never from joint/control names.
 
 import importlib
 import json
+import math
 import os
 import re
 import sys
@@ -804,7 +805,11 @@ def _world_axes_unreal(node):
     swap roles too). The result is a proper right-handed basis, directly
     usable as a Control Rig rotation.
     """
-    matrix = cmds.xform(node, query=True, worldSpace=True, matrix=True)
+    return _matrix_axes_unreal(cmds.xform(node, query=True, worldSpace=True, matrix=True))
+
+
+def _matrix_axes_unreal(matrix):
+    """Unreal axes [X, Y, Z] of a flat 16-value Maya world matrix."""
     axes = []
     for row in range(3):
         vector = [matrix[row * 4 + i] for i in range(3)]
@@ -867,16 +872,338 @@ def _space_drivers(node):
         for source in sources:
             if cmds.objectType(source, isAType='constraint'):
                 drivers = drivers if drivers is not None else []
-                targets = cmds.listConnections(
-                    '{}.target'.format(source), source=True, destination=False
-                ) or []
-                for target in targets:
+                for target in _constraint_targets(source):
                     if (target not in drivers and target != _short_node_name(node)
                             and cmds.objectType(target, isAType='transform')):
                         drivers.append(target)
             elif attribute == 'offsetParentMatrix':
                 drivers = drivers if drivers is not None else []
     return drivers
+
+
+def _constraint_targets(constraint):
+    """The transforms a constraint follows -- what feeds each target's
+    parent matrix. Weight inputs (an IK/FK switch wired to target weights)
+    are also connected under .target and must not count as targets."""
+    targets = []
+    for index in cmds.getAttr('{}.target'.format(constraint), multiIndices=True) or []:
+        for plug in ('targetParentMatrix', 'targetTranslate', 'targetRotate'):
+            # Not every constraint type has every plug (orient: no translate).
+            try:
+                sources = cmds.listConnections(
+                    '{}.target[{}].{}'.format(constraint, index, plug), source=True, destination=False
+                ) or []
+            except (ValueError, RuntimeError):
+                continue
+            if sources:
+                if sources[0] not in targets:
+                    targets.append(sources[0])
+                break
+    return targets
+
+
+def _weight_source(constraint, index):
+    """What drives one constraint target's weight.
+
+    {'value': w} for a constant, else {'control', 'attr', 'ops'}: the
+    controller attribute and the maths turning it into the weight (any wiring
+    the attribute walker understands -- condition nodes for an enum space
+    switch, driven keys, a reverse for an IK/FK blend...). 'invert' is kept
+    for the plain and reversed cases (older builders read it). None when the
+    wiring is not supported.
+    """
+    plug = '{}.target[{}].targetWeight'.format(constraint, index)
+    source = _source_plug(plug)
+    # Usually fed by the constraint's own weight attribute ('chest_ctrlW1'):
+    # a constant unless something drives that attribute in turn.
+    if source is None or (cmds.objectType(source.split('.')[0], isAType='constraint')
+                          and _source_plug(source) is None):
+        return {'value': float(cmds.getAttr(plug))}
+    control, attribute, ops = _attribute_driver(plug)
+    if control is None:
+        return None
+    weight = {'control': control, 'attr': attribute, 'ops': ops}
+    if not ops:
+        weight['invert'] = False
+    elif ops == [{'op': 'reverse'}]:
+        weight['invert'] = True
+    return weight
+
+
+_SPACE_CONSTRAINT_KINDS = {'parentConstraint': 'parent', 'orientConstraint': 'orient', 'pointConstraint': 'point'}
+
+
+def _space_target(node):
+    """What a space target follows in the rebuilt rig: the nearest controller
+    above it, else the nearest exported joint above it, else the world."""
+    controller = _nearest_controller_transform(node)
+    if controller:
+        return {'controller': _short_node_name(controller)}
+    exported = set(_exported_joints())
+    current = _full_dag_path(node)
+    while current:
+        if current in exported:
+            return {'bone': _short_node_name(current)}
+        current = (cmds.listRelatives(current, parent=True, fullPath=True) or [None])[0]
+    return {'world': True}
+
+
+def describe_space(node):
+    """(blend, reason) for the constraint that replaces a controller's space.
+
+    Walks up from the controller through its groups; at the first group a
+    constraint drives (before any parent controller) returns the blend:
+    {'kind': 'parent'|'orient'|'point', 'group', 'constraint', 'targets':
+    [{'controller'|'bone'|'world', 'weight'}], 'rest', per-target 'solo'
+    poses, and 'switch' (driver attribute, enum labels, value per target)}.
+    (None, reason) when no group is constrained or the space cannot be
+    described -- the reason is reported instead of guessing silently.
+    """
+    current = (cmds.listRelatives(node, parent=True, fullPath=True) or [None])[0]
+    while current:
+        if cmds.objectType(current, isAType='transform') and _has_controller_shape(current):
+            return None, None
+        constraints = sorted({
+            source for attribute in _DRIVEN_ATTRS
+            if cmds.attributeQuery(attribute.split('.')[0], node=current, exists=True)
+            for source in (cmds.listConnections('{}.{}'.format(current, attribute), source=True,
+                                                destination=False, skipConversionNodes=True) or [])
+            if cmds.objectType(source, isAType='constraint')
+        })
+        if constraints:
+            group = _short_node_name(current)
+            if len(constraints) != 1:
+                return None, '{} is driven by several constraints ({})'.format(
+                    group, ', '.join(_short_node_name(c) for c in constraints))
+            constraint = constraints[0]
+            kind = _SPACE_CONSTRAINT_KINDS.get(cmds.nodeType(constraint))
+            if kind is None:
+                return None, '{} is driven by a {}'.format(group, cmds.nodeType(constraint))
+            targets = []
+            for index in cmds.getAttr('{}.target'.format(constraint), multiIndices=True) or []:
+                sources = cmds.listConnections('{}.target[{}].targetParentMatrix'.format(constraint, index),
+                                               source=True, destination=False) or []
+                if not sources:
+                    continue
+                weight = _weight_source(constraint, index)
+                if weight is None:
+                    return None, 'the weight of {} target {} uses wiring that is not supported'.format(
+                        _short_node_name(constraint), _short_node_name(sources[0]))
+                target = _space_target(sources[0])
+                target.update({'node': _short_node_name(sources[0]), 'weight': weight, 'index': index})
+                targets.append(target)
+            if not targets:
+                return None, '{} has no target'.format(_short_node_name(constraint))
+            blend = {'kind': kind, 'group': group, 'constraint': _short_node_name(constraint), 'targets': targets}
+            try:
+                _measure_solo_targets(node, blend)
+            except Exception as exc:
+                blend['solo_error'] = str(exc)
+            return blend, None
+        if cmds.attributeQuery('offsetParentMatrix', node=current, exists=True) and \
+                _source_plug(current + '.offsetParentMatrix') is not None:
+            return None, '{} follows its space through a matrix network (offsetParentMatrix)'.format(
+                _short_node_name(current))
+        current = (cmds.listRelatives(current, parent=True, fullPath=True) or [None])[0]
+    return None, None
+
+
+def _parent_space_blend(node):
+    return describe_space(node)[0]
+
+
+def _world_pose_unreal(node):
+    """{'position', 'axes'} of a node's world matrix in Unreal axes / cm."""
+    matrix = cmds.xform(node, query=True, worldSpace=True, matrix=True)
+    return {
+        'position': _maya_vector_to_unreal(matrix[12:15], apply_unit_scale=False),
+        'axes': _world_axes_unreal(node),
+    }
+
+
+_SOLO_MAX_ASSIGNMENTS = 512
+
+
+def enum_entries(node, attribute):
+    """[(label, value)] of an enum attribute, honouring explicit values ('High=10')."""
+    entries, value = [], 0
+    for item in ((cmds.attributeQuery(attribute, node=node, listEnum=True) or [''])[0]).split(':'):
+        if not item:
+            continue
+        label = item
+        if '=' in item:
+            label, number = item.rsplit('=', 1)
+            try:
+                value = int(number)
+            except ValueError:
+                pass
+        entries.append((label, float(value)))
+        value += 1
+    return entries
+
+
+def _driver_candidates(plug, ops):
+    """Values worth trying on a driver plug to isolate each space."""
+    node, attribute = plug.split('.', 1)
+    values = [0.0, 1.0]
+    try:
+        if cmds.getAttr(plug, type=True) == 'enum':
+            values += [value for _, value in enum_entries(node, attribute)]
+        for flag, exists in (('minimum', 'minExists'), ('maximum', 'maxExists')):
+            if cmds.attributeQuery(attribute, node=node, **{exists: True}):
+                values += [float(v) for v in cmds.attributeQuery(attribute, node=node, **{flag: True})]
+    except Exception:
+        pass
+    for op in ops or []:
+        if op.get('op') == 'compare':
+            values += [op['value'], op['value'] + 1.0, op['value'] - 1.0]
+        elif op.get('op') == 'curve':
+            values += [k[0] for k in op.get('keys') or []]
+        elif op.get('op') == 'remap':
+            values += list(op.get('from') or [])
+    unique = []
+    for value in values:
+        if all(abs(value - u) > 1e-9 for u in unique):
+            unique.append(value)
+    return unique
+
+
+def _measure_solo_targets(node, blend):
+    """Record where the controller sits with each space (target) alone.
+
+    A Maya constraint keeps one offset PER TARGET, set when it was made, and
+    they need not agree at the current pose (Murakami's foot FK group drops
+    1 cm from IK to FK). Each space is isolated by trying driver values (enum
+    entries, slider limits, the numbers in the weight maths) and reading the
+    constraint's ACTUAL weights, so any wiring works. Also records the
+    switch: driver attribute, enum labels, and the value selecting each
+    space. Every touched attribute is restored.
+    """
+    targets = blend['targets']
+    constraint = blend['constraint']
+    plugs = []
+    for target in targets:
+        weight = target['weight']
+        if 'attr' in weight:
+            plug = '{}.{}'.format(weight['control'], weight['attr'])
+            if plug not in [p for p, _ in plugs]:
+                plugs.append((plug, weight.get('ops')))
+    blend['rest'] = _world_pose_unreal(node)
+    if not plugs:
+        return
+    candidates = [_driver_candidates(plug, ops) for plug, ops in plugs]
+    assignments = [[]]
+    for values in candidates:
+        assignments = [a + [v] for a in assignments for v in values]
+        if len(assignments) > _SOLO_MAX_ASSIGNMENTS:
+            raise RuntimeError('too many driver combinations to isolate each space')
+    previous = {plug: cmds.getAttr(plug) for plug, _ in plugs}
+
+    def weights():
+        return [float(cmds.getAttr('{}.target[{}].targetWeight'.format(constraint, t['index']))) for t in targets]
+
+    selected = {}
+    try:
+        for assignment in assignments:
+            try:
+                for (plug, _), value in zip(plugs, assignment):
+                    cmds.setAttr(plug, value)
+            except Exception:
+                continue
+            current = weights()
+            for index, target in enumerate(targets):
+                if index in selected or current[index] <= 1e-6:
+                    continue
+                if all(w <= 1e-6 for j, w in enumerate(current) if j != index):
+                    target['solo'] = _world_pose_unreal(node)
+                    selected[index] = list(assignment)
+    finally:
+        for plug, value in previous.items():
+            cmds.setAttr(plug, value)
+    if len(plugs) == 1:
+        plug = plugs[0][0]
+        control, attribute = plug.split('.', 1)
+        switch = {'control': _short_node_name(control), 'attr': attribute,
+                  'values': [selected.get(i, [None])[0] for i in range(len(targets))]}
+        try:
+            if cmds.getAttr(plug, type=True) == 'enum':
+                by_value = {value: label for label, value in enum_entries(control, attribute)}
+                switch['labels'] = [by_value.get(v, '?') if v is not None else '?' for v in switch['values']]
+        except Exception:
+            pass
+        blend['switch'] = switch
+
+
+# ---------------------------------------------------------------------------
+# Offset / zero groups
+#
+# The groups between a controller and its parent controller. A static group
+# only holds the rest pose (Unreal: the control's offset transform). A group
+# whose channels are driven by controller sliders through a node network
+# (set-driven-key / "auto" groups, Murakami's petal groups) must move in
+# Unreal too: it becomes a null whose local transform is rebuilt every frame
+# from the same channels (see rig_builder/driven_groups.py).
+# ---------------------------------------------------------------------------
+
+_GROUP_CHANNELS = ('translateX', 'translateY', 'translateZ', 'rotateX', 'rotateY', 'rotateZ',
+                   'scaleX', 'scaleY', 'scaleZ')
+_ROTATE_ORDERS = ('xyz', 'yzx', 'zxy', 'xzy', 'yxz', 'zyx')
+
+
+def _group_entry(group):
+    """One offset group: its kind and, when driven, what the builder needs."""
+    entry = {'name': _short_node_name(group), 'node_type': cmds.nodeType(group), 'kind': 'static'}
+    driven, problems = {}, []
+    for channel in _GROUP_CHANNELS:
+        plug = '{}.{}'.format(group, channel)
+        source = _source_plug(plug) or _source_plug('{}.{}'.format(group, channel[:-1]))
+        if source is None:
+            continue
+        if cmds.objectType(source.split('.')[0], isAType='constraint'):
+            entry['kind'] = 'space'
+            continue
+        control, attribute, ops = _attribute_driver(plug)
+        if control is None:
+            problems.append('{}: {}'.format(channel, ops))
+        elif channel.startswith('scale'):
+            problems.append('{}: driven scale is not transferred yet'.format(channel))
+        else:
+            driven[channel] = {'control': control, 'attr': attribute, 'ops': ops}
+    if _source_plug(group + '.offsetParentMatrix') is not None:
+        entry['kind'] = 'matrix'
+        problems.append('placed by a matrix network (offsetParentMatrix)')
+    if entry['kind'] == 'static' and (driven or problems):
+        entry['kind'] = 'driven'
+    if driven or problems:
+        entry['driven'] = driven
+        entry['problems'] = problems
+    if entry['kind'] == 'driven':
+        pivots = [cmds.getAttr('{}.{}'.format(group, a))[0] for a in ('rotatePivot', 'scalePivot',
+                                                                         'rotatePivotTranslate')]
+        if any(abs(c) > 1e-6 for p in pivots for c in p):
+            problems.append('moved pivots are not transferred yet (the group turns about its origin)')
+        is_joint = cmds.nodeType(group) == 'joint'
+        entry.update({
+            'rest_world': _world_pose_unreal(group),
+            'rest': {c: float(cmds.getAttr('{}.{}'.format(group, c))) for c in _GROUP_CHANNELS[:6]},
+            'rotate_order': _ROTATE_ORDERS[cmds.getAttr(group + '.rotateOrder')],
+            'rotate_axis': list(cmds.getAttr(group + '.rotateAxis')[0]),
+            'joint_orient': list(cmds.getAttr(group + '.jointOrient')[0]) if is_joint else [0.0, 0.0, 0.0],
+            'axes_unreal': {a: _maya_vector_to_unreal(v, apply_unit_scale=False)
+                            for a, v in (('x', [1, 0, 0]), ('y', [0, 1, 0]), ('z', [0, 0, 1]))},
+            'unit_scale': _maya_linear_to_centimeters_scale(),
+        })
+    return entry
+
+
+def offset_stack(node):
+    """Groups between a controller and its parent controller, nearest first."""
+    stack = []
+    current = (cmds.listRelatives(node, parent=True, fullPath=True) or [None])[0]
+    while current and not (cmds.objectType(current, isAType='transform') and _has_controller_shape(current)):
+        stack.append(_group_entry(current))
+        current = (cmds.listRelatives(current, parent=True, fullPath=True) or [None])[0]
+    return stack
 
 
 def _is_driven_space(node):
@@ -913,10 +1240,8 @@ def _parent_space(node):
             drivers = _space_drivers(current)
             if drivers is not None:
                 if not controllers:
-                    points = [
-                        cmds.xform(target, query=True, worldSpace=True, rotatePivot=True)
-                        for target in drivers
-                    ] or [cmds.xform(current, query=True, worldSpace=True, rotatePivot=True)]
+                    points = [_target_point(target) for target in drivers] or [
+                        cmds.xform(current, query=True, worldSpace=True, rotatePivot=True)]
                     centre = [sum(p[i] for p in points) / len(points) for i in range(3)]
                     return controllers, _nearest_exported_joint(centre)
                 break
@@ -931,14 +1256,569 @@ def _exported_joints():
     return root + (cmds.listRelatives(root[0], allDescendents=True, type='joint', fullPath=True) or [])
 
 
+# ---------------------------------------------------------------------------
+# Blendshapes: which controller slider drives each target weight, and how
+#
+# Unreal imports the targets themselves from the FBX (morph targets, same
+# names); what it cannot see is the wiring that drives their weights. Each
+# weight is followed back through the usual Maya maths nodes to the
+# controller attribute that drives it, and the maths is written as a list of
+# simple operations applied in order (driver -> op 1 -> op 2 -> weight).
+# ---------------------------------------------------------------------------
+
+_BLENDSHAPE_MAX_DEPTH = 16
+_MD_OPERATIONS = {0: None, 1: 'mul', 2: 'div', 3: 'pow'}
+
+
+def _source_plug(plug):
+    """The plug connected into ``plug`` (unit conversions kept), or None."""
+    sources = cmds.listConnections(plug, source=True, destination=False, plugs=True,
+                                   skipConversionNodes=False) or []
+    return sources[0] if sources else None
+
+
+_COMPARE_TESTS = {0: 'eq', 1: 'ne', 2: 'gt', 3: 'ge', 4: 'lt', 5: 'le'}
+_COMPARE_SWAPPED = {'eq': 'eq', 'ne': 'ne', 'gt': 'lt', 'ge': 'le', 'lt': 'gt', 'le': 'ge'}
+
+
+def _ui_unit_scale(plug):
+    """Internal units per UI unit of a plug: radians per degree for angles,
+    cm per scene unit for distances, 1 for plain numbers."""
+    try:
+        kind = cmds.getAttr(plug, type=True)
+    except Exception:
+        return 1.0
+    if kind == 'doubleAngle':
+        return math.pi / 180.0
+    if kind == 'doubleLinear':
+        return _maya_linear_to_centimeters_scale()
+    return 1.0
+
+
+def _attribute_driver(plug, depth=0):
+    """(control, attribute, ops) of whatever drives ``plug``.
+
+    Shared by blendshape weights, constraint (space) weights and driven
+    group channels. Values are in UI units at both ends: the driver as the
+    animator reads it, the result as the driven channel shows it (degrees,
+    scene units, weights). ``ops`` are applied in order to the driver value:
+    {'op': 'mul'|'div'|'pow'|'add', 'value': v}, {'op': 'reverse'} (1 - x),
+    {'op': 'clamp', 'min', 'max'}, {'op': 'remap', 'from': [a, b],
+    'to': [c, d]} (clamped), {'op': 'curve', 'keys': [[in, out], ...]}
+    (driven keys, linear, constant outside the keys) and {'op': 'compare',
+    'test': 'eq'|'ne'|'gt'|'ge'|'lt'|'le', 'value', 'true', 'false'}
+    (condition nodes: the usual way an enum switches space weights).
+    Unsupported wiring returns (None, None, reason).
+    """
+    if depth > _BLENDSHAPE_MAX_DEPTH:
+        return None, None, 'wiring too deep'
+    source = _source_plug(plug)
+    if source is None:
+        return None, None, 'not connected'
+    node, attribute = source.split('.', 1)
+    kind = cmds.nodeType(node)
+
+    def follow(input_plug, ops):
+        control, attr, upstream = _attribute_driver(input_plug, depth + 1)
+        if control is None:
+            return control, attr, upstream
+        return control, attr, upstream + ops
+
+    def connected(input_plug):
+        return _source_plug(input_plug) is not None
+
+    if cmds.objectType(node, isAType='constraint'):
+        # A constraint's own weight attribute (e.g. 'chest_ctrlW1') feeding
+        # its target slot: the real driver is upstream of it.
+        return follow(source, []) if _source_plug(source) is not None else (
+            None, None, 'constraint weight not driven')
+
+    if cmds.objectType(node, isAType='transform'):
+        return _short_node_name(node), attribute.split('[')[0], []
+
+    if kind == 'unitConversion':
+        # The factor works on Maya's INTERNAL units (radians, cm); ops work in
+        # UI units at both ends. Between a plain number and an angle or
+        # distance this is 1: Maya reads the number in UI units.
+        factor = float(cmds.getAttr(node + '.conversionFactor'))
+        upstream = _source_plug(node + '.input')
+        factor *= (_ui_unit_scale(upstream) if upstream else 1.0) / _ui_unit_scale(plug)
+        ops = [] if abs(factor - 1.0) < 1e-9 else [{'op': 'mul', 'value': factor}]
+        return follow(node + '.input', ops)
+
+    if kind == 'condition':
+        channel = attribute[-1] if attribute.startswith('outColor') else 'R'
+        first, second = node + '.firstTerm', node + '.secondTerm'
+        when_true, when_false = node + '.colorIfTrue' + channel, node + '.colorIfFalse' + channel
+        if connected(when_true) or connected(when_false):
+            return None, None, 'condition with driven result colours'
+        test = _COMPARE_TESTS.get(cmds.getAttr(node + '.operation'))
+        if connected(first) and not connected(second):
+            driven, constant = first, second
+        elif connected(second) and not connected(first):
+            driven, constant, test = second, first, _COMPARE_SWAPPED.get(test)
+        else:
+            return None, None, 'condition with two driven terms'
+        return follow(driven, [{'op': 'compare', 'test': test, 'value': float(cmds.getAttr(constant)),
+                                'true': float(cmds.getAttr(when_true)), 'false': float(cmds.getAttr(when_false))}])
+
+    if kind == 'multiplyDivide':
+        axis = attribute[-1]
+        operation = _MD_OPERATIONS.get(cmds.getAttr(node + '.operation'))
+        first, second = '{}.input1{}'.format(node, axis), '{}.input2{}'.format(node, axis)
+        if operation is None:
+            return follow(first, [])
+        if connected(first) and not connected(second):
+            return follow(first, [{'op': operation, 'value': float(cmds.getAttr(second))}])
+        if connected(second) and not connected(first) and operation == 'mul':
+            return follow(second, [{'op': 'mul', 'value': float(cmds.getAttr(first))}])
+        return None, None, 'multiplyDivide with two driven inputs'
+
+    if kind == 'reverse':
+        return follow('{}.input{}'.format(node, attribute[-1]), [{'op': 'reverse'}])
+
+    if kind in ('addDoubleLinear', 'multDoubleLinear'):
+        first, second = node + '.input1', node + '.input2'
+        op = 'add' if kind == 'addDoubleLinear' else 'mul'
+        if connected(first) != connected(second):
+            driven, constant = (first, second) if connected(first) else (second, first)
+            return follow(driven, [{'op': op, 'value': float(cmds.getAttr(constant))}])
+        return None, None, '{} with two driven inputs'.format(kind)
+
+    if kind == 'plusMinusAverage':
+        if attribute.startswith('output3D'):
+            axis = attribute[-1].lower()
+            indices = cmds.getAttr(node + '.input3D', multiIndices=True) or []
+            plugs = ['{}.input3D[{}].input3D{}'.format(node, i, axis) for i in indices]
+        else:
+            indices = cmds.getAttr(node + '.input1D', multiIndices=True) or []
+            plugs = ['{}.input1D[{}]'.format(node, i) for i in indices]
+        driven = [i for i, pl in enumerate(plugs) if connected(pl)]
+        if len(driven) != 1:
+            return None, None, 'plusMinusAverage needs exactly one driven input'
+        values = [0.0 if i == driven[0] else float(cmds.getAttr(pl)) for i, pl in enumerate(plugs)]
+        operation = cmds.getAttr(node + '.operation')
+        if operation == 1:      # sum
+            return follow(plugs[driven[0]], [{'op': 'add', 'value': sum(values)}])
+        if operation == 2:      # subtract: first - all others
+            if driven[0] == 0:
+                return follow(plugs[0], [{'op': 'add', 'value': -sum(values[1:])}])
+            return follow(plugs[driven[0]], [{'op': 'mul', 'value': -1.0},
+                                             {'op': 'add', 'value': values[0] - sum(values[1:])}])
+        if operation == 3:      # average
+            return follow(plugs[driven[0]], [{'op': 'add', 'value': sum(values)},
+                                             {'op': 'mul', 'value': 1.0 / len(plugs)}])
+        return None, None, 'plusMinusAverage with no operation'
+
+    if kind == 'clamp':
+        channel = attribute[-1]
+        value_plug = '{}.input{}'.format(node, channel)
+        low, high = '{}.min{}'.format(node, channel), '{}.max{}'.format(node, channel)
+        if connected(low) or connected(high):
+            return None, None, 'clamp with driven limits'
+        return follow(value_plug, [{'op': 'clamp', 'min': float(cmds.getAttr(low)), 'max': float(cmds.getAttr(high))}])
+
+    if kind == 'setRange':
+        axis = attribute[-1]
+        limits = ['{}.{}{}'.format(node, name, axis) for name in ('oldMin', 'oldMax', 'min', 'max')]
+        if any(connected(pl) for pl in limits):
+            return None, None, 'setRange with driven limits'
+        old_min, old_max, new_min, new_max = (float(cmds.getAttr(pl)) for pl in limits)
+        return follow('{}.value{}'.format(node, axis),
+                      [{'op': 'remap', 'from': [old_min, old_max], 'to': [new_min, new_max]}])
+
+    if kind.startswith('animCurveU'):
+        times = cmds.keyframe(node, query=True, floatChange=True) or []
+        values = cmds.keyframe(node, query=True, valueChange=True) or []
+        if not times:
+            return None, None, 'driven-key curve without keys'
+        keys = [[float(t), float(v)] for t, v in sorted(zip(times, values))]
+        return follow(node + '.input', [{'op': 'curve', 'keys': keys}])
+
+    return None, None, '{} node not supported'.format(kind)
+
+
+# Registration, stored on the blendShape node like module tags on joints:
+# only registered blendshapes are exported, minus the targets left unticked.
+BLENDSHAPE_EXPORT_ATTR = 'rigTag_exportBlendshape'
+BLENDSHAPE_EXCLUDED_ATTR = 'rigTag_excludedTargets'
+_TRANSFORM_CHANNELS = tuple('{}{}'.format(k, a) for k in ('translate', 'rotate', 'scale') for a in 'XYZ')
+
+
+_blendshape_driver = _attribute_driver     # former name, kept for callers
+
+
+def blendshape_registered(blendshape):
+    plug = '{}.{}'.format(blendshape, BLENDSHAPE_EXPORT_ATTR)
+    return bool(cmds.objExists(plug) and cmds.getAttr(plug))
+
+
+def set_blendshape_registered(blendshape, registered):
+    if not cmds.attributeQuery(BLENDSHAPE_EXPORT_ATTR, node=blendshape, exists=True):
+        cmds.addAttr(blendshape, longName=BLENDSHAPE_EXPORT_ATTR, attributeType='bool')
+    cmds.setAttr('{}.{}'.format(blendshape, BLENDSHAPE_EXPORT_ATTR), bool(registered))
+
+
+def blendshape_excluded_targets(blendshape):
+    plug = '{}.{}'.format(blendshape, BLENDSHAPE_EXCLUDED_ATTR)
+    if not cmds.objExists(plug):
+        return []
+    return [t for t in (cmds.getAttr(plug) or '').split(',') if t]
+
+
+def set_blendshape_target_included(blendshape, target, included):
+    excluded = [t for t in blendshape_excluded_targets(blendshape) if t != target]
+    if not included:
+        excluded.append(target)
+    if not cmds.attributeQuery(BLENDSHAPE_EXCLUDED_ATTR, node=blendshape, exists=True):
+        cmds.addAttr(blendshape, longName=BLENDSHAPE_EXCLUDED_ATTR, dataType='string')
+    cmds.setAttr('{}.{}'.format(blendshape, BLENDSHAPE_EXCLUDED_ATTR), ','.join(excluded), type='string')
+
+
+def blendshapes_of(nodes):
+    """blendShape nodes on the given meshes/transforms (or the nodes themselves)."""
+    found = []
+    for node in nodes or []:
+        if cmds.nodeType(node) == 'blendShape':
+            candidates = [node]
+        else:
+            candidates = [h for h in (cmds.listHistory(node, pruneDagObjects=True) or [])
+                          if cmds.nodeType(h) == 'blendShape']
+        for candidate in candidates:
+            if candidate not in found:
+                found.append(candidate)
+    return found
+
+
+def describe_ops(ops):
+    """Readable form of a driver's maths, e.g. 'x 0.1' or '1 - x, clamp 0..1'."""
+    def num(v):
+        return '{:g}'.format(round(v, 6))
+    parts = []
+    for op in ops or []:
+        kind = op.get('op')
+        if kind == 'mul':
+            parts.append('x {}'.format(num(op['value'])))
+        elif kind == 'div':
+            parts.append('/ {}'.format(num(op['value'])))
+        elif kind == 'pow':
+            parts.append('^ {}'.format(num(op['value'])))
+        elif kind == 'add':
+            parts.append(('+ {}' if op['value'] >= 0 else '- {}').format(num(abs(op['value']))))
+        elif kind == 'reverse':
+            parts.append('1 - x')
+        elif kind == 'clamp':
+            parts.append('clamp {}..{}'.format(num(op['min']), num(op['max'])))
+        elif kind == 'remap':
+            parts.append('remap {}..{} -> {}..{}'.format(*[num(v) for v in op['from'] + op['to']]))
+        elif kind == 'curve':
+            parts.append('driven keys ({})'.format(len(op.get('keys') or [])))
+        elif kind == 'compare':
+            symbol = {'eq': '==', 'ne': '!=', 'gt': '>', 'ge': '>=', 'lt': '<', 'le': '<='}.get(op.get('test'), '?')
+            parts.append('{} if x {} {} else {}'.format(num(op['true']), symbol, num(op['value']), num(op['false'])))
+    return ', '.join(parts) if parts else 'direct'
+
+
+def _blendshape_target_record(blendshape, mesh, target):
+    plug = '{}.{}'.format(blendshape, target)
+    entry = {
+        'blendshape': blendshape,
+        'mesh': _short_node_name(mesh) if mesh else None,
+        'target': target,
+        'morph': target,          # FBX/Unreal morph target name
+        'rest_weight': round(float(cmds.getAttr(plug)), 6),
+        'driver': None,
+        'ops': [],
+    }
+    control, attribute, ops = _blendshape_driver(plug)
+    if control is not None:
+        entry['driver'] = {'control': control, 'attr': attribute}
+        entry['ops'] = ops
+    elif ops != 'not connected':
+        entry['unsupported'] = ops
+    return entry
+
+
+def _blendshape_status(entry, duplicate_morphs=()):
+    """(green/orange/red/gray, message) for one target, as the tool shows it."""
+    if entry.get('unsupported'):
+        return 'red', 'Maya wiring not supported: {}'.format(entry['unsupported'])
+    driver = entry.get('driver')
+    if not driver:
+        return 'gray', 'not driven (weight stays {:g})'.format(entry.get('rest_weight', 0.0))
+    control, attribute = driver['control'], driver['attr']
+    if not cmds.objExists(control):
+        return 'red', "driver '{}' no longer exists".format(control)
+    if attribute in _TRANSFORM_CHANNELS:
+        return 'orange', '{}.{} is a transform channel; Unreal only drives morphs from sliders for now'.format(
+            control, attribute)
+    if not _has_controller_shape(control):
+        return 'orange', "'{}' is not a controller: Unreal gets no slider for it".format(control)
+    if attribute not in [a['name'] for a in _controller_attributes(control)]:
+        return 'orange', "'{}.{}' is not a keyable slider: Unreal gets no slider for it".format(control, attribute)
+    if entry.get('morph') in duplicate_morphs:
+        return 'orange', "another registered target is also named '{}'; Unreal drives both together".format(
+            entry['morph'])
+    return 'green', 'slider {}.{} ({})'.format(control, attribute, describe_ops(entry.get('ops')))
+
+
+def blendshape_inventory():
+    """Every blendShape node in the scene with its targets, for the tool.
+
+    [{'blendshape', 'mesh', 'registered', 'targets': [record + 'included',
+    'status', 'message', 'maths']}], sorted by mesh then node.
+    """
+    items = []
+    for blendshape in cmds.ls(type='blendShape') or []:
+        geometry = cmds.blendShape(blendshape, query=True, geometry=True) or []
+        mesh = (cmds.listRelatives(geometry[0], parent=True) or [geometry[0]])[0] if geometry else None
+        excluded = set(blendshape_excluded_targets(blendshape))
+        targets = []
+        for target in cmds.listAttr(blendshape + '.w', multi=True) or []:
+            entry = _blendshape_target_record(blendshape, mesh, target)
+            entry['included'] = target not in excluded
+            targets.append(entry)
+        items.append({'blendshape': blendshape, 'mesh': _short_node_name(mesh) if mesh else '',
+                      'registered': blendshape_registered(blendshape), 'targets': targets})
+    exported = [t['morph'] for item in items if item['registered'] for t in item['targets'] if t['included']]
+    duplicates = {m for m in exported if exported.count(m) > 1}
+    for item in items:
+        for entry in item['targets']:
+            entry['status'], entry['message'] = _blendshape_status(
+                entry, duplicates if item['registered'] and entry['included'] else ())
+            entry['maths'] = describe_ops(entry.get('ops'))
+    items.sort(key=lambda i: (i['mesh'].lower(), i['blendshape'].lower()))
+    return items
+
+
+def _blendshape_records(only_registered=True):
+    """Manifest entries: one per exported blendshape target."""
+    records = []
+    for item in blendshape_inventory():
+        if only_registered and not item['registered']:
+            continue
+        for entry in item['targets']:
+            if only_registered and not entry['included']:
+                continue
+            records.append({k: v for k, v in entry.items() if k not in ('included', 'status', 'message', 'maths')})
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Materials
+#
+# Unreal's importer creates a material per Maya material, but its colour is
+# unreliable: a lambert's visible colour is color x diffuse (0.8 by default),
+# a standardSurface's is baseColor x base, and with colour management the
+# values are in Maya's rendering space (ACEScg by default in recent Maya),
+# not Unreal's linear sRGB. Each material is described here; the builder
+# makes a matching material instance and assigns it to the mesh slot of the
+# same name (rig_builder/materials.py).
+# ---------------------------------------------------------------------------
+
+_COLOR_ATTRIBUTES = (
+    # (shader types, colour attribute, weight attribute)
+    (('lambert', 'blinn', 'phong', 'phongE', 'anisotropic'), 'color', 'diffuse'),
+    (('standardSurface', 'aiStandardSurface', 'openPBRSurface'), 'baseColor', 'base'),
+    (('usdPreviewSurface',), 'diffuseColor', None),
+)
+
+
+# Colour-space conversions to Unreal's working space (linear Rec.709/sRGB
+# primaries). ACEScg (AP1) -> linear sRGB, Bradford-adapted D60 -> D65.
+_ACESCG_TO_LINEAR_SRGB = (
+    (1.70505, -0.62179, -0.08326),
+    (-0.13026, 1.14080, -0.01055),
+    (-0.02400, -0.12897, 1.15297),
+)
+_LINEAR_SRGB_NAMES = ('scene-linear rec.709-srgb', 'scene-linear rec 709/srgb', 'linear rec.709 (srgb)',
+                      'lin_rec709', 'linear srgb', 'utility - linear - srgb')
+
+
+def to_linear_srgb(color, space):
+    """(rgb in Unreal's linear sRGB, problem or None) from a Maya colour."""
+    name = str(space or '').strip().lower()
+    if name in ('acescg', 'aces - acescg', 'acescg (ap1)'):
+        rgb = [sum(row[i] * color[i] for i in range(3)) for row in _ACESCG_TO_LINEAR_SRGB]
+        return [round(max(0.0, c), 6) for c in rgb], None
+    if name in _LINEAR_SRGB_NAMES or 'rec.709' in name or 'rec 709' in name:
+        return [round(float(c), 6) for c in color], None
+    return [round(float(c), 6) for c in color], 'unknown rendering space "{}": colour copied as is'.format(space)
+
+
+def _color_space():
+    """Maya's rendering space when colour management is on, else linear sRGB."""
+    try:
+        if cmds.colorManagementPrefs(query=True, cmEnabled=True):
+            return str(cmds.colorManagementPrefs(query=True, renderingSpaceName=True) or 'scene-linear Rec.709-sRGB')
+    except Exception:
+        pass
+    return 'scene-linear Rec.709-sRGB'
+
+
+def material_records(meshes=None):
+    """[{name, type, color, weight, transparency, texture, color_space, meshes,
+    problems}] for every material assigned to an exported mesh."""
+    meshes = meshes if meshes is not None else collect_visible_mesh_transforms()
+    space = _color_space()
+    by_material = {}
+    for transform in meshes:
+        for shape in cmds.listRelatives(transform, shapes=True, fullPath=True, noIntermediate=True) or []:
+            for engine in set(cmds.listConnections(shape, type='shadingEngine') or []):
+                # Maya keeps an empty connection to a shading group whose faces
+                # were all reassigned: only real members count.
+                members = cmds.ls(cmds.sets(engine, query=True) or [], long=True, objectsOnly=True) or []
+                if shape not in members and transform not in members:
+                    continue
+                for material in cmds.listConnections(engine + '.surfaceShader', source=True, destination=False) or []:
+                    record = by_material.setdefault(material, {'name': _short_node_name(material).split(':')[-1],
+                                                               'meshes': []})
+                    mesh_name = _short_node_name(transform)
+                    if mesh_name not in record['meshes']:
+                        record['meshes'].append(mesh_name)
+    records = []
+    for material, record in sorted(by_material.items()):
+        kind = cmds.nodeType(material)
+        record.update({'type': kind, 'color_space': space, 'problems': []})
+        color_attr = weight_attr = None
+        for kinds, color_name, weight_name in _COLOR_ATTRIBUTES:
+            if kind in kinds:
+                color_attr, weight_attr = color_name, weight_name
+                break
+        if color_attr is None or not cmds.attributeQuery(color_attr, node=material, exists=True):
+            record['problems'].append('{} shader: no known colour attribute, Unreal keeps a grey material'.format(kind))
+            records.append(record)
+            continue
+        record['color'] = [round(float(c), 6) for c in cmds.getAttr('{}.{}'.format(material, color_attr))[0]]
+        record['weight'] = (round(float(cmds.getAttr('{}.{}'.format(material, weight_attr))), 6)
+                            if weight_attr and cmds.attributeQuery(weight_attr, node=material, exists=True) else 1.0)
+        effective = [c * record['weight'] for c in record['color']]
+        record['color_unreal'], problem = to_linear_srgb(effective, space)
+        if problem:
+            record['problems'].append(problem)
+        textures = cmds.listConnections('{}.{}'.format(material, color_attr), source=True, destination=False) or []
+        if textures:
+            record['texture'] = _short_node_name(textures[0])
+            path = None
+            if cmds.attributeQuery('fileTextureName', node=textures[0], exists=True):
+                path = cmds.getAttr(textures[0] + '.fileTextureName')
+            record['texture_path'] = path
+            record['problems'].append('colour comes from a texture ({}); only the flat colour is transferred yet'.format(
+                record['texture']))
+        if cmds.attributeQuery('transparency', node=material, exists=True):
+            transparency = cmds.getAttr(material + '.transparency')[0]
+            record['transparency'] = [round(float(c), 6) for c in transparency]
+            if any(c > 1e-3 for c in transparency):
+                record['problems'].append('transparency is not transferred yet (the material stays opaque)')
+        records.append(record)
+    return records
+
+
+def _settings_controls(modules_config):
+    """Controllers that belong to no module but whose sliders drive exported
+    things (driven offset groups, blendshapes): Unreal must build them so
+    the sliders exist (Murakami's Head_Settings_Ctrl)."""
+    module_controls = set()
+    drivers = set()
+    for bone_records in collect_bone_controller_manifest(modules_config).values():
+        for record in bone_records:
+            module_controls.add(record.get('name'))
+            for group in record.get('offset_stack') or []:
+                for channel in (group.get('driven') or {}).values():
+                    drivers.add(channel['control'])
+    for entry in _blendshape_records():
+        if entry.get('driver'):
+            drivers.add(entry['driver']['control'])
+    exported = [j for j in _exported_joints()]
+    records = []
+    for name in sorted(drivers - module_controls):
+        node = (cmds.ls(name, long=True) or [None])[0]
+        if not node or not _has_controller_shape(node) or not exported:
+            continue
+        snapshot = _snapshot_for_chain(node, 'settings', '', exported)
+        if snapshot:
+            records.append(snapshot)
+    return records
+
+
+def _rest_pose_unreal():
+    """{joint: {'t', 'q', 'bind_t', 'bind_q'}} for every exported joint
+    (Unreal axes, cm): the frame as the scene stands and the frame the skin
+    was bound in. Unreal's skeleton comes from the BIND pose, which can
+    differ from where the rig actually rests (Murakami's toes sit 1 cm above
+    where they were bound); the builder moves its bones by rest x bind^-1."""
+    import export_test_poses
+    import maya.api.OpenMaya as om
+
+    bind_pre = {}
+    for skin in cmds.ls(type='skinCluster') or []:
+        for index in cmds.getAttr(skin + '.matrix', multiIndices=True) or []:
+            sources = cmds.listConnections('{}.matrix[{}]'.format(skin, index), source=True,
+                                           destination=False) or []
+            sources = cmds.ls(sources, long=True) if sources else []
+            if sources and sources[0] not in bind_pre:
+                bind_pre[sources[0]] = om.MMatrix(cmds.getAttr('{}.bindPreMatrix[{}]'.format(skin, index)))
+
+    bind_world = {}
+
+    def bind_of(joint):
+        # Unskinned joints keep their local transform under a bound parent.
+        if joint not in bind_world:
+            if joint in bind_pre:
+                bind_world[joint] = bind_pre[joint].inverse()
+            else:
+                world = om.MMatrix(cmds.xform(joint, query=True, worldSpace=True, matrix=True))
+                parent = (cmds.listRelatives(joint, parent=True, fullPath=True, type='joint') or [None])[0]
+                if parent:
+                    parent_now = om.MMatrix(cmds.xform(parent, query=True, worldSpace=True, matrix=True))
+                    world = world * parent_now.inverse() * bind_of(parent)
+                bind_world[joint] = world
+        return bind_world[joint]
+
+    pose = {}
+    for joint in _exported_joints():
+        position, rotation = export_test_poses.world_state(joint)
+        bind_t, bind_q = export_test_poses.matrix_state(list(bind_of(joint)))
+        pose[_short_node_name(joint)] = {'t': position, 'q': rotation, 'bind_t': bind_t, 'bind_q': bind_q}
+    return pose
+
+
+def _is_module_joint(joint):
+    """True for joints a tagged module owns (rebuilt in Unreal)."""
+    try:
+        return bool(cmds.attributeQuery('rigTag_moduleName', node=joint, exists=True)
+                    and cmds.getAttr('{}.rigTag_moduleName'.format(joint)))
+    except Exception:
+        return False
+
+
 def _nearest_exported_joint(world_point):
-    best, best_distance = None, None
+    """Exported joint nearest to a point; module joints win ties (within 0.1
+    unit) over helper chains sitting at the same place -- a blended limb's
+    FK/IK duplicate joints are exported but not rebuilt, so a space following
+    one of them would never move in Unreal."""
+    ranked = []
     for joint in _exported_joints():
         position = _world_translation(joint)
-        distance = sum((position[i] - world_point[i]) ** 2 for i in range(3))
-        if best_distance is None or distance < best_distance:
-            best, best_distance = joint, distance
-    return _short_node_name(best) if best else None
+        distance = sum((position[i] - world_point[i]) ** 2 for i in range(3)) ** 0.5
+        ranked.append((distance, joint))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    nearest = ranked[0][0]
+    for distance, joint in ranked:
+        if distance > nearest + 0.1:
+            break
+        if _is_module_joint(joint):
+            return _short_node_name(joint)
+    return _short_node_name(ranked[0][1])
+
+
+def _target_point(node):
+    """Where a constraint target sits: a joint's position, else its pivot."""
+    if cmds.objectType(node, isAType='joint'):
+        return _world_translation(node)
+    return cmds.xform(node, query=True, worldSpace=True, rotatePivot=True)
 
 
 def _joint_local_unreal(world_point, joint):
@@ -1100,13 +1980,21 @@ def _query_transform_snapshot(node, role, module_name, driven_bone, anchor_bone,
     except Exception:
         rotate_order = None
 
-    parent_controllers, parent_space_bone = [], None
+    parent_controllers, parent_space_bone, parent_space_blend, space_note = [], None, None, None
     try:
         parent_controllers, parent_space_bone = _parent_space(node)
-    except Exception:
-        pass
+        if parent_space_bone:
+            parent_space_blend, space_note = describe_space(node)
+            if parent_space_blend is None:
+                space_note = '{}; Unreal follows the nearest joint ({}) instead'.format(
+                    space_note or 'space could not be described', parent_space_bone)
+    except Exception as exc:
+        space_note = 'space detection failed: {}'.format(exc)
 
     return dict(local_fields, **{
+        'parent_space_blend': parent_space_blend,
+        'parent_space_note': space_note,
+        'offset_stack': _safe_call(offset_stack, node),
         'name': _short_node_name(node),
         'dag_path': node,
         'node_type': cmds.nodeType(node),
@@ -1270,44 +2158,6 @@ def _joints_driven_by_constraint(joint, constraint_types):
     return list(set(result))
 
 
-def _constraint_targets(constraint):
-    """Return all target transform nodes driving *constraint*.
-    
-    Carefully guards both targetTranslate and targetRotate queries because
-    different constraint types expose different attributes:
-    - parentConstraint: has both targetTranslate and targetRotate
-    - orientConstraint: only targetRotate
-    - pointConstraint: only targetTranslate
-    - poleVectorConstraint: only targetTranslate
-    
-    Querying a missing attribute can raise RuntimeError/ValueError depending
-    on Maya version, so both are wrapped in try-except.
-    """
-    targets = []
-    indices = cmds.getAttr('{}.target'.format(constraint), multiIndices=True) or []
-    for idx in indices:
-        # Guard targetTranslate: not all constraints have this (e.g., orientConstraint).
-        try:
-            conns = cmds.listConnections(
-                '{}.target[{}].targetTranslate'.format(constraint, idx),
-                source=True, destination=False, plugs=False,
-            ) or []
-            targets.extend(conns)
-        except (ValueError, RuntimeError, AttributeError):
-            pass
-        
-        # Guard targetRotate: not all constraints have this (e.g., pointConstraint).
-        try:
-            conns2 = cmds.listConnections(
-                '{}.target[{}].targetRotate'.format(constraint, idx),
-                source=True, destination=False, plugs=False,
-            ) or []
-            targets.extend(conns2)
-        except (ValueError, RuntimeError, AttributeError):
-            pass
-    return list(set(targets))
-
-
 def _upstream_float_control_attr(node, attr):
     """
     Walk upstream connections from node.attr to find the first float/enum
@@ -1375,6 +2225,52 @@ def _constraint_drives_joint(constraint, joint):
             plug, source=False, destination=True, plugs=False
         ) or []
         if joint in conns:
+            return True
+    return False
+
+
+def _ik_end_joint(handle):
+    """The joint an ikHandle's end effector follows (the chain's end joint)."""
+    try:
+        effector = cmds.ikHandle(handle, query=True, endEffector=True)
+    except Exception:
+        return None
+    sources = cmds.listConnections('{}.translateX'.format(effector), source=True,
+                                   destination=False, type='joint') or []
+    return sources[0] if sources else None
+
+
+def root_local_blend(module):
+    """True when the limb's ROOT joint takes its values as LOCAL channels
+    (pairBlend / blendColors from separate IK and FK chains), so it rides on
+    its parent joint; False when a constraint places it in world space."""
+    chain = list(module.get('chain') or [])
+    if not chain or not cmds.objExists(chain[0]):
+        return False
+    for attribute in ('translate', 'rotate', 'translateX', 'rotateX'):
+        for source in cmds.listConnections('{}.{}'.format(chain[0], attribute), source=True,
+                                           destination=False, skipConversionNodes=True) or []:
+            kind = cmds.nodeType(source)
+            if kind in ('pairBlend', 'blendColors', 'blendTwoAttr', 'animBlendNodeAdditiveRotation'):
+                return True
+            if cmds.objectType(source, isAType='constraint'):
+                return False
+    return False
+
+
+def ik_end_orient(module):
+    """True when the IK chain's END joint is oriented by the rig (an orient or
+    parent constraint on it -- typically to the IK control), False when only
+    the solver sets it. An IK solver alone never rotates the end joint with
+    the IK control; Unreal must copy that behaviour, not assume either way.
+    """
+    ik_root = (module.get('params') or {}).get('ik_chain_root')
+    handle = _ik_handle_for_joint(ik_root) if ik_root and cmds.objExists(ik_root) else None
+    end = _ik_end_joint(handle) if handle else None
+    if not end:
+        return False
+    for kind in ('orientConstraint', 'parentConstraint'):
+        if cmds.listConnections(end, type=kind, source=True, destination=False):
             return True
     return False
 
@@ -2141,7 +3037,13 @@ def auto_discover_modules():
 # ---------------------------------------------------------------------------
 
 def collect_visible_mesh_transforms():
-    """Return transform nodes for every non-intermediate mesh in the scene."""
+    """Return transform nodes for every non-intermediate mesh in the scene.
+
+    Blendshape target meshes are kept on purpose: without them in the
+    export, the FBX keeps the blendshape but loses its target names
+    ('weight[0]' instead of 'Head_BS_Smile'), and Unreal names its morph
+    targets from those names (tests/maya_materials_test.py checks this).
+    """
     mesh_transforms = []
     # Full DAG paths throughout: short names are ambiguous when several nodes
     # share a name, and cmds.select() then fails with "More than one object
@@ -2570,6 +3472,20 @@ def _spline_cv_influences(curve_shape, cv_count):
     return [], []
 
 
+def _spline_stretches(spline):
+    """True when the spline curve's arc length drives anything (a stretch
+    network); a plain spline IK keeps its joint lengths."""
+    handle = (spline or {}).get('ik_handle')
+    try:
+        curve = cmds.ikHandle(handle, query=True, curve=True) if handle and cmds.objExists(handle) else None
+    except Exception:
+        curve = None
+    for info in (cmds.listConnections(curve, type='curveInfo') or []) if curve else []:
+        if cmds.listConnections('{}.arcLength'.format(info), source=False, destination=True):
+            return True
+    return False
+
+
 def _spline_ik_export(module):
     """Everything needed to rebuild a Maya spline IK's controls in Unreal.
 
@@ -2625,9 +3541,20 @@ def _spline_ik_export(module):
             holder = holders.get(controls[index])
             snapshot['ue_control_name'] = _short_node_name(holder or controls[index])
             snapshot['semantic_name'] = '{}_SplineCtrl{:02d}_CTRL'.format(module_name, rank)
+            holder_origin = None
+            if holder:
+                # The UE control stands for the holder, so it sits at the
+                # holder's own origin (the pivot the animator rotates about),
+                # not at the influence joint under it (chest_ctrl's sits 0.59
+                # cm away). The curve points are placed separately.
+                try:
+                    holder_origin, _source = _controller_origin_world(holder)
+                    snapshot['ue_control_origin'] = _point_offset_record(chain, holder_origin)
+                except Exception:
+                    holder_origin = None
             if holder and not snapshot.get('shape_id'):
                 try:
-                    origin, _source = _controller_origin_world(controls[index])
+                    origin = holder_origin or _controller_origin_world(controls[index])[0]
                     snapshot['shape_id'] = _register_controller_shape(holder, origin)
                     snapshot['attributes'] = _controller_attributes(holder)
                     snapshot['shape_source'] = _short_node_name(holder)
@@ -3013,9 +3940,19 @@ def _merge_scene_detected_module_data(module):
         if enriched.get('module_type') == 'IKFKSwitch':
             _verify_ikfk_roots(enriched)
             extra = _ikfk_switch_export(enriched)
+            extra['ik_end_orient'] = ik_end_orient(enriched)
+            extra['root_local_blend'] = root_local_blend(enriched)
         elif enriched.get('module_type') == 'SplineIK':
             spline = _spline_ik_export(enriched)
             extra = {'spline': spline} if spline else {}
+            # Maya's spline IK keeps joint lengths unless a curveInfo network
+            # drives the joints; record which, so Unreal does the same.
+            extra['stretch_enabled'] = _spline_stretches(spline)
+            # Constraints layered on the spline chain (e.g. the top joint
+            # orient-constrained to the chest control) are part of its behaviour.
+            constraints = _bone_constraints_export(enriched)
+            if constraints:
+                extra['constraints'] = constraints
         elif enriched.get('module_type') == 'FKChain':
             constraints = _bone_constraints_export(enriched)
             extra = {'constraints': constraints} if constraints else {}
@@ -3126,6 +4063,10 @@ def build_manifest(rig_name, modules_config):
         # degrees. Source units are kept for reference only.
         "units": {"linear": "cm", "angular": "deg"},
         "coordinate_system": _coordinate_system_manifest(),
+        "rest_pose": _safe_call(_rest_pose_unreal),
+        "settings_controls": _safe_call(_settings_controls, modules_config),
+        "materials": _safe_call(material_records),
+        "blendshapes": _safe_call(_blendshape_records),
         "module_build_order": list(graph.get("build_order", [])),
         "module_graph": {
             "valid": graph.get("valid", True),
@@ -3325,6 +4266,317 @@ def _manifest_schema_module():
     return importlib.reload(manifest_schema)
 
 
+# ---------------------------------------------------------------------------
+# Scene analysis for the Rig Tagger (no file is written)
+# ---------------------------------------------------------------------------
+
+_NETWORK_MAX_DEPTH = 12
+REST_POSE_REPORT_CM = 0.01
+REST_POSE_REPORT_DEG = 0.05
+
+
+def _transforms_driven_by(plug):
+    """Transforms whose translate/rotate/scale ``plug`` reaches through nodes.
+
+    Stops at blendShape nodes (exported separately) and at other transforms
+    (their own children are a different hierarchy, not a network).
+    """
+    hits, seen = set(), set()
+    pending = [(plug, 0)]
+    while pending:
+        current, depth = pending.pop()
+        for target in cmds.listConnections(current, source=False, destination=True, plugs=True,
+                                           skipConversionNodes=True) or []:
+            if target in seen or depth > _NETWORK_MAX_DEPTH:
+                continue
+            seen.add(target)
+            node, attribute = target.split('.', 1)
+            if cmds.objectType(node, isAType='transform'):
+                if attribute.startswith(('translate', 'rotate', 'scale')):
+                    hits.add(_short_node_name(node))
+                continue
+            if cmds.nodeType(node) == 'blendShape':
+                continue
+            outputs = cmds.listConnections(node, source=False, destination=True, plugs=True,
+                                           connections=True, skipConversionNodes=True) or []
+            pending.extend((out, depth + 1) for out in outputs[0::2])
+    return sorted(hits)
+
+
+def _controller_summary(record):
+    """What the tool shows for one controller record."""
+    blend = record.get('parent_space_blend') or {}
+    names = [t.get('controller') or t.get('bone') or 'world' for t in blend.get('targets') or []]
+    switch = blend.get('switch') or {}
+    if switch.get('labels'):
+        follows = '{} space switch on {}.{}: {}'.format(blend.get('kind', 'parent'), switch['control'], switch['attr'],
+                                                      ' / '.join(switch['labels']))
+    elif blend.get('targets'):
+        follows = '{} blend of {}'.format(blend.get('kind', 'parent'), ', '.join(names))
+    elif record.get('parent_space_bone'):
+        follows = 'follows bone {}{}'.format(record['parent_space_bone'],
+                                             ' (fallback)' if record.get('parent_space_note') else '')
+    elif record.get('parent_controllers'):
+        follows = 'under {}'.format(record['parent_controllers'][0])
+    else:
+        follows = 'world'
+    groups = []
+    for group in record.get('offset_stack') or []:
+        if group.get('kind') == 'driven' and group.get('driven'):
+            groups.append('{} driven ({})'.format(group['name'], ', '.join(
+                '{} <- {}.{} {}'.format(c, d['control'], d['attr'], describe_ops(d.get('ops')))
+                for c, d in group['driven'].items())))
+        else:
+            groups.append('{} ({})'.format(group.get('name'), group.get('kind')))
+    if groups:
+        follows += '; groups: ' + ' > '.join(groups)
+    return {
+        'name': record.get('ue_control_name') or record.get('name'),
+        'role': record.get('role') or '',
+        'driven_bone': record.get('driven_bone') or record.get('anchor_bone') or '',
+        'pivot': record.get('origin_source') or '',
+        'follows': follows,
+        'channels': [a.get('name') for a in record.get('attributes') or [] if a.get('name')],
+        'shape': 'exported' if record.get('shape_id') else 'default shape',
+    }
+
+
+def _weight_text(weight):
+    if 'attr' in (weight or {}):
+        plug = '{}.{}'.format(weight.get('control'), weight.get('attr'))
+        if weight.get('ops'):
+            return '{} ({})'.format(plug, describe_ops(weight['ops']))
+        return '1 - {}'.format(plug) if weight.get('invert') else plug
+    return '{:g}'.format(float((weight or {}).get('value', 1.0)))
+
+
+def _module_setup(module, records):
+    """[(label, value, status)] describing how a module is rigged in Maya."""
+    rows = []
+    params = module.get('params') or {}
+    kind = module.get('module_type')
+    mine = [r for r in records if r.get('module_name') == module.get('module_name')]
+
+    def first(roles):
+        return next((r.get('ue_control_name') or r.get('name') for r in mine if r.get('role') in roles), None)
+
+    if kind == 'IKFKSwitch':
+        switch = params.get('switch') or {}
+        control = switch.get('control') or {}
+        control_name = control.get('name') if isinstance(control, dict) else control
+        if switch.get('attribute'):
+            rows.append(('IK/FK switch', '{}.{}  (IK = {:g}, FK = {:g})'.format(
+                control_name, switch['attribute'], float(switch.get('ik_value', 0)),
+                float(switch.get('fk_value', 1))), 'green'))
+        else:
+            rows.append(('IK/FK switch', 'not found: Unreal uses a fixed blend', 'orange'))
+        rows.append(('Chains', 'IK root {}  /  FK root {}'.format(
+            _short_node_name(params.get('ik_chain_root') or '?'), _short_node_name(params.get('fk_chain_root') or '?')),
+            'green'))
+        if params.get('blend_node_type'):
+            rows.append(('Blend', '{} ({})'.format(params['blend_node_type'], params.get('blend_node', '')), 'green'))
+        effector, pole = first(('ik_effector', 'effector')), first(('pole_vector', 'pv'))
+        rows.append(('IK control', effector or 'not found', 'green' if effector else 'orange'))
+        rows.append(('Pole vector', pole or 'not found', 'green' if pole else 'orange'))
+        rows.append(('End joint in IK', 'follows the IK control' if params.get('ik_end_orient')
+                     else 'keeps its own rotation (does not follow the IK control)', 'gray'))
+        rows.append(('Root joint', 'rides on its parent joint (chains blended locally)' if params.get('root_local_blend')
+                     else 'placed in world space by a constraint', 'gray'))
+
+    if kind == 'SplineIK':
+        spline = params.get('spline') or {}
+        controls = [c.get('ue_control_name') or c.get('name') for c in spline.get('controls') or []]
+        rows.append(('Spline IK', 'handle {}, curve {} (degree {}, {} points)'.format(
+            spline.get('ik_handle', '?'), spline.get('curve', '?'), spline.get('degree', '?'),
+            spline.get('cv_count', len(spline.get('cvs') or []))), 'green' if controls else 'red'))
+        rows.append(('Controls', ', '.join(controls) or 'none found', 'green' if controls else 'red'))
+        for index, cv in enumerate(spline.get('cvs') or []):
+            weights = cv.get('weights') or []
+            parts = ['{} {:.0f}%'.format(controls[i] if i < len(controls) else i, w * 100)
+                     for i, w in enumerate(weights) if w >= 0.005]
+            rows.append(('Curve point {}'.format(index), ' / '.join(parts) or 'no weight', 'green' if parts else 'red'))
+        rows.append(('Stretch', 'yes (bones stretch along the curve)' if params.get('stretch_enabled')
+                     else 'no (bones keep their length)', 'gray'))
+
+    for constraint in params.get('constraints') or []:
+        targets = []
+        for target in constraint.get('targets') or []:
+            name = (target.get('controller') or {}).get('name', '?')
+            sub = (target.get('target') or {}).get('name')
+            targets.append('{} (via {})'.format(name, sub) if sub else name)
+        rows.append(('Constraint', '{}: {} -> {}'.format(
+            _short_node_name(constraint.get('bone', '?')), constraint.get('type', '?'), ', '.join(targets)), 'green'))
+
+    for record in mine:
+        if record.get('parent_space_note'):
+            rows.append(('Parent space', '{}: {}'.format(record.get('ue_control_name') or record.get('name'),
+                                                         record['parent_space_note']), 'orange'))
+        blend = record.get('parent_space_blend') or {}
+        if not blend.get('targets'):
+            continue
+        name = record.get('ue_control_name') or record.get('name')
+        switch = blend.get('switch') or {}
+        labels = switch.get('labels') or []
+        rows.append(('Space switch' if labels else 'Parent space', '{}: {} space, {}'.format(
+            name, blend.get('kind', 'parent'), ', '.join(
+                '{}{} (weight {})'.format('{} = '.format(labels[i]) if i < len(labels) else '',
+                                          t.get('controller') or t.get('bone') or 'world', _weight_text(t.get('weight')))
+                for i, t in enumerate(blend['targets']))), 'green'))
+        rest = (blend.get('rest') or {}).get('position')
+        for target in blend['targets']:
+            solo = (target.get('solo') or {}).get('position')
+            if rest and solo:
+                shift = math.sqrt(sum((a - b) ** 2 for a, b in zip(rest, solo)))
+                if shift > 0.01:
+                    rows.append(('Per-target offset', '{} moves {:.3f} cm when only {} drives it '
+                                 '(Maya keeps one offset per target; Unreal reproduces it)'.format(
+                                     name, shift, target.get('controller')), 'gray'))
+    return rows
+
+
+def scene_analysis(rig_name, modules_config):
+    """Controllers per module and pre-export checks, from an in-memory manifest.
+
+    Returns {'controllers': {module: [summary]}, 'checks': [{'status',
+    'category', 'subject', 'message'}], 'manifest': manifest}. Statuses:
+    red (export would fail or be wrong), orange (review), gray (information).
+    """
+    import export_test_poses
+
+    manifest = build_manifest(rig_name, modules_config)
+    checks = []
+
+    def check(status, category, subject, message):
+        checks.append({'status': status, 'category': category, 'subject': subject, 'message': message})
+
+    # Controllers per module (bone drivers, IK/FK controls, spline controls).
+    controllers = {}
+    seen = set()
+    records = [r for recs in (manifest.get('bone_controllers') or {}).values() for r in recs]
+    for module in manifest.get('modules') or []:
+        spline = (module.get('params') or {}).get('spline') or {}
+        for record in spline.get('controls') or []:
+            records.append(dict(record, module_name=module.get('module_name')))
+    for record in records:
+        summary = _controller_summary(record)
+        key = (record.get('module_name'), summary['name'])
+        if key in seen:
+            continue
+        seen.add(key)
+        controllers.setdefault(record.get('module_name') or '', []).append(summary)
+        node = (cmds.ls(record.get('shape_source') or record.get('name') or '', long=True) or [None])[0]
+        # Pole vectors get Unreal's stock sphere on purpose.
+        if summary['shape'] == 'default shape' and node and _has_controller_shape(node)                 and summary['role'] not in ('pole_vector', 'pv'):
+            check('orange', 'Controller shape', summary['name'],
+                  'curve shape could not be exported; Unreal will use a default shape')
+
+    # Spaces that could not be described (Unreal falls back to a bone).
+    noted = set()
+    for record in records:
+        note = record.get('parent_space_note')
+        name = record.get('ue_control_name') or record.get('name')
+        if note and name not in noted:
+            noted.add(name)
+            check('orange', 'Space switch', name, note)
+
+    # Joints of FK chains with no controller found.
+    driven = {r.get('driven_bone') for r in records}
+    for module in manifest.get('modules') or []:
+        if module.get('module_type') != 'FKChain' or (module.get('params') or {}).get('constraints'):
+            continue
+        for bone in module.get('chain') or []:
+            if _short_node_name(bone) not in driven:
+                check('orange', 'Missing controller', _short_node_name(bone),
+                      "no controller drives this joint in module '{}'; Unreal creates a default control"
+                      .format(module.get('module_name')))
+
+    # Manifest validation (the same check the export runs).
+    try:
+        errors, warnings = _manifest_schema_module().validate_manifest(manifest)
+    except Exception as exc:
+        errors, warnings = ['validation could not run: {}'.format(exc)], []
+    for error in errors:
+        check('red', 'Manifest', 'schema', error)
+    for warning in warnings:
+        check('orange', 'Manifest', 'schema', warning)
+
+    # Bind pose vs rest pose (handled by the builder, reported for awareness).
+    moved = []
+    for name, state in (manifest.get('rest_pose') or {}).items():
+        if not state.get('bind_t'):
+            continue
+        distance = math.sqrt(sum((a - b) ** 2 for a, b in zip(state['t'], state['bind_t'])))
+        dot = min(1.0, abs(sum(a * b for a, b in zip(state['q'], state['bind_q']))))
+        angle = math.degrees(2.0 * math.acos(dot))
+        if distance > REST_POSE_REPORT_CM or angle > REST_POSE_REPORT_DEG:
+            moved.append((distance, angle, name))
+    if moved:
+        moved.sort(reverse=True)
+        check('gray', 'Rest pose', '{} joint(s)'.format(len(moved)),
+              'rest pose differs from the skin bind pose (largest: {} {:.4f} cm / {:.3f} deg); '
+              'Unreal starts these bones from the Maya rest pose automatically'.format(
+                  moved[0][2], moved[0][0], moved[0][1]))
+
+    # Controller sliders that move transforms through a node network.
+    switches = {(sw['control'], sw['attribute']) for sw in export_test_poses.switches(manifest)}
+    # Sliders driving offset groups are transferred (driven groups), as are
+    # constraint (space) weights; only what drives nothing exported is flagged.
+    group_drivers = set()
+    for record in records + list(manifest.get('settings_controls') or []):
+        for group in record.get('offset_stack') or []:
+            for driver in (group.get('driven') or {}).values():
+                group_drivers.add((driver['control'], driver['attr']))
+            for problem in group.get('problems') or []:
+                check('orange', 'Offset group', '{} ({})'.format(group['name'], record.get('name')), problem)
+        for target in (record.get('parent_space_blend') or {}).get('targets') or []:
+            weight = target.get('weight') or {}
+            if 'attr' in weight:
+                group_drivers.add((weight['control'], weight['attr']))
+    morph_drivers = {(e['driver']['control'], e['driver']['attr'])
+                     for e in manifest.get('blendshapes') or [] if e.get('driver')}
+    # Every controller in the scene, not only module ones: a settings control
+    # (Head_Settings_Ctrl) often belongs to no module.
+    scene_controllers = sorted({n for n in cmds.ls(type='transform', long=True) or [] if _has_controller_shape(n)})
+    for node in scene_controllers:
+        name = _short_node_name(node)
+        for attribute in _controller_attributes(node):
+            attr = attribute.get('name')
+            if not attr or (name, attr) in switches or (name, attr) in morph_drivers or (name, attr) in group_drivers:
+                continue
+            reached = _transforms_driven_by('{}.{}'.format(node, attr))
+            if reached:
+                check('orange', 'Not transferred', '{}.{}'.format(name, attr),
+                      'moves {} transform(s) ({}{}) through a node network; not transferred to Unreal yet'
+                      .format(len(reached), ', '.join(reached[:4]), ', ...' if len(reached) > 4 else ''))
+
+    # Materials.
+    materials = manifest.get('materials') or []
+    if materials:
+        check('gray', 'Materials', '{} material(s)'.format(len(materials)),
+              'transferred as flat colours ({}): {}'.format(
+                  materials[0].get('color_space', '?'), ', '.join(m['name'] for m in materials)))
+    for material in materials:
+        for problem in material.get('problems') or []:
+            check('orange', 'Materials', material['name'], problem)
+
+    # Blendshapes.
+    for item in blendshape_inventory():
+        if not item['registered']:
+            check('gray', 'Blendshapes', item['blendshape'],
+                  'not registered: its {} target(s) will not be exported'.format(len(item['targets'])))
+            continue
+        for target in item['targets']:
+            if target['included'] and target['status'] in ('red', 'orange'):
+                check(target['status'], 'Blendshapes', '{}.{}'.format(item['blendshape'], target['target']),
+                      target['message'])
+
+    setup = {module.get('module_name'): _module_setup(module, records) for module in manifest.get('modules') or []}
+
+    order = {'red': 0, 'orange': 1, 'gray': 2}
+    checks.sort(key=lambda c: (order.get(c['status'], 3), c['category'], c['subject']))
+    return {'controllers': controllers, 'setup': setup, 'checks': checks, 'manifest': manifest}
+
+
 def validate_manifest_or_raise(manifest):
     """Validate against schema/kotsudo_manifest.schema.json before anything is written."""
     errors, warnings = _manifest_schema_module().validate_manifest(manifest)
@@ -3465,6 +4717,10 @@ def export_fbx(fbx_path, export_nodes):
 # Main entry point
 # ---------------------------------------------------------------------------
 
+# What the last export() wrote, for the tool's "Export Complete" message.
+LAST_EXPORT_SUMMARY = {}
+
+
 def export(export_dir, filename_base, rig_name, modules_config):
     """
     Full export pipeline:
@@ -3552,9 +4808,23 @@ def export(export_dir, filename_base, rig_name, modules_config):
 
     # Controller shapes travel as mesh-only FBXs (tube meshes built from the
     # Maya curves). A failure here must not lose the rig export.
+    LAST_EXPORT_SUMMARY.clear()
+    LAST_EXPORT_SUMMARY.update({
+        'fbx': fbx_path,
+        'modules': len(manifest.get('modules') or []),
+        'blendshapes': len(manifest.get('blendshapes') or []),
+        'shapes_expected': len(_SHAPE_RAW),
+        'shapes_exported': 0,
+        'shapes_failed': [],
+        'poses': None,
+    })
     if _SHAPE_RAW:
         try:
-            export_control_shapes_fbx(shapes_dir)
+            exported_shapes = export_control_shapes_fbx(shapes_dir) or []
+            LAST_EXPORT_SUMMARY['shapes_exported'] = len(exported_shapes)
+            LAST_EXPORT_SUMMARY['shapes_failed'] = sorted(
+                set(_SHAPE_RAW) - {os.path.splitext(os.path.basename(str(x)))[0].replace(SHAPE_MESH_PREFIX, '')
+                                   for x in exported_shapes})
         except Exception as exc:
             print("[RigManifest] Shapes FBX export failed ({}). The rig FBX is unaffected; "
                   "Unreal will use built-in shapes.".format(exc))
@@ -3567,11 +4837,25 @@ def export(export_dir, filename_base, rig_name, modules_config):
         here = os.path.dirname(os.path.abspath(__file__))
         if here not in sys.path:
             sys.path.insert(0, here)
+        # Python caches each folder's file list: a module file added after
+        # Maya started is invisible to import until the cache is dropped.
+        importlib.invalidate_caches()
         import export_test_poses
         importlib.reload(export_test_poses)
-        export_test_poses.export_test_poses(
+        poses_path = export_test_poses.export_test_poses(
             os.path.join(export_dir, manifest["poses_file"]), manifest
         )
+        with open(poses_path) as handle:
+            poses_document = json.load(handle)
+        poses = poses_document.get("poses") or []
+        LAST_EXPORT_SUMMARY['poses'] = {
+            'count': max(0, len(poses) - 1),
+            'still': sum(1 for pose in poses[1:]
+                         if (pose.get('maya_motion') or {}).get('cm', 1) < 1e-3
+                         and (pose.get('maya_motion') or {}).get('deg', 1) < 1e-3
+                         and not any((pose.get('blendshapes') or {}).values())),
+            'switches': len(poses_document.get('switches') or []),
+        }
     except Exception as exc:
         import traceback
         traceback.print_exc()
