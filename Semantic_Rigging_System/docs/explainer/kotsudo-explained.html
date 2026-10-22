@@ -4,6 +4,7 @@
   Maintenance memo (for Claude and anyone editing this page)
   - Source of truth: docs/explainer/kotsudo-explained.html in the repo. It is also published as a claude.ai artifact.
   - When a feature changes, update its section here in the same change, then republish.
+  - Section order: idea, pipeline, modules (IK/FK, spline, constraints, rest), drivers and extras, checking and tools.
   - Every feature keeps the same five parts: What it is in Maya / The challenges / How we solved it
     (each solution with a visual beside it) / How we know it works / Limits.
   - Colour code used by every figure: teal = Maya side, amber = Unreal side, red = a problem or an old behaviour.
@@ -61,7 +62,8 @@ body {
 /* index */
 nav.index { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 24px); align-self: start; font-size: 14px; }
 nav.index h2 { font: 700 12px/1 var(--body); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
-nav.index ol { list-style: none; margin: 0 0 24px; padding: 0; display: grid; gap: 2px; }
+nav.index ol { list-style: none; margin: 0 0 22px; padding: 0; display: grid; gap: 2px; }
+nav.index { max-height: calc(100vh - 48px); overflow-y: auto; }
 nav.index a { display: block; padding: 5px 10px; border-radius: var(--radius); color: var(--fg); text-decoration: none; border-left: 2px solid transparent; }
 nav.index a:hover { background: var(--sunk); }
 nav.index a.on { border-left-color: var(--ue); background: var(--surface); }
@@ -70,8 +72,7 @@ nav.index li.soon { padding: 4px 10px; color: var(--muted); }
   nav.index { position: static; }
   nav.index ol { display: flex; flex-wrap: wrap; gap: 6px; }
   nav.index a { border: 1px solid var(--line); border-left-width: 1px; }
-  nav.index .soon-list { display: none; }
-  nav.index .soon-title { display: none; }
+  nav.index { max-height: none; }
 }
 
 main { min-width: 0; }
@@ -225,23 +226,29 @@ section[id] { scroll-margin-top: 16px; }
   <h2>Features</h2>
   <ol id="toc">
     <li><a href="#idea">The idea behind it all</a></li>
+    <li><a href="#pipeline">Pipeline and manifest</a></li>
+  </ol>
+  <h2>Modules</h2>
+  <ol>
+    <li><a href="#ikfk">IK/FK limbs</a></li>
+    <li><a href="#spline-ik">Spline IK</a></li>
+    <li><a href="#constraints">Constraints and follow spaces</a></li>
+    <li><a href="#rest-correction">Rest correction</a></li>
+  </ol>
+  <h2>Drivers and extras</h2>
+  <ol>
+    <li><a href="#custom-attributes">Custom attributes</a></li>
+    <li><a href="#blendshapes">Blendshapes</a></li>
     <li><a href="#space-switching">Space switching</a></li>
     <li><a href="#offset-groups">Offset / zero groups</a></li>
     <li><a href="#materials">Materials</a></li>
-    <li><a href="#custom-attributes">Custom attributes</a></li>
-    <li><a href="#unreal-todo">Not yet run in Unreal</a></li>
   </ol>
-  <h2 class="soon-title">Coming next</h2>
-  <ol class="soon-list">
-    <li class="soon">Pipeline and manifest</li>
-    <li class="soon">IK/FK limbs</li>
-    <li class="soon">Spline IK</li>
-    <li class="soon">Constraints</li>
-    <li class="soon">Rest correction</li>
-    <li class="soon">Blendshapes</li>
-    <li class="soon">Pose check</li>
-    <li class="soon">Graph layout</li>
-    <li class="soon">Tagger tool and Checks</li>
+  <h2>Checking and tools</h2>
+  <ol>
+    <li><a href="#pose-check">Pose check</a></li>
+    <li><a href="#graph-layout">Graph layout</a></li>
+    <li><a href="#tagger-tool">Tagger tool and Checks</a></li>
+    <li><a href="#unreal-todo">Not yet run in Unreal</a></li>
   </ol>
 </nav>
 
@@ -249,7 +256,7 @@ section[id] { scroll-margin-top: 16px; }
 <header class="top">
   <h1>Kotsudo Explained</h1>
   <p>How the Maya → Unreal Engine 5.6 rigging pipeline rebuilds each rig feature: the logic, the problems we hit, and how we solved them. Test character: Murakami.</p>
-  <p>Every feature follows the same five parts: what it is in Maya, the challenges, how we solved it (with a visual beside each solution), how we know it works, and its limits.</p>
+  <p>Every feature follows the same five parts: what it is in Maya, the challenges, how we solved it (with a visual beside each solution), how we know it works, and its limits. Sliders and buttons in the figures are live: try them.</p>
   <div class="legend" aria-label="Colour code used in every figure">
     <span><i class="sw m"></i>Maya side</span>
     <span><i class="sw u"></i>Unreal side</span>
@@ -315,6 +322,857 @@ section[id] { scroll-margin-top: 16px; }
     <div class="chain" id="wk-chain" aria-live="polite"></div>
     <figcaption>Each box is one operation the walker wrote down. Unreal builds exactly these steps with float nodes, so the target gets the same value as in Maya for every slider position.</figcaption>
   </figure>
+</section>
+
+<!-- ============================================================ PIPELINE -->
+<section class="feature" id="pipeline">
+  <h2>Pipeline and manifest</h2>
+  <p class="lead">How a Maya rig travels to Unreal: one FBX carries the skeleton, the mesh and a description of the rig, and Unreal rebuilds the rig from that description.</p>
+  <div class="status"><span class="pill ok">Maya: tested</span><span class="pill ok">Unreal: in use (21/21 modules within T1)</span></div>
+
+  <h3>What it is in Maya</h3>
+  <p>The artist tags joint chains as <b>modules</b> with the tagger tool (an arm, a spine, a petal). A module is one rig setup on one joint chain. There are four module types:</p>
+  <div class="scroll">
+  <table class="t" style="max-width:760px">
+    <thead><tr><th>Type</th><th>What it is</th><th>Murakami modules</th></tr></thead>
+    <tbody>
+      <tr><td><code>FKChain</code></td><td>one controller per joint</td><td>Neck, L_LegLeafToe, 2 eyes, 12 petals</td></tr>
+      <tr><td><code>IKFKSwitch</code></td><td>3-joint limb with IK, FK and a switch</td><td>L/R arm, L/R leg</td></tr>
+      <tr><td><code>SplineIK</code></td><td>joints following a curve</td><td>Spine</td></tr>
+      <tr><td><code>IKLimb</code></td><td>IK only, any length</td><td class="muted">none</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Murakami has 21 modules. The export button writes three things: the FBX (skeleton and mesh) with the rig description inside it, one small FBX per controller shape, and a file of test poses.</p>
+
+  <h3>The challenges</h3>
+  <ol class="challenges">
+    <li><b>An FBX only carries joints, meshes and skin.</b> Controllers, constraints, IK handles and sliders don't survive the trip.</li>
+    <li><b>Maya and Unreal disagree on axes and units.</b> Maya is Y-up and right-handed; Unreal is Z-up, left-handed and in centimetres. Murakami's scene is in metres.</li>
+    <li><b>Maya's own commands mix units.</b> <code>xform -matrix</code> always answers in centimetres, but translation and pivot queries answer in scene units (metres here). Mixing them made some offsets 100× wrong.</li>
+    <li><b>A controller doesn't have to sit on its bone.</b> Petals and the chest rotate around custom pivots away from the joint.</li>
+    <li><b>Control Rig can't draw a Maya curve.</b> Controller shapes are NURBS curves in Maya; Control Rig draws meshes.</li>
+  </ol>
+
+  <h3>How we solved it</h3>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 1</span>
+      <h4>A manifest travels inside the FBX</h4>
+      <p>The exporter writes a JSON description of the rig, the <b>manifest</b>, into an attribute on the root joint (<code>rig_manifest_json</code>). The FBX carries that attribute as metadata, so one file holds everything. In Unreal, <code>run_rig_builder.py</code> reads it back from the mesh metadata.</p>
+      <p>Click a part of the manifest to see what it holds.</p>
+    </div>
+    <figure>
+      <div class="controls" style="margin:0 0 10px" id="mf-pick"></div>
+      <div class="stage" id="mf-detail" style="grid-template-columns:110px minmax(0,1fr)"></div>
+      <figcaption>Main parts of the manifest. All positions are already in Unreal axes and centimetres, so the Unreal side never has to know Maya's conventions.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 2</span>
+      <h4>Convert once, on the Maya side</h4>
+      <p>Every position and direction is converted before it is written:</p>
+      <ul>
+        <li>a Maya vector (X, Y, Z) becomes (X, Z, Y) in Unreal;</li>
+        <li>rotations get the same swap, exactly as the FBX importer converts joints;</li>
+        <li>lengths are converted to centimetres using the scene's unit.</li>
+      </ul>
+      <p>The unit mix-up got its own guard: the manifest's schema check refuses a file where the two encodings of a controller offset disagree in length. A unit error can no longer move a control silently.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 180" role="img" aria-label="Maya's xform matrix answers in centimetres and its translation query in metres; mixing them gives a 100 times error; now both are converted to centimetres and the schema check compares the two offset encodings.">
+        <rect class="bm" x="0" y="14" width="150" height="40" rx="5"/><text x="75" y="31" text-anchor="middle" class="c">xform -matrix</text><text x="75" y="46" text-anchor="middle" class="s">always cm</text>
+        <rect class="bm" x="0" y="70" width="150" height="40" rx="5"/><text x="75" y="87" text-anchor="middle" class="c">xform -translation</text><text x="75" y="102" text-anchor="middle" class="s">scene units (m)</text>
+        <rect class="bw" x="200" y="14" width="140" height="40" rx="5"/><text x="270" y="31" text-anchor="middle" class="wt">mixed directly</text><text x="270" y="46" text-anchor="middle" class="s">offset 100× wrong</text>
+        <rect class="bo" x="200" y="70" width="140" height="40" rx="5"/><text x="270" y="87" text-anchor="middle" class="ot">both → cm first</text><text x="270" y="102" text-anchor="middle" class="s">× unit scale</text>
+        <path class="lw" d="M150,34 H197" marker-end="url(#arr-w)"/>
+        <path class="ln" d="M150,90 H197" marker-end="url(#arr)"/>
+        <rect class="bx" x="380" y="70" width="140" height="40" rx="5"/><text x="450" y="87" text-anchor="middle">schema check</text><text x="450" y="102" text-anchor="middle" class="s">offsets must agree</text>
+        <line class="ln" x1="340" y1="90" x2="377" y2="90" marker-end="url(#arr)"/>
+        <text x="260" y="150" text-anchor="middle" class="s">A manifest that fails the check is refused, with the controller named,</text>
+        <text x="260" y="166" text-anchor="middle" class="s">instead of building a rig with a control in the wrong place.</text>
+      </svg>
+      <figcaption>The Unreal side only ever sees Unreal axes and centimetres.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 3</span>
+      <h4>Controls sit at the Maya pivot; a hidden null sits on the bone</h4>
+      <p>Each controller record stores its <b>origin</b>: the rotate pivot, the point the animator rotates around. Unreal creates the control there. When that isn't on the bone, a hidden <b>driver null</b> (<code>&lt;control&gt;_Drv</code>) is parented under the control and placed exactly on the bone. The rig reads the null, so the bone follows the control with a fixed offset.</p>
+      <p>Rotate the petal control: the bone turns around the control's pivot, as in Maya.</p>
+    </div>
+    <figure>
+      <svg class="d" id="dn-svg" viewBox="0 0 520 220" role="img" aria-label="Interactive: a control at its Maya pivot with a driver null placed on the bone; rotating the control swings the bone around the pivot.">
+        <circle cx="150" cy="150" r="5" class="dot-f"/>
+        <text x="150" y="172" text-anchor="middle" class="s">pivot (Maya origin)</text>
+        <circle id="dn-ring" cx="150" cy="150" r="34" class="lu" style="stroke-width:2.5"/>
+        <line id="dn-arm" x1="150" y1="150" x2="300" y2="90" class="lg"/>
+        <rect id="dn-null" x="294" y="84" width="12" height="12" class="bx"/>
+        <line id="dn-bone" x1="300" y1="90" x2="380" y2="58" class="ln" style="stroke-width:5;stroke-linecap:round"/>
+        <text id="dn-null-t" x="300" y="116" text-anchor="middle" class="c">_Drv null</text>
+        <text x="150" y="104" text-anchor="middle" class="c ut">control</text>
+        <text x="380" y="210" text-anchor="middle" class="s">bone = control × fixed offset</text>
+      </svg>
+      <div class="controls"><label for="dn-rot">Rotate control <input type="range" id="dn-rot" min="-60" max="60" value="0"></label></div>
+      <figcaption>Controls closer than 0.5 cm to their bone used to be snapped onto it, which moved the neck controls 0.1 cm. The tolerance is now 0.001 cm, so every real offset is kept.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 4</span>
+      <h4>Curves become thin tube meshes</h4>
+      <p>The exporter samples each NURBS curve into points (in Unreal axes and centimetres), builds a thin square tube around them, and saves one small FBX per shape. In Unreal those meshes go into a shape library, and each control uses its own.</p>
+      <p>The shape id is a hash of the geometry, so identical shapes are shared. If a shape can't be imported, a stock circle, box or sphere is picked instead.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 150" role="img" aria-label="A Maya NURBS curve is sampled into a polyline, then turned into a thin tube mesh saved as an FBX, then imported into the Control Rig shape library.">
+        <path class="lm" d="M20,90 C30,30 110,30 120,90 C110,130 30,130 20,90" style="stroke-width:2"/>
+        <text x="70" y="140" text-anchor="middle" class="s">NURBS curve</text>
+        <polyline class="ln" points="160,90 163,68 172,52 186,45 200,52 209,68 212,90 209,108 200,120 186,125 172,120 163,108 160,90"/>
+        <g class="dot-f"><circle cx="163" cy="68" r="2"/><circle cx="172" cy="52" r="2"/><circle cx="186" cy="45" r="2"/><circle cx="200" cy="52" r="2"/><circle cx="209" cy="68" r="2"/><circle cx="212" cy="90" r="2"/><circle cx="209" cy="108" r="2"/><circle cx="200" cy="120" r="2"/><circle cx="186" cy="125" r="2"/><circle cx="172" cy="120" r="2"/><circle cx="163" cy="108" r="2"/></g>
+        <text x="186" y="140" text-anchor="middle" class="s">sampled points</text>
+        <path class="lu" d="M262,90 C272,30 352,30 362,90 C352,130 272,130 262,90" style="stroke-width:7;stroke-opacity:.35"/>
+        <path class="lu" d="M262,90 C272,30 352,30 362,90 C352,130 272,130 262,90" style="stroke-width:1.2"/>
+        <text x="312" y="140" text-anchor="middle" class="s">tube mesh (RB_&lt;id&gt;.fbx)</text>
+        <rect class="bu" x="410" y="66" width="110" height="48" rx="5"/><text x="465" y="86" text-anchor="middle">shape library</text><text x="465" y="102" text-anchor="middle" class="s">/Game/RigBuilder</text>
+        <line class="ln" x1="124" y1="90" x2="154" y2="90" marker-end="url(#arr)"/>
+        <line class="ln" x1="218" y1="90" x2="256" y2="90" marker-end="url(#arr)"/>
+        <line class="ln" x1="368" y1="90" x2="407" y2="90" marker-end="url(#arr)"/>
+      </svg>
+      <figcaption>The points are stored in world orientation and the shape transform cancels the control's rotation, so the drawing matches Maya while the control turns. Murakami: 39 of 39 shapes exported.</figcaption>
+    </figure>
+  </div>
+
+  <h3>How we know it works</h3>
+  <ul>
+    <li>The pose check's calibration compares every joint and control at rest with Maya. A conversion error (axes, units) would show on most joints at once.</li>
+    <li>On Murakami, every control sits within 0.013 cm of its Maya pivot, and 95% of joints at rest are within 0.0003 cm.</li>
+  </ul>
+
+  <h3>Limits</h3>
+  <ul>
+    <li>The root joint has to be named <code>root</code>.</li>
+    <li>The manifest's schema file doesn't describe the newest sections yet (blendshapes, rest pose, group stacks, spaces, settings controls, materials). The builder reads them, but the schema check doesn't validate them.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ IK/FK -->
+<section class="feature" id="ikfk">
+  <h2>IK/FK limbs</h2>
+  <p class="lead">Arms and legs the animator can pose two ways: joint by joint (FK) or by placing the hand or foot (IK), with a switch to blend between them.</p>
+  <div class="status"><span class="pill ok">Unreal: pose check, 4/4 limbs within T1</span></div>
+
+  <h3>What it is in Maya</h3>
+  <p>Three bound joints per limb (shoulder, elbow, wrist; or hip, knee, ankle). Two helper chains drive them: an IK chain with an IK handle and a pole vector, and an FK chain with one control per joint. The bound joints copy the helpers' <b>local</b> values through pairBlend nodes, weighted by the switch attribute <code>IK_FK</code>.</p>
+  <p><b>FK</b> (forward kinematics): you rotate each joint yourself. <b>IK</b> (inverse kinematics): you place the end, and a solver works out the joint angles. The <b>pole vector</b> says which way the elbow or knee points.</p>
+  <p>Facts we measured in Maya, not assumed: the wrists and ankles don't turn with the IK controls; the knee stays exactly in the hip / foot / pole plane; and Murakami's arms and legs are perfectly straight at rest.</p>
+
+  <h3>The challenges</h3>
+  <ol class="challenges">
+    <li><b>FK mode must really be FK.</b> An early design left the IK solver running in FK mode, so moving one FK control made the whole limb react.</li>
+    <li><b>The end bone's rotation.</b> We first assumed Maya's wrists follow the IK control. They don't.</li>
+    <li><b>Which parent does the limb ride on?</b> Maya blends the chains locally, so the hip rides on the spine joint, not on the pelvis control above the FK chain.</li>
+    <li><b>Straight limbs are hypersensitive.</b> On a straight leg, a tiny change of reach moves the knee by centimetres. The knee was 3.16 cm off on chest poses.</li>
+    <li><b>Small API traps.</b> The Set Rotation node's input pin is called "Value", not "Rotation", so the end bone's rotation was silently not applied.</li>
+  </ol>
+
+  <h3>How we solved it</h3>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 1</span>
+      <h4>The switch drives the solver's weight</h4>
+      <p>The FK controls always write the full FK pose first. Then Control Rig's two-bone IK solver ("Basic IK") runs, and its <b>Weight</b> is the switch: at 0 it leaves the FK pose untouched, at 1 the limb is pure IK, in between it blends each bone's rotation.</p>
+      <p>Try it: move the IK target, bend the FK shoulder, and slide the blend.</p>
+    </div>
+    <figure>
+      <svg class="d" id="ik-svg" viewBox="0 0 520 260" role="img" aria-label="Interactive: a two-bone arm showing the FK pose, the IK pose reaching a target, and the blended result driven by the switch weight.">
+        <circle id="ik-target" r="9" class="bu" style="stroke-width:2"/>
+        <text id="ik-target-t" class="c ut" text-anchor="middle">IK control</text>
+        <polyline id="ik-fk" class="lm" style="stroke-dasharray:6 4"/>
+        <polyline id="ik-ik" class="lu" style="stroke-dasharray:6 4"/>
+        <polyline id="ik-res" class="ln" style="stroke-width:6;stroke-linecap:round;stroke-linejoin:round"/>
+        <circle id="ik-root" r="6" class="dot-f"/>
+        <circle id="ik-mid" r="5" class="dot-f"/>
+        <g transform="translate(330,24)">
+          <line x1="0" y1="0" x2="24" y2="0" class="lm" style="stroke-dasharray:6 4"/><text x="32" y="4" class="s">FK pose</text>
+          <line x1="0" y1="18" x2="24" y2="18" class="lu" style="stroke-dasharray:6 4"/><text x="32" y="22" class="s">IK pose</text>
+          <line x1="0" y1="36" x2="24" y2="36" class="ln" style="stroke-width:5"/><text x="32" y="40" class="s">result (blend)</text>
+        </g>
+      </svg>
+      <div class="controls">
+        <label for="ik-w">IK/FK blend <input type="range" id="ik-w" min="0" max="1" step="0.01" value="1"> <span class="val" id="ik-wv"></span></label>
+        <label for="ik-fka">FK shoulder <input type="range" id="ik-fka" min="-80" max="80" value="30"></label>
+        <label for="ik-tx">Target X <input type="range" id="ik-tx" min="140" max="330" value="290"></label>
+        <label for="ik-ty">Target Y <input type="range" id="ik-ty" min="40" max="240" value="190"></label>
+      </div>
+      <figcaption>At blend 0 the solver does nothing, so each FK control moves only its own bone. That fixed challenge 1.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 2</span>
+      <h4>Measure the end bone, and export what Maya does</h4>
+      <p>The exporter measures whether the end joint follows the IK control and writes it as a flag (<code>ik_end_orient</code>). On Murakami it doesn't, so in IK the wrist keeps its rest local rotation. The rotation is wired to the node's real "Value" pin, with a fallback.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 150" role="img" aria-label="When the IK control rotates, Murakami's wrist in Maya does not follow; the exporter writes ik_end_orient false and Unreal keeps the wrist's rest local rotation.">
+        <line class="ln" x1="30" y1="100" x2="130" y2="70" style="stroke-width:5;stroke-linecap:round"/>
+        <line class="ln" x1="130" y1="70" x2="230" y2="100" style="stroke-width:5;stroke-linecap:round"/>
+        <line class="lm" x1="230" y1="100" x2="270" y2="100" style="stroke-width:5;stroke-linecap:round"/>
+        <rect class="bu" x="214" y="84" width="32" height="32" rx="4" transform="rotate(35 230 100)" style="fill-opacity:.4"/>
+        <text x="230" y="140" text-anchor="middle" class="s">IK control turned 35°, wrist stays</text>
+        <rect class="bx" x="320" y="30" width="200" height="40" rx="5"/><text x="420" y="55" text-anchor="middle" class="c">ik_end_orient: false</text>
+        <rect class="bu" x="320" y="90" width="200" height="40" rx="5"/><text x="420" y="107" text-anchor="middle">wrist keeps its rest</text><text x="420" y="122" text-anchor="middle">local rotation</text>
+        <line class="ln" x1="420" y1="70" x2="420" y2="87" marker-end="url(#arr)"/>
+        <path class="lm" d="M275,100 C295,100 300,50 317,50" marker-end="url(#arr-m)"/><text x="296" y="40" class="s">measured</text>
+      </svg>
+      <figcaption>On another rig where the wrist does follow, the flag flips and Unreal follows suit. No assumption is baked in.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 3</span>
+      <h4>Root rebase: ride on the right parent</h4>
+      <p>Maya blends the chains locally, so the hip rides on its parent joint (the spine), not on the FK control's parent (the pelvis control). The FK pose is therefore taken relative to the FK control's parent, then re-applied under a null that follows the hip's real parent bone.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 170" role="img" aria-label="The FK pose is made relative to the pelvis control, then made absolute again under a null following Spine1, the hip's real parent bone.">
+        <rect class="bm" x="0" y="20" width="130" height="40" rx="5"/><text x="65" y="37" text-anchor="middle" class="c">Pelvis_IKctrl</text><text x="65" y="52" text-anchor="middle" class="s">FK control's parent</text>
+        <rect class="bx" x="170" y="20" width="150" height="40" rx="5"/><text x="245" y="37" text-anchor="middle">Make Relative</text><text x="245" y="52" text-anchor="middle" class="s">FK pose vs that parent</text>
+        <rect class="bu" x="0" y="110" width="130" height="40" rx="5"/><text x="65" y="127" text-anchor="middle" class="c">null on Spine1</text><text x="65" y="142" text-anchor="middle" class="s">hip's real parent</text>
+        <rect class="bx" x="170" y="110" width="150" height="40" rx="5"/><text x="245" y="127" text-anchor="middle">Make Absolute</text><text x="245" y="142" text-anchor="middle" class="s">re-applied under it</text>
+        <rect class="bu" x="370" y="110" width="150" height="40" rx="5"/><text x="445" y="134" text-anchor="middle">hip follows the spine</text>
+        <line class="ln" x1="130" y1="40" x2="167" y2="40" marker-end="url(#arr)"/>
+        <line class="ln" x1="245" y1="60" x2="245" y2="107" marker-end="url(#arr)"/>
+        <line class="ln" x1="130" y1="130" x2="167" y2="130" marker-end="url(#arr)"/>
+        <line class="ln" x1="320" y1="130" x2="367" y2="130" marker-end="url(#arr)"/>
+      </svg>
+      <figcaption>Done for the whole chain, so bending the spine carries the leg the way Maya does.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 4</span>
+      <h4>Fixed bone lengths, and an honest score for straight limbs</h4>
+      <p>On a nearly straight limb, the middle joint's distance from the root–tip line is about <b>h ≈ √(2·k·slack)</b>, where k = A·B/(A+B) from the two bone lengths and slack = A + B − reach. A tiny slack moves the knee a lot.</p>
+      <p>Two fixes: the solver uses the <b>rest</b> bone lengths instead of measuring them each frame, and the spine's tiny rest error was removed (see <a href="#rest-correction">rest correction</a>). The knee went from 3.16 cm to 0.15 cm. The pose check then scores the middle joint only on the error the limb's reach and the file precision can't explain.</p>
+      <p>Move the slack: the curve is for Murakami's arm (two 350 cm bones).</p>
+    </div>
+    <figure>
+      <svg class="d" id="sl-svg" viewBox="0 0 520 230" role="img" aria-label="Chart: the knee's distance from the straight line grows like the square root of the slack; half a thousandth of a centimetre of slack moves the elbow about 0.4 cm.">
+        <line class="ln" x1="60" y1="190" x2="500" y2="190"/><line class="ln" x1="60" y1="190" x2="60" y2="20"/>
+        <g id="sl-ticks"></g>
+        <path id="sl-curve" class="lu" style="stroke-width:2"/>
+        <line id="sl-v" class="lg"/><line id="sl-h" class="lg"/>
+        <circle id="sl-dot" r="6" class="dot-u"/>
+        <text x="280" y="224" text-anchor="middle" class="s">slack (cm): how much shorter the reach is than A + B</text>
+        <text x="16" y="105" text-anchor="middle" class="s" transform="rotate(-90 16 105)">middle joint offset h (cm)</text>
+        <text id="sl-read" x="80" y="36" class="c"></text>
+      </svg>
+      <div class="controls"><label for="sl-s">Slack <input type="range" id="sl-s" min="0" max="0.05" step="0.0005" value="0.0005"> <span class="val" id="sl-sv"></span></label></div>
+      <figcaption>0.0005 cm of slack (the precision of the poses file) already moves the elbow 0.4 cm. That's why the remaining 0.15–0.39 cm on the elbows and knees is fully explained, not a rig error.</figcaption>
+    </figure>
+  </div>
+
+  <h3>How we know it works</h3>
+  <ul>
+    <li>The pose check probes every FK control in FK mode and every IK control in IK mode, plus random mixed poses. All four limbs are within T1.</li>
+    <li>Hands, feet, shoulders and hips match Maya; the elbows and knees match once the straight-limb effect is accounted for.</li>
+  </ul>
+
+  <h3>Limits</h3>
+  <ul>
+    <li>The IK/FK module takes exactly three joints. Longer chains are refused with a clear message (the plain IK module still handles any length with FABRIK).</li>
+    <li>Maya's stretchy IK isn't detected yet, so the solver's stretch option stays off. Soft IK isn't transferred.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ SPLINE IK -->
+<section class="feature" id="spline-ik">
+  <h2>Spline IK</h2>
+  <p class="lead">Joints that follow a curve, shaped by a few controls. Murakami's spine.</p>
+  <div class="status"><span class="pill ok">Unreal: pose check within T1 (worst 0.056 cm)</span></div>
+
+  <h3>What it is in Maya</h3>
+  <p>A spline IK handle on Spine1–Spine4. The curve's control points (CVs) are skinned to three hidden helper joints, each riding under an animator control: <code>Pelvis_IKctrl</code>, <code>spine_ctrl_01</code>, <code>chest_ctrl</code>. Moving a control pulls its CVs, the curve bends, and the joints slide along it. Spine4 is also orient-constrained to the chest. Murakami's spine doesn't stretch.</p>
+
+  <h3>The challenges</h3>
+  <ol class="challenges">
+    <li><b>Each CV is pulled by several controls</b> with skin weights. Our first version kept only the two strongest influences, so the spine bent differently from Maya.</li>
+    <li><b>Stretch.</b> The Unreal fit defaulted to stretching, while Murakami's spine keeps its length.</li>
+    <li><b>The fit is an approximation.</b> Unreal's "Fit Chain on Spline Curve" lands about 0.04 cm from the bind pose. Small, but it lifted the hips and broke the straight knees (see <a href="#ikfk">IK/FK</a>).</li>
+    <li><b>The control isn't the helper joint.</b> The chest control was drawn 0.59 cm away from its Maya pivot because it was placed at the hidden helper joint.</li>
+  </ol>
+
+  <h3>How we solved it</h3>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 1</span>
+      <h4>Each CV is the weighted average of all its controls</h4>
+      <p>For every CV, Unreal creates one invisible point per influencing control, riding on that control. The CV's position is their weighted average with Maya's weights, built as a chain of lerps (blends).</p>
+      <p>Then <b>Spline From Points</b> builds the curve, and <b>Fit Chain on Spline Curve</b> places the bones along it, each keeping its length.</p>
+      <p>Move the controls, and compare "all influences" with the old "two strongest".</p>
+    </div>
+    <figure>
+      <svg class="d" id="spl-svg" viewBox="0 0 520 280" role="img" aria-label="Interactive: three spine controls pull four curve points by skin weights; the curve and the fitted bones follow; the old two-influence version is shown for comparison.">
+        <g id="spl-g"></g>
+      </svg>
+      <div class="controls">
+        <label for="spl-c">chest_ctrl <input type="range" id="spl-c" min="-90" max="90" value="55"></label>
+        <label for="spl-m">spine_ctrl_01 <input type="range" id="spl-m" min="-60" max="60" value="-20"></label>
+        <label><input type="checkbox" id="spl-old"> show old "two strongest"</label>
+      </div>
+      <figcaption>Squares: controls. Dots: CVs, each a weighted average of the controls (weights listed). Thick line: bones fitted along the curve with fixed lengths. Illustrative weights.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 2</span>
+      <h4>Stretch only when Maya stretches</h4>
+      <p>The exporter checks whether Maya's spline stretches and writes <code>stretch_enabled</code>. The fit uses alignment "Front" (bones keep their length), or "Stretched" only when Maya stretches.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 130" role="img" aria-label="With Front alignment the bones keep their length and may stop before the end of the curve; with Stretched they cover the whole curve.">
+        <path class="lg" d="M20,100 C120,20 260,20 360,60"/>
+        <polyline class="ln" points="20,100 85,57 160,38 236,36" style="stroke-width:5;stroke-linecap:round;stroke-linejoin:round"/>
+        <text x="130" y="122" text-anchor="middle" class="h">Front</text><text x="130" y="108" text-anchor="middle" class="s">lengths kept (Murakami)</text>
+        <path class="lg" d="M290,110 C360,40 440,40 510,70" transform="translate(-10,0)"/>
+        <polyline class="lu" points="280,110 330,64 395,46 455,48 500,70" style="stroke-width:5;stroke-linecap:round;stroke-linejoin:round"/>
+        <text x="400" y="122" text-anchor="middle" class="h">Stretched</text><text x="400" y="108" text-anchor="middle" class="s">only if Maya stretches</text>
+      </svg>
+      <figcaption>Defaulting to "off" and switching on from evidence is safer than the opposite.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 3</span>
+      <h4>A rest correction cancels the fit's approximation</h4>
+      <p>After the fit, each spine bone is re-applied as <b>RestOffset × solved</b>. The builder measures that offset itself right after compiling (see <a href="#rest-correction">rest correction</a>). Largest offset found on Murakami: 0.0379 cm.</p>
+      <p>The control itself is placed at the animator control's pivot (<code>ue_control_origin</code>), not at the helper joint. The curve isn't affected, because the CV points are placed from the CVs.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 150" role="img" aria-label="Fit Chain on Spline Curve gives a solved pose about 0.04 cm off; multiplying by the measured rest offset puts the bone back on the bind pose at rest.">
+        <rect class="bx" x="0" y="40" width="130" height="44" rx="5"/><text x="65" y="59" text-anchor="middle">Fit Chain</text><text x="65" y="75" text-anchor="middle" class="s">≈ 0.04 cm off at rest</text>
+        <rect class="bu" x="170" y="40" width="150" height="44" rx="5"/><text x="245" y="59" text-anchor="middle">× RestOffset</text><text x="245" y="75" text-anchor="middle" class="s">measured at build</text>
+        <rect class="bo" x="360" y="40" width="160" height="44" rx="5"/><text x="440" y="59" text-anchor="middle" class="ot">bone = bind pose</text><text x="440" y="75" text-anchor="middle" class="s">exact at rest</text>
+        <line class="ln" x1="130" y1="62" x2="167" y2="62" marker-end="url(#arr)"/><line class="ln" x1="320" y1="62" x2="357" y2="62" marker-end="url(#arr)"/>
+        <text x="260" y="122" text-anchor="middle" class="s">Then the chest orient constraint runs (Spine4 follows the chest's rotation), as in Maya.</text>
+      </svg>
+      <figcaption>The correction is constant, so it removes the rest error without changing how the spine moves.</figcaption>
+    </figure>
+  </div>
+
+  <h3>How we know it works</h3>
+  <ul>
+    <li>The spine is within T1 on every pose. The largest remaining error is 0.056 cm on Spine3 when the spine controls rotate: Unreal's fit approximating Maya's curve.</li>
+    <li>The chest control now sits on its Maya pivot (was 0.59 cm away).</li>
+  </ul>
+
+  <h3>Limits</h3>
+  <ul>
+    <li>No spline twist (roll distributed along the spine) yet.</li>
+    <li>Ribbons (surface-based spines) aren't supported.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ CONSTRAINTS -->
+<section class="feature" id="constraints">
+  <h2>Constraints and follow spaces</h2>
+  <p class="lead">Bones and controls that follow something other than their parent: a constraint on a bone, or a controller whose group is driven by another part of the rig.</p>
+  <div class="status"><span class="pill ok">Unreal: pose check within T1</span></div>
+
+  <h3>What it is in Maya</h3>
+  <ul>
+    <li><b>Constraints on bones:</b> point, orient, scale or parent constraints (Spine4 orient-constrained to the chest, FK joints parent-constrained to their controls).</li>
+    <li><b>Follow spaces:</b> a controller's group is moved by a constraint, a matrix or driven keys. Its Maya parent then isn't what really carries it. The petals ride on the head this way.</li>
+  </ul>
+  <p>Space switching (a choice between several targets) is covered in <a href="#space-switching">its own section</a>.</p>
+
+  <h3>The challenges</h3>
+  <ol class="challenges">
+    <li><b>Where does Maya keep the offset?</b> A maintained offset lives in the constrained node's parent space. Unreal's plain constraint nodes keep it in world space, and the bone drifts as soon as its parent rotates.</li>
+    <li><b>Finding the real targets.</b> The IK/FK switch's weight input is also connected under the constraint's target list, so it was counted as a target. And the helper IK/FK joints sit at the same positions as the real ones. Result: the toe control followed the knee.</li>
+    <li><b>Feedback loops.</b> A petal's follow space pointed at a bone the petal drives itself, so it chased itself and flew away when the head rotated.</li>
+    <li><b>Some chains aren't plain FK.</b> When the constraints can't be expressed as "control drives bone", the FK module has to do something else.</li>
+  </ol>
+
+  <h3>How we solved it</h3>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 1</span>
+      <h4>Use the "Local Space Offset" constraint variants</h4>
+      <p>Maya constraints become Control Rig constraint nodes with maintain offset, using the variants that keep the offset in the parent's space, as Maya does.</p>
+      <p>Rotate the parent: the world-space version drifts away from the parent; the local version stays attached.</p>
+    </div>
+    <figure>
+      <svg class="d" id="co-svg" viewBox="0 0 520 220" role="img" aria-label="Interactive: as the parent rotates, a constraint keeping its offset in the parent's space stays attached, while one keeping it in world space drifts.">
+        <circle cx="130" cy="170" r="6" class="dot-f"/><text x="130" y="200" text-anchor="middle" class="s">parent pivot</text>
+        <line id="co-parent" x1="130" y1="170" x2="130" y2="70" class="ln" style="stroke-width:6;stroke-linecap:round"/>
+        <circle id="co-target" r="6" class="dot-m"/>
+        <circle id="co-local" r="9" class="bu" style="stroke-width:2.5"/>
+        <circle id="co-world" r="9" class="bw" style="stroke-width:2"/>
+        <line id="co-drift" class="lw"/>
+        <g transform="translate(330,40)">
+          <circle cx="6" cy="0" r="7" class="bu" style="stroke-width:2"/><text x="22" y="4" class="s">Local Space Offset (Maya's way)</text>
+          <circle cx="6" cy="26" r="7" class="bw" style="stroke-width:2"/><text x="22" y="30" class="s">plain: offset in world space</text>
+          <circle cx="6" cy="52" r="5" class="dot-m"/><text x="22" y="56" class="s">constraint target</text>
+        </g>
+      </svg>
+      <div class="controls"><label for="co-rot">Rotate parent <input type="range" id="co-rot" min="-70" max="70" value="35"></label></div>
+      <figcaption>Illustration of a bone with a maintained offset under a rotating parent.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 2</span>
+      <h4>Read targets from the right plug, prefer real joints</h4>
+      <p>Targets are read only from the constraint's <code>targetParentMatrix</code> inputs, which only real targets feed. When looking for the joint a target sits on, module joints are preferred over helper joints at the same position.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 170" role="img" aria-label="The constraint's target list includes the IK/FK switch weight, which is not a target; reading only targetParentMatrix keeps the real targets; module joints win over helper joints.">
+        <rect class="bx" x="180" y="60" width="140" height="44" rx="5"/><text x="250" y="80" text-anchor="middle" class="c">parentConstraint</text><text x="250" y="96" text-anchor="middle" class="c s">.target[ ]</text>
+        <rect class="bm" x="0" y="10" width="140" height="34" rx="5"/><text x="70" y="31" text-anchor="middle" class="c">L_LegIKctrl</text>
+        <rect class="bm" x="0" y="64" width="140" height="34" rx="5"/><text x="70" y="85" text-anchor="middle" class="c">L_LegFKctrl_03</text>
+        <rect class="bw" x="0" y="118" width="140" height="40" rx="5"/><text x="70" y="135" text-anchor="middle" class="c">IK_FK switch</text><text x="70" y="150" text-anchor="middle" class="s wt">weight only, not a target</text>
+        <path class="lm" d="M140,27 C160,27 160,72 177,74" marker-end="url(#arr-m)"/>
+        <line class="lm" x1="140" y1="81" x2="177" y2="81" marker-end="url(#arr-m)"/>
+        <path class="lw" d="M140,138 C160,138 160,96 177,92" marker-end="url(#arr-w)"/>
+        <text x="158" y="58" class="s">targetParentMatrix</text>
+        <rect class="bo" x="360" y="60" width="160" height="44" rx="5"/><text x="440" y="78" text-anchor="middle" class="ot">2 real targets</text><text x="440" y="94" text-anchor="middle" class="s">module joints preferred</text>
+        <line class="ln" x1="320" y1="82" x2="357" y2="82" marker-end="url(#arr)"/>
+      </svg>
+      <figcaption>An older duplicate of the target-reading function further down the file was silently overriding the fixed one. It was removed.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 3</span>
+      <h4>A follow-space null, updated at the right moment, never in a loop</h4>
+      <p>For a driven group, the exporter finds the joint the constraint's targets sit on (<code>parent_space_bone</code>). Unreal creates a null that follows that bone's solved transform and puts the control under it. The null's update runs right after the module that drives that bone.</p>
+      <p>If that bone is one the control drives itself, the space is replaced with the driven bone's parent, which breaks the loop. A warning is logged when a space follows a bone no module drives.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 190" role="img" aria-label="Before: the petal's space followed the petal bone it drives, a loop. Now: the space follows the head bone, the driven bone's parent.">
+        <text x="120" y="16" text-anchor="middle" class="h wt">Before: a loop</text>
+        <rect class="bw" x="40" y="30" width="160" height="34" rx="5"/><text x="120" y="51" text-anchor="middle" class="c">petal space null</text>
+        <rect class="bx" x="40" y="96" width="160" height="34" rx="5"/><text x="120" y="117" text-anchor="middle" class="c">pedal_ctrl_01</text>
+        <rect class="bx" x="40" y="150" width="160" height="34" rx="5"/><text x="120" y="171" text-anchor="middle" class="c">petal bone</text>
+        <line class="ln" x1="120" y1="64" x2="120" y2="93" marker-end="url(#arr)"/>
+        <line class="ln" x1="120" y1="130" x2="120" y2="147" marker-end="url(#arr)"/>
+        <path class="lw" d="M200,167 C250,167 250,47 203,47" marker-end="url(#arr-w)"/><text x="252" y="110" class="s wt">follows</text>
+        <text x="400" y="16" text-anchor="middle" class="h ot">Now</text>
+        <rect class="bm" x="320" y="30" width="160" height="34" rx="5"/><text x="400" y="51" text-anchor="middle" class="c">Head bone</text>
+        <rect class="bu" x="320" y="96" width="160" height="34" rx="5"/><text x="400" y="117" text-anchor="middle" class="c">petal space null</text>
+        <rect class="bx" x="320" y="150" width="160" height="34" rx="5"/><text x="400" y="171" text-anchor="middle" class="c">pedal_ctrl_01 → bone</text>
+        <line class="lu" x1="400" y1="64" x2="400" y2="93" marker-end="url(#arr-u)"/><text x="406" y="84" class="s">follows</text>
+        <line class="ln" x1="400" y1="130" x2="400" y2="147" marker-end="url(#arr)"/>
+      </svg>
+      <figcaption>The petals now follow the head and no longer fly away when it rotates.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 4</span>
+      <h4>Constraint mode for chains that aren't plain FK</h4>
+      <p>When a chain's Maya constraints can't be expressed as "each control drives its bone", the FK module switches to <b>constraint mode</b>: it rebuilds each exported constraint as a Control Rig constraint node instead. The artist can also turn constraint detection off per joint (<code>rigTag_skipConstraintDetection</code>).</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 130" role="img" aria-label="If every constraint is control drives bone, the FK module uses plain FK; otherwise it switches to constraint mode and rebuilds each constraint.">
+        <rect class="bx" x="0" y="44" width="150" height="44" rx="5"/><text x="75" y="63" text-anchor="middle">every constraint is</text><text x="75" y="79" text-anchor="middle">"control → bone"?</text>
+        <rect class="bu" x="230" y="10" width="290" height="38" rx="5"/><text x="375" y="33" text-anchor="middle">plain FK: control sets bone</text>
+        <rect class="bu" x="230" y="84" width="290" height="38" rx="5"/><text x="375" y="107" text-anchor="middle">constraint mode: one node per constraint</text>
+        <path class="ln" d="M150,58 C190,58 190,29 227,29" marker-end="url(#arr)"/><text x="190" y="36" class="s">yes</text>
+        <path class="ln" d="M150,74 C190,74 190,103 227,103" marker-end="url(#arr)"/><text x="190" y="102" class="s">no</text>
+      </svg>
+      <figcaption>The decision comes from the constraints found in the scene, not from the module's name.</figcaption>
+    </figure>
+  </div>
+
+  <h3>How we know it works</h3>
+  <ul>
+    <li>The toe follows its real targets; the petals follow the head; Spine4 follows the chest. All within T1 on the pose check.</li>
+  </ul>
+
+  <h3>Limits</h3>
+  <ul>
+    <li>Aim constraints and pole-vector constraints outside IK limbs aren't rebuilt.</li>
+    <li>Matrix-based constraints (offsetParentMatrix, blendMatrix) are reported, not rebuilt.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ REST CORRECTION -->
+<section class="feature" id="rest-correction">
+  <h2>Rest correction</h2>
+  <p class="lead">Making Unreal's rig start from exactly the pose Maya's rig rests in, even when the skeleton was imported in a slightly different pose.</p>
+  <div class="status"><span class="pill ok">Unreal: in use (95% of joints within 0.0003 cm at rest)</span></div>
+
+  <h3>What it is in Maya</h3>
+  <p>A skinned mesh remembers the <b>bind pose</b>: where the joints were when the skin was attached. The rig usually rests in that same pose, but not always. On Murakami the four toe joints were bound 1.0114 cm lower than where the rig keeps them (the foot FK control carries a −1.0114 translate).</p>
+
+  <h3>The challenges</h3>
+  <ol class="challenges">
+    <li><b>Unreal's skeleton is the bind pose</b>, not the rig's rest pose. The toe and its control sat 1 cm off at rest, and rotating the control swung the toe around the wrong point.</li>
+    <li><b>Solvers don't land exactly on rest.</b> The spline fit lands about 0.04 cm off. On a straight leg that tiny error became 3 cm at the knee.</li>
+    <li><b>No absolute axis convention can be assumed.</b> The FBX importer gives each bone its own fixed axis difference.</li>
+    <li><b>An API gap.</b> Unreal 5.6's Python <code>Quat</code> has no <code>inverse()</code>, which crashed the first try.</li>
+  </ol>
+
+  <h3>How we solved it</h3>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 1</span>
+      <h4>Export both poses, move bones onto Maya's rest</h4>
+      <p>The exporter writes <code>rest_pose</code>: for every joint, its current frame and its bind frame (read from the skin cluster). Before building any module, the builder moves each bone that differs onto Maya's rest:</p>
+      <ul>
+        <li>position: the exported rest position;</li>
+        <li>rotation: the change "rest × bind⁻¹", applied on top of Unreal's own bone rotation. Only the difference is used, so no axis convention is assumed.</li>
+      </ul>
+      <p>The log says which bones moved. The quaternion maths is plain Python, which avoids the missing <code>inverse()</code>.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 200" role="img" aria-label="Murakami's toe was bound 1.0114 cm lower than its rest pose; the builder moves the bone from the bind pose up to the rest pose before building.">
+        <line class="lg" x1="20" y1="150" x2="500" y2="150"/>
+        <line class="ln" x1="60" y1="60" x2="160" y2="100" style="stroke-width:5;stroke-linecap:round"/>
+        <text x="60" y="48" class="s">ankle</text>
+        <line class="lw" x1="160" y1="126" x2="290" y2="126" style="stroke-width:5;stroke-dasharray:none;stroke-linecap:round;opacity:.7"/>
+        <text x="300" y="130" class="s wt">bind pose (Unreal import)</text>
+        <line class="lu" x1="160" y1="100" x2="290" y2="100" style="stroke-width:5;stroke-linecap:round"/>
+        <text x="300" y="104" class="s ut">Maya rest pose</text>
+        <line class="ln" x1="225" y1="124" x2="225" y2="104" marker-end="url(#arr)"/>
+        <text x="232" y="118" class="c">1.0114 cm</text>
+        <text x="260" y="180" text-anchor="middle" class="s">apply_maya_rest_pose: moved before any module is built</text>
+      </svg>
+      <figcaption>Exaggerated vertically. Hip and spine joints differed by under 0.007 cm and were moved the same way.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 2</span>
+      <h4>Bake the solvers' rest error back into the graph</h4>
+      <p>Right after compiling, the builder runs the rig at rest, measures each spine bone (offset = bind × solved⁻¹), writes those offsets into the graph, and compiles again. From then on the spine sits exactly on rest, and the knees stop paying for the spine's error.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 170" role="img" aria-label="Rest correction loop: compile, run the rig at rest, measure each bone's offset to the bind pose, write the offsets into the graph, recompile.">
+        <rect class="bu" x="0" y="20" width="110" height="40" rx="5"/><text x="55" y="45" text-anchor="middle">compile</text>
+        <rect class="bu" x="140" y="20" width="110" height="40" rx="5"/><text x="195" y="38" text-anchor="middle">run at rest</text><text x="195" y="53" text-anchor="middle" class="s">solve once</text>
+        <rect class="bu" x="280" y="20" width="110" height="40" rx="5"/><text x="335" y="38" text-anchor="middle">measure</text><text x="335" y="53" text-anchor="middle" class="s">bind × solved⁻¹</text>
+        <rect class="bu" x="420" y="20" width="100" height="40" rx="5"/><text x="470" y="38" text-anchor="middle">write</text><text x="470" y="53" text-anchor="middle" class="s">into graph</text>
+        <rect class="bo" x="280" y="110" width="240" height="40" rx="5"/><text x="400" y="128" text-anchor="middle" class="ot">recompile: spine exact at rest</text><text x="400" y="143" text-anchor="middle" class="s">log: largest rest offset 0.0379 cm</text>
+        <line class="ln" x1="110" y1="40" x2="137" y2="40" marker-end="url(#arr)"/><line class="ln" x1="250" y1="40" x2="277" y2="40" marker-end="url(#arr)"/><line class="ln" x1="390" y1="40" x2="417" y2="40" marker-end="url(#arr)"/>
+        <line class="ln" x1="470" y1="60" x2="470" y2="107" marker-end="url(#arr)"/>
+        <text x="20" y="130" class="s">knee on chest poses:</text><text x="20" y="148" class="c">3.16 cm → 0.15 cm</text>
+      </svg>
+      <figcaption>A measurement the builder takes itself, so it adapts to any rig instead of relying on a fixed number.</figcaption>
+    </figure>
+  </div>
+
+  <h3>How we know it works</h3>
+  <ul>
+    <li>Pose check calibration: no joint off at rest; 95% within 0.0003 cm (was: toe 1.01 cm, 95% within 0.038 cm).</li>
+    <li>The toe went from 1.01 cm off at rest to T0.</li>
+  </ul>
+
+  <h3>Limits</h3>
+  <ul>
+    <li>Rest correction is baked for the spine. Other solvers that land off rest would need the same treatment; none does on Murakami.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ CUSTOM ATTRIBUTES -->
+<section class="feature" id="custom-attributes">
+  <h2>Custom attributes</h2>
+  <p class="lead">The animator's knobs: user-made sliders and switches on controllers. They do nothing by themselves; what matters is what they drive.</p>
+  <div class="status"><span class="pill ok">Maya: tested</span><span class="pill ok">Offline: tested</span><span class="pill todo">Unreal: channels built, new links not run yet</span></div>
+
+  <h3>What it is in Maya</h3>
+  <div class="sol" style="border:0;padding-top:0">
+    <div>
+      <p>Examples on Murakami and the test rigs:</p>
+      <ul>
+        <li><code>IK_FK</code> on the limb switches;</li>
+        <li><code>BS_Smile</code> and the other face sliders on <code>head_ctrl</code>;</li>
+        <li><code>Wink</code> and <code>Eyelid_UP</code> on the eyes;</li>
+        <li><code>Petal_Translate</code> and <code>Petal_Rotation</code> on <code>Head_Settings_Ctrl</code>;</li>
+        <li>a "Space" enum on a space-switch controller.</li>
+      </ul>
+      <p>Not every extra attribute is a knob. Nodes also carry internal ones: our own <code>rigTag_*</code> tags, the manifest text, FBX bookkeeping.</p>
+    </div>
+    <figure>
+      <div class="tool" aria-label="A controller's extra attributes, with which ones are exported">
+        <div class="bar-t">head_ctrl: extra attributes</div>
+        <div class="row"><i class="d" style="background:var(--ok)"></i><span class="subj">BS_Smile</span><span>float 0–10, keyable · <span class="chip ok">exported</span></span></div>
+        <div class="row"><i class="d" style="background:var(--ok)"></i><span class="subj">BS_Omouth</span><span>float 0–10, keyable · <span class="chip ok">exported</span></span></div>
+        <div class="row"><i class="d" style="background:var(--ok)"></i><span class="subj">Space</span><span>enum World / Chest / Head · <span class="chip ok">exported</span></span></div>
+        <div class="row"><i class="d" style="background:var(--line-strong)"></i><span class="subj">rigTag_module</span><span class="muted">our own tag, hidden · skipped</span></div>
+        <div class="row"><i class="d" style="background:var(--line-strong)"></i><span class="subj">kotsudoManifest</span><span class="muted">manifest text · skipped</span></div>
+      </div>
+      <figcaption>Illustration combining real attribute names. Knobs are exported; internal attributes are skipped.</figcaption>
+    </figure>
+  </div>
+
+  <h3>The challenges</h3>
+  <ol class="challenges">
+    <li><b>Knowing which attributes are animator knobs</b>, among all the internal ones.</li>
+    <li><b>Unreal has no "extra attribute on a control".</b> The closest equivalent is an <b>animation channel</b>: a float that lives under a control and shows up in the Details panel, the Anim Outliner and Sequencer.</li>
+    <li><b>Knowing what each attribute drives</b>, and rebuilding that link. An attribute can drive an IK/FK blend, blendshape weights, constraint weights or group channels, through any chain of maths nodes.</li>
+    <li><b>Attributes that drive things we don't transfer</b> shouldn't disappear silently.</li>
+    <li><b>Attributes on controllers that belong to no module</b> (the settings controllers).</li>
+  </ol>
+
+  <h3>How we solved it</h3>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 1</span>
+      <h4>Export animator-facing attributes only</h4>
+      <p>An attribute is exported when it is keyable or visible in the channel box, of a known type (float, int, bool, enum), and not an internal name. Each one carries its type, default, current value, min/max and enum labels.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 150" role="img" aria-label="Filter: an attribute must be keyable or visible in the channel box, of a known type, and not internal, to be exported with its type, default, value, limits and labels.">
+        <rect class="bm" x="0" y="50" width="100" height="44" rx="5"/><text x="50" y="76" text-anchor="middle">attribute</text>
+        <rect class="bx" x="120" y="10" width="120" height="36" rx="5"/><text x="180" y="32" text-anchor="middle" class="s">keyable or in channel box?</text>
+        <rect class="bx" x="120" y="54" width="120" height="36" rx="5"/><text x="180" y="76" text-anchor="middle" class="s">float, int, bool, enum?</text>
+        <rect class="bx" x="120" y="98" width="120" height="36" rx="5"/><text x="180" y="120" text-anchor="middle" class="s">not an internal name?</text>
+        <rect class="bu" x="290" y="40" width="230" height="64" rx="5"/>
+        <text x="405" y="62" text-anchor="middle">exported with</text>
+        <text x="405" y="80" text-anchor="middle" class="s">type, default, value, min/max,</text>
+        <text x="405" y="95" text-anchor="middle" class="s">enum labels</text>
+        <line class="ln" x1="100" y1="72" x2="117" y2="72" marker-end="url(#arr)"/>
+        <path class="ln" d="M240,28 C265,28 265,60 287,62"/><line class="ln" x1="240" y1="72" x2="287" y2="72" marker-end="url(#arr)"/><path class="ln" d="M240,116 C265,116 265,84 287,82"/>
+        <text x="265" y="146" text-anchor="middle" class="s">all three must hold</text>
+      </svg>
+      <figcaption>This keeps our own tags and FBX bookkeeping out of the animator's controls.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 2</span>
+      <h4>Each one becomes an animation channel on the same control</h4>
+      <p>In Unreal, each exported attribute becomes an animation channel on the matching control, with the same limits and default. You select the control and the slider is there.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 170" role="img" aria-label="In the Unreal rig hierarchy, head_ctrl has child animation channels BS_Smile, BS_Omouth and Space, each with its limits.">
+        <text x="0" y="18" class="h ut">Unreal rig hierarchy</text>
+        <rect class="bu" x="0" y="30" width="170" height="32" rx="5"/><text x="12" y="51" class="c">head_ctrl</text><text x="160" y="51" text-anchor="end" class="s">control</text>
+        <path class="lg" d="M20,62 V150"/>
+        <path class="lg" d="M20,86 H44"/><rect class="bx" x="44" y="72" width="230" height="28" rx="4"/><text x="56" y="90" class="c">BS_Smile</text><text x="264" y="90" text-anchor="end" class="s">float 0–10, default 0</text>
+        <path class="lg" d="M20,118 H44"/><rect class="bx" x="44" y="104" width="230" height="28" rx="4"/><text x="56" y="122" class="c">BS_Omouth</text><text x="264" y="122" text-anchor="end" class="s">float 0–10, default 0</text>
+        <path class="lg" d="M20,150 H44"/><rect class="bx" x="44" y="136" width="230" height="28" rx="4"/><text x="56" y="154" class="c">Space</text><text x="264" y="154" text-anchor="end" class="s">float 0–2 (enum by number)</text>
+        <text x="300" y="90" class="s">shows in Details,</text>
+        <text x="300" y="106" class="s">Anim Outliner and Sequencer</text>
+      </svg>
+      <figcaption>Channels are keyable in Sequencer like any control value.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 3</span>
+      <h4>One mechanism rebuilds every link</h4>
+      <p>The walker (see <a href="#walker-demo">the demo at the top</a>) describes what each attribute drives as maths. Unreal rebuilds it with float nodes feeding one of four kinds of target.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 210" role="img" aria-label="A slider channel goes through the walker's float maths into four kinds of target: IK solver weight, morph target curve, constraint weight, and driven group channel.">
+        <rect class="bm" x="0" y="82" width="100" height="44" rx="5"/><text x="50" y="102" text-anchor="middle">slider</text><text x="50" y="118" text-anchor="middle" class="s">channel</text>
+        <rect class="bu" x="140" y="82" width="120" height="44" rx="5"/><text x="200" y="102" text-anchor="middle">float maths</text><text x="200" y="118" text-anchor="middle" class="s">from the walker</text>
+        <line class="ln" x1="100" y1="104" x2="137" y2="104" marker-end="url(#arr)"/>
+        <rect class="bu" x="320" y="8" width="200" height="38" rx="5"/><text x="420" y="25" text-anchor="middle">IK solver weight</text><text x="420" y="39" text-anchor="middle" class="s">IK/FK switch</text>
+        <rect class="bu" x="320" y="58" width="200" height="38" rx="5"/><text x="420" y="75" text-anchor="middle">morph target curve</text><text x="420" y="89" text-anchor="middle" class="s">blendshapes</text>
+        <rect class="bu" x="320" y="108" width="200" height="38" rx="5"/><text x="420" y="125" text-anchor="middle">constraint weight</text><text x="420" y="139" text-anchor="middle" class="s">space switching</text>
+        <rect class="bu" x="320" y="158" width="200" height="38" rx="5"/><text x="420" y="175" text-anchor="middle">driven group channel</text><text x="420" y="189" text-anchor="middle" class="s">offset groups (petals)</text>
+        <path class="lu" d="M260,96 C290,96 290,27 317,27" marker-end="url(#arr-u)"/>
+        <path class="lu" d="M260,100 C290,100 290,77 317,77" marker-end="url(#arr-u)"/>
+        <path class="lu" d="M260,108 C290,108 290,127 317,127" marker-end="url(#arr-u)"/>
+        <path class="lu" d="M260,112 C290,112 290,177 317,177" marker-end="url(#arr-u)"/>
+      </svg>
+      <figcaption>One description language, one Unreal builder (<code>driver_ops.py</code>). A fix to the walker improves all four features at once.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 4</span>
+      <h4>Anything else is reported</h4>
+      <p>The Checks tab follows every slider downstream. If it moves a joint or group through a node network we don't transfer, it says so. That's how the petal sliders were found. Now that they're transferred, the warning is gone.</p>
+    </div>
+    <figure>
+      <div class="tool">
+        <div class="bar-t">Checks tab: Head_Settings_Ctrl</div>
+        <div class="row old"><i class="d" style="background:var(--ue)"></i><span>Not transferred</span><span><span class="subj">.Petal_Rotation</span><br><span class="msg">moves 12 transforms through a node network; not transferred</span></span></div>
+        <div class="row"><i class="d" style="background:var(--ok)"></i><span>Controller</span><span><span class="subj">pedal_ctrl_01</span><br>pedal_NULLctrl_01 driven (rotateX ← Petal_Rotation × 8)</span></div>
+      </div>
+      <figcaption>Before (struck through) and now. The warning pointed straight at the next feature to build.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 5</span>
+      <h4>Settings controllers and pose probes</h4>
+      <p>Sliders on controllers that belong to no module are handled by the settings controllers (offset groups, solution 8).</p>
+      <p>The pose check then probes them: every custom slider is moved to its limit, and every enum to each value. Unreal must produce the same joints and the same blendshape weights as Maya. Murakami has 292 test poses.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 130" role="img" aria-label="For each custom slider, Maya records a pose at its limit; for each enum, a pose per value; Unreal replays them and the joints and blendshape weights are compared.">
+        <rect class="bm" x="0" y="20" width="150" height="40" rx="5"/><text x="75" y="38" text-anchor="middle" class="s">slider → its limit</text><text x="75" y="52" text-anchor="middle" class="s">enum → each value</text>
+        <rect class="bm" x="180" y="20" width="140" height="40" rx="5"/><text x="250" y="45" text-anchor="middle">Maya records pose</text>
+        <rect class="bu" x="350" y="20" width="170" height="40" rx="5"/><text x="435" y="45" text-anchor="middle">Unreal replays it</text>
+        <line class="ln" x1="150" y1="40" x2="177" y2="40" marker-end="url(#arr)"/><line class="ln" x1="320" y1="40" x2="347" y2="40" marker-end="url(#arr)"/>
+        <rect class="bx" x="180" y="84" width="340" height="36" rx="5"/><text x="350" y="106" text-anchor="middle">compare joints (cm, °) and blendshape weights (± 0.001)</text>
+        <line class="ln" x1="250" y1="60" x2="250" y2="81" marker-end="url(#arr)"/><line class="ln" x1="435" y1="60" x2="435" y2="81" marker-end="url(#arr)"/>
+      </svg>
+      <figcaption>Details in the <a href="#pose-check">pose check</a> section.</figcaption>
+    </figure>
+  </div>
+
+  <h3>How we know it works</h3>
+  <ul>
+    <li><code>tests/maya_blendshape_drivers_test.py</code>: 12 wiring types (multiply, divide, power, add, reverse, clamp, remap, driven keys, conditions, chains), plus driven rotate and translate channels in centimetre and metre scenes. The walker's description, replayed, gives Maya's value.</li>
+    <li><code>tests/offline_blendshapes_test.py</code>: the Unreal float graph, evaluated with numbers, matches the same reference, including the compare fallback.</li>
+    <li>Maya stores some utility results in 32-bit floats, so the tests allow a 0.0001 difference.</li>
+  </ul>
+
+  <h3>Limits</h3>
+  <ul>
+    <li><b>Unreal's channels are all floats for now.</b> An enum works by number (0, 1, 2). Its labels are in the manifest and shown in the tool, but not on the Unreal slider. Unreal's integer or enum control types would be the improvement.</li>
+    <li>Bool attributes also become 0–1 float sliders.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ BLENDSHAPES -->
+<section class="feature" id="blendshapes">
+  <h2>Blendshapes</h2>
+  <p class="lead">Face shapes (smile, open mouth, eyelids) driven by sliders on the controllers. In Unreal they're called morph targets.</p>
+  <div class="status"><span class="pill ok">Maya: tested</span><span class="pill ok">Offline: tested</span><span class="pill todo">Unreal: not run yet</span></div>
+
+  <h3>What it is in Maya</h3>
+  <p>A blendshape node mixes a base mesh with target meshes: each target has a weight from 0 (base) to 1 (full target). Murakami has 10 targets on 3 nodes: four on the face (Smile, Omouth, CloseMouth, Disgusting) and three per eye. Sliders on the controllers drive the weights, through a multiplyDivide node set to × 0.1.</p>
+
+  <h3>The challenges</h3>
+  <ol class="challenges">
+    <li><b>The FBX carries the shapes but not the wiring.</b> Unreal imports the morph targets, but nothing moves them.</li>
+    <li><b>The wiring varies</b>: direct connections, multiply nodes, reverse, remap, driven keys, chains of them.</li>
+    <li><b>Several meshes, several nodes.</b> The artist must choose which blendshapes and which targets go to Unreal, and see it in the tool.</li>
+    <li><b>Sensitivity.</b> Without the × 0.1, a 0–10 slider reaches full weight after one unit, so the shape "explodes" at the start of the slide.</li>
+  </ol>
+
+  <h3>How we solved it</h3>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 1</span>
+      <h4>Register blendshapes in the tool</h4>
+      <p>The tagger's Blendshapes tab lists every blendshape node and its targets, with the driver and the maths found for each. The artist ticks what goes to Unreal. The choice is stored on the blendshape node itself (<code>rigTag_exportBlendshape</code>, <code>rigTag_excludedTargets</code>), so it travels with the scene.</p>
+    </div>
+    <figure>
+      <div class="tool">
+        <div class="bar-t">Blendshapes tab</div>
+        <div class="row"><i class="d" style="background:var(--ok)"></i><span class="subj">Face</span><span>4 targets · registered</span></div>
+        <div class="row"><i class="d" style="background:var(--ok)"></i><span class="subj">Head_BS_Smile</span><span><span class="subj">head_ctrl.BS_Smile</span> · × 0.1 · slider</span></div>
+        <div class="row"><i class="d" style="background:var(--ok)"></i><span class="subj">Head_BS_Omouth</span><span><span class="subj">head_ctrl.BS_Omouth</span> · × 0.1 · slider</span></div>
+        <div class="row"><i class="d" style="background:var(--line-strong)"></i><span class="subj">L_Eye</span><span class="muted">3 targets · not registered</span></div>
+      </div>
+      <figcaption>Columns: target, driver, maths, validation, and the Unreal result once a pose report exists.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 2</span>
+      <h4>The walker describes the wiring</h4>
+      <p>For each registered target, the <a href="#walker-demo">shared walker</a> follows the weight back to its slider and writes the maths. In Unreal each target gets: <b>Get channel → float nodes → Set Curve Value</b>. A morph target follows the animation curve of the same name, so writing the curve moves the shape. Missing curves are added.</p>
+      <p>Move the slider to see the × 0.1 at work, and switch it off to see why it's there.</p>
+    </div>
+    <figure>
+      <svg class="d" id="bs-svg" viewBox="0 0 520 220" role="img" aria-label="Interactive: a mouth blends from neutral to smile as the BS_Smile slider moves; the weight is the slider times 0.1, clamped to 1.">
+        <circle cx="140" cy="110" r="95" class="bx"/>
+        <circle cx="105" cy="80" r="8" class="dot-f"/><circle cx="175" cy="80" r="8" class="dot-f"/>
+        <path id="bs-mouth" class="ln" style="stroke-width:5;stroke-linecap:round"/>
+        <g transform="translate(270,40)">
+          <text x="0" y="0" class="h">Weight = slider × 0.1</text>
+          <text x="0" y="28" class="c" id="bs-r1"></text>
+          <text x="0" y="50" class="c ut" id="bs-r2"></text>
+          <rect x="0" y="64" width="220" height="10" rx="4" class="bs"/>
+          <rect id="bs-bar" x="0" y="64" width="0" height="10" rx="4" class="dot-u"/>
+          <text x="0" y="104" class="s">vertex = base + weight × (target − base)</text>
+          <text x="0" y="122" class="s">Unreal: Set Curve Value "Head_BS_Smile"</text>
+        </g>
+      </svg>
+      <div class="controls">
+        <label for="bs-s">head_ctrl.BS_Smile <input type="range" id="bs-s" min="0" max="10" step="0.1" value="3"></label>
+        <label><input type="checkbox" id="bs-nomul"> without × 0.1</label>
+      </div>
+      <figcaption>Without the multiply node, the weight hits 1 at slider value 1, and the rest of the slider does nothing. Unreal does exactly what Maya does, so the × 0.1 is rebuilt there too.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 3</span>
+      <h4>The pose check compares curve values</h4>
+      <p>The Maya poses record each blendshape weight, and the slider probes move each face slider to its limit. Unreal must produce the same curve values within 0.001. A target with no curve in Unreal is reported by name, and the tool shows the result per target.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 120" role="img" aria-label="Maya records the blendshape weight for each pose; Unreal reads the morph curve; they are compared within 0.001.">
+        <rect class="bm" x="0" y="30" width="150" height="44" rx="5"/><text x="75" y="49" text-anchor="middle">Maya weight</text><text x="75" y="65" text-anchor="middle" class="s">recorded per pose</text>
+        <rect class="bu" x="370" y="30" width="150" height="44" rx="5"/><text x="445" y="49" text-anchor="middle">Unreal curve</text><text x="445" y="65" text-anchor="middle" class="s">read after solve</text>
+        <rect class="bx" x="190" y="30" width="140" height="44" rx="5"/><text x="260" y="49" text-anchor="middle">compare</text><text x="260" y="65" text-anchor="middle" class="s">± 0.001</text>
+        <line class="ln" x1="150" y1="52" x2="187" y2="52" marker-end="url(#arr)"/><line class="ln" x1="370" y1="52" x2="333" y2="52" marker-end="url(#arr)"/>
+        <text x="260" y="108" text-anchor="middle" class="s">report: "blendshapes N/M match"</text>
+      </svg>
+      <figcaption>Blendshapes get the same treatment as joints: measured against Maya.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 4</span>
+      <h4>Keep the target meshes in the FBX</h4>
+      <p>Without the hidden target meshes, the FBX loses the target names and Unreal can't name its morph targets. They stay in the export (see <a href="#materials">materials, solution 4</a>).</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 80" role="img" aria-label="Target meshes kept in the FBX give named morph targets in Unreal.">
+        <rect class="bm" x="0" y="20" width="170" height="40" rx="5"/><text x="85" y="44" text-anchor="middle" class="c">Head_BS_Smile mesh</text>
+        <rect class="bx" x="200" y="20" width="110" height="40" rx="5"/><text x="255" y="44" text-anchor="middle">FBX</text>
+        <rect class="bo" x="340" y="20" width="180" height="40" rx="5"/><text x="430" y="44" text-anchor="middle" class="c ot">morph "Head_BS_Smile"</text>
+        <line class="ln" x1="170" y1="40" x2="197" y2="40" marker-end="url(#arr)"/><line class="ln" x1="310" y1="40" x2="337" y2="40" marker-end="url(#arr)"/>
+      </svg>
+      <figcaption>The name links the Maya target, the Unreal morph target and its curve.</figcaption>
+    </figure>
+  </div>
+
+  <h3>How we know it works</h3>
+  <ul>
+    <li><code>tests/maya_blendshape_drivers_test.py</code>: 12 wiring types, the walker's description replayed gives Maya's weight.</li>
+    <li><code>tests/offline_blendshapes_test.py</code>: the Unreal graph evaluated with numbers matches.</li>
+    <li><code>tests/maya_tool_ui_test.py</code>: registering, excluding a target and "Register All" in the real tool window.</li>
+  </ul>
+
+  <h3>Limits</h3>
+  <ul>
+    <li>Corrective shapes (a shape that fires from a joint angle) and in-between targets aren't supported yet.</li>
+    <li>Not run in Unreal yet: the curve creation and Set Curve Value pins are untested there.</li>
+  </ul>
 </section>
 
 <!-- ============================================================ SPACE SWITCHING -->
@@ -647,7 +1505,7 @@ section[id] { scroll-margin-top: 16px; }
         <thead><tr><th>Kind</th><th>How we recognise it</th><th>What Unreal gets</th></tr></thead>
         <tbody>
           <tr><td><span class="chip static">static</span></td><td>nothing drives its channels</td><td>the control's offset transform</td></tr>
-          <tr><td><span class="chip space">space</span></td><td>a constraint drives it</td><td>a space switch (section above)</td></tr>
+          <tr><td><span class="chip space">space</span></td><td>a constraint drives it</td><td>a space switch or a follow space</td></tr>
           <tr><td><span class="chip driven">driven</span></td><td>sliders or driven keys drive its channels</td><td>a null rebuilt every frame</td></tr>
           <tr><td><span class="chip matrix">matrix</span></td><td>placed by offsetParentMatrix or matrix nodes</td><td>reported, not rebuilt</td></tr>
         </tbody>
@@ -1080,45 +1938,22 @@ section[id] { scroll-margin-top: 16px; }
   </ul>
 </section>
 
-<!-- ============================================================ CUSTOM ATTRIBUTES -->
-<section class="feature" id="custom-attributes">
-  <h2>Custom attributes</h2>
-  <p class="lead">The animator's knobs: user-made sliders and switches on controllers. They do nothing by themselves; what matters is what they drive.</p>
-  <div class="status"><span class="pill ok">Maya: tested</span><span class="pill ok">Offline: tested</span><span class="pill todo">Unreal: channels built, new links not run yet</span></div>
+<!-- ============================================================ POSE CHECK -->
+<section class="feature" id="pose-check">
+  <h2>Pose check</h2>
+  <p class="lead">The answer key: the same control moves are applied in Maya and in Unreal, and every joint and blendshape weight is compared.</p>
+  <div class="status"><span class="pill ok">Unreal: in use (Murakami 21/21 within T1)</span></div>
 
-  <h3>What it is in Maya</h3>
-  <div class="sol" style="border:0;padding-top:0">
-    <div>
-      <p>Examples on Murakami and the test rigs:</p>
-      <ul>
-        <li><code>IK_FK</code> on the limb switches;</li>
-        <li><code>BS_Smile</code> and the other face sliders on <code>head_ctrl</code>;</li>
-        <li><code>Wink</code> and <code>Eyelid_UP</code> on the eyes;</li>
-        <li><code>Petal_Translate</code> and <code>Petal_Rotation</code> on <code>Head_Settings_Ctrl</code>;</li>
-        <li>a "Space" enum on a space-switch controller.</li>
-      </ul>
-      <p>Not every extra attribute is a knob. Nodes also carry internal ones: our own <code>rigTag_*</code> tags, the manifest text, FBX bookkeeping.</p>
-    </div>
-    <figure>
-      <div class="tool" aria-label="A controller's extra attributes, with which ones are exported">
-        <div class="bar-t">head_ctrl: extra attributes</div>
-        <div class="row"><i class="d" style="background:var(--ok)"></i><span class="subj">BS_Smile</span><span>float 0–10, keyable · <span class="chip ok">exported</span></span></div>
-        <div class="row"><i class="d" style="background:var(--ok)"></i><span class="subj">BS_Omouth</span><span>float 0–10, keyable · <span class="chip ok">exported</span></span></div>
-        <div class="row"><i class="d" style="background:var(--ok)"></i><span class="subj">Space</span><span>enum World / Chest / Head · <span class="chip ok">exported</span></span></div>
-        <div class="row"><i class="d" style="background:var(--line-strong)"></i><span class="subj">rigTag_module</span><span class="muted">our own tag, hidden · skipped</span></div>
-        <div class="row"><i class="d" style="background:var(--line-strong)"></i><span class="subj">kotsudoManifest</span><span class="muted">manifest text · skipped</span></div>
-      </div>
-      <figcaption>Illustration combining real attribute names. Knobs are exported; internal attributes are skipped.</figcaption>
-    </figure>
-  </div>
+  <h3>What it is</h3>
+  <p>At export, Maya records a set of test poses (<code>murakami.poses.json</code>). After the build, Unreal replays each pose on the new rig and compares. The result is a verdict line, a report with per-module tiers, the worst poses, and a comparison with the previous run.</p>
 
   <h3>The challenges</h3>
   <ol class="challenges">
-    <li><b>Knowing which attributes are animator knobs</b>, among all the internal ones.</li>
-    <li><b>Unreal has no "extra attribute on a control".</b> The closest equivalent is an <b>animation channel</b>: a float that lives under a control and shows up in the Details panel, the Anim Outliner and Sequencer.</li>
-    <li><b>Knowing what each attribute drives</b>, and rebuilding that link. An attribute can drive an IK/FK blend, blendshape weights, constraint weights or group channels, through any chain of maths nodes.</li>
-    <li><b>Attributes that drive things we don't transfer</b> shouldn't disappear silently.</li>
-    <li><b>Attributes on controllers that belong to no module</b> (the settings controllers).</li>
+    <li><b>Which poses?</b> Enough to exercise every control, but few enough to run quickly.</li>
+    <li><b>Constant offsets.</b> The importer gives each bone a fixed axis difference, and a joint misplaced at rest would add the same error to every pose.</li>
+    <li><b>Controls with moved pivots</b> (pole vectors, pelvis, chest) replayed wrongly when only their translate channel was copied.</li>
+    <li><b>Measuring correctly.</b> The petals showed a constant 0.14° that didn't exist: a measurement artifact.</li>
+    <li><b>Straight limbs</b> make the middle joint's error look huge when it isn't (see <a href="#ikfk">IK/FK, solution 4</a>).</li>
   </ol>
 
   <h3>How we solved it</h3>
@@ -1126,131 +1961,307 @@ section[id] { scroll-margin-top: 16px; }
   <div class="sol">
     <div>
       <span class="num">SOLUTION 1</span>
-      <h4>Export animator-facing attributes only</h4>
-      <p>An attribute is exported when it is keyable or visible in the channel box, of a known type (float, int, bool, enum), and not an internal name. Each one carries its type, default, current value, min/max and enum labels.</p>
+      <h4>Rest, one probe per channel, random poses</h4>
+      <ul>
+        <li><b>Rest</b>, used for calibration.</li>
+        <li><b>Probes</b>: every unlocked rotate/translate channel (+20°, +5 cm), every custom slider to its limit, every enum to each value. IK/FK limbs are set to the mode the control belongs to.</li>
+        <li><b>12 random poses</b> moving 4 controls each, with random IK/FK modes.</li>
+      </ul>
+      <p>Each pose records every joint's world position and rotation, and every blendshape weight. Murakami: 292 poses.</p>
     </div>
     <figure>
-      <svg class="d" viewBox="0 0 520 150" role="img" aria-label="Filter: an attribute must be keyable or visible in the channel box, of a known type, and not internal, to be exported with its type, default, value, limits and labels.">
-        <rect class="bm" x="0" y="50" width="100" height="44" rx="5"/><text x="50" y="76" text-anchor="middle">attribute</text>
-        <rect class="bx" x="120" y="10" width="120" height="36" rx="5"/><text x="180" y="32" text-anchor="middle" class="s">keyable or in channel box?</text>
-        <rect class="bx" x="120" y="54" width="120" height="36" rx="5"/><text x="180" y="76" text-anchor="middle" class="s">float, int, bool, enum?</text>
-        <rect class="bx" x="120" y="98" width="120" height="36" rx="5"/><text x="180" y="120" text-anchor="middle" class="s">not an internal name?</text>
-        <rect class="bu" x="290" y="40" width="230" height="64" rx="5"/>
-        <text x="405" y="62" text-anchor="middle">exported with</text>
-        <text x="405" y="80" text-anchor="middle" class="s">type, default, value, min/max,</text>
-        <text x="405" y="95" text-anchor="middle" class="s">enum labels</text>
-        <line class="ln" x1="100" y1="72" x2="117" y2="72" marker-end="url(#arr)"/>
-        <path class="ln" d="M240,28 C265,28 265,60 287,62"/><line class="ln" x1="240" y1="72" x2="287" y2="72" marker-end="url(#arr)"/><path class="ln" d="M240,116 C265,116 265,84 287,82"/>
-        <text x="265" y="146" text-anchor="middle" class="s">all three must hold</text>
+      <svg class="d" viewBox="0 0 520 150" role="img" aria-label="Pose set: one rest pose, one probe per control channel and custom slider, and 12 random multi-control poses, for 292 poses on Murakami.">
+        <rect class="bm" x="0" y="20" width="60" height="70" rx="5"/><text x="30" y="52" text-anchor="middle">rest</text><text x="30" y="70" text-anchor="middle" class="s">1</text>
+        <rect class="bm" x="76" y="20" width="330" height="70" rx="5"/>
+        <g class="dot-m">
+          <circle cx="96" cy="40" r="3"/><circle cx="108" cy="40" r="3"/><circle cx="120" cy="40" r="3"/><circle cx="132" cy="40" r="3"/><circle cx="144" cy="40" r="3"/><circle cx="156" cy="40" r="3"/><circle cx="168" cy="40" r="3"/><circle cx="180" cy="40" r="3"/><circle cx="192" cy="40" r="3"/><circle cx="204" cy="40" r="3"/><circle cx="216" cy="40" r="3"/><circle cx="228" cy="40" r="3"/><circle cx="240" cy="40" r="3"/><circle cx="252" cy="40" r="3"/><circle cx="264" cy="40" r="3"/><circle cx="276" cy="40" r="3"/><circle cx="288" cy="40" r="3"/><circle cx="300" cy="40" r="3"/><circle cx="312" cy="40" r="3"/><circle cx="324" cy="40" r="3"/><circle cx="336" cy="40" r="3"/><circle cx="348" cy="40" r="3"/><circle cx="360" cy="40" r="3"/><circle cx="372" cy="40" r="3"/><circle cx="384" cy="40" r="3"/>
+        </g>
+        <text x="241" y="66" text-anchor="middle">probes: one channel or slider at a time</text>
+        <text x="241" y="82" text-anchor="middle" class="s">+20°, +5 cm, slider limits, each enum value</text>
+        <rect class="bm" x="422" y="20" width="98" height="70" rx="5"/><text x="471" y="52" text-anchor="middle">random</text><text x="471" y="70" text-anchor="middle" class="s">12 × 4 controls</text>
+        <text x="260" y="124" text-anchor="middle" class="h">292 poses on Murakami</text>
+        <text x="260" y="142" text-anchor="middle" class="s">probes that move nothing in Maya are flagged; Unreal must not move anything either</text>
       </svg>
-      <figcaption>This keeps our own tags and FBX bookkeeping out of the animator's controls.</figcaption>
+      <figcaption>A probe isolates one control, so a failing probe points straight at the setup to fix.</figcaption>
     </figure>
   </div>
 
   <div class="sol">
     <div>
       <span class="num">SOLUTION 2</span>
-      <h4>Each one becomes an animation channel on the same control</h4>
-      <p>In Unreal, each exported attribute becomes an animation channel on the matching control, with the same limits and default. You select the control and the slider is there.</p>
+      <h4>Compare motion from rest, after calibrating</h4>
+      <p>The error is Unreal's <b>motion from rest</b> against Maya's motion from rest. A constant offset (an importer axis difference, a joint misplaced at rest) cancels out.</p>
+      <p><b>Calibration</b> runs first: joints and controls at rest against Maya. It fails only when most joints are off (95th percentile above 0.1 cm), which means a conversion error. A few joints off are listed once as rest offsets.</p>
+      <p>Controls are replayed with their Maya <b>world-matrix</b> motion, which rotates about the pivot as Maya does.</p>
     </div>
     <figure>
-      <svg class="d" viewBox="0 0 520 170" role="img" aria-label="In the Unreal rig hierarchy, head_ctrl has child animation channels BS_Smile, BS_Omouth and Space, each with its limits.">
-        <text x="0" y="18" class="h ut">Unreal rig hierarchy</text>
-        <rect class="bu" x="0" y="30" width="170" height="32" rx="5"/><text x="12" y="51" class="c">head_ctrl</text><text x="160" y="51" text-anchor="end" class="s">control</text>
-        <path class="lg" d="M20,62 V150"/>
-        <path class="lg" d="M20,86 H44"/><rect class="bx" x="44" y="72" width="230" height="28" rx="4"/><text x="56" y="90" class="c">BS_Smile</text><text x="264" y="90" text-anchor="end" class="s">float 0–10, default 0</text>
-        <path class="lg" d="M20,118 H44"/><rect class="bx" x="44" y="104" width="230" height="28" rx="4"/><text x="56" y="122" class="c">BS_Omouth</text><text x="264" y="122" text-anchor="end" class="s">float 0–10, default 0</text>
-        <path class="lg" d="M20,150 H44"/><rect class="bx" x="44" y="136" width="230" height="28" rx="4"/><text x="56" y="154" class="c">Space</text><text x="264" y="154" text-anchor="end" class="s">float 0–2 (enum by number)</text>
-        <text x="300" y="90" class="s">shows in Details,</text>
-        <text x="300" y="106" class="s">Anim Outliner and Sequencer</text>
+      <svg class="d" viewBox="0 0 520 160" role="img" aria-label="Error equals Unreal's displacement from rest minus Maya's displacement from rest, so a constant rest offset cancels out.">
+        <circle cx="70" cy="110" r="6" class="dot-m"/><text x="70" y="134" text-anchor="middle" class="s">Maya rest</text>
+        <circle cx="200" cy="50" r="6" class="dot-m"/><text x="200" y="36" text-anchor="middle" class="s">Maya posed</text>
+        <line class="lm" x1="76" y1="107" x2="193" y2="54" marker-end="url(#arr-m)"/>
+        <circle cx="90" cy="122" r="6" class="dot-u"/><text x="96" y="148" class="s">Unreal rest (offset)</text>
+        <circle cx="222" cy="63" r="6" class="dot-u"/><text x="230" y="78" class="s">Unreal posed</text>
+        <line class="lu" x1="96" y1="119" x2="215" y2="66" marker-end="url(#arr-u)"/>
+        <rect class="bx" x="320" y="40" width="200" height="70" rx="5"/>
+        <text x="420" y="62" text-anchor="middle">error = |Δ Unreal − Δ Maya|</text>
+        <text x="420" y="82" text-anchor="middle" class="s">same arrow → error ≈ 0,</text>
+        <text x="420" y="98" text-anchor="middle" class="s">even with the rest offset</text>
       </svg>
-      <figcaption>Channels are keyable in Sequencer like any control value.</figcaption>
+      <figcaption>Teal: Maya's motion. Amber: Unreal's. The two arrows match even though the starting points differ.</figcaption>
     </figure>
   </div>
 
   <div class="sol">
     <div>
       <span class="num">SOLUTION 3</span>
-      <h4>One mechanism rebuilds every link</h4>
-      <p>The walker (see <a href="#walker-demo">the demo at the top</a>) describes what each attribute drives as maths. Unreal rebuilds it with float nodes feeding one of four kinds of target.</p>
+      <h4>Tiers, and the right maths for angles</h4>
+      <p>Each module gets a tier: <b>T0</b> ≤ 0.01 cm / 0.01°, <b>T1</b> ≤ 0.1 cm / 0.5°, otherwise "above T1".</p>
+      <p>The petal "0.14°" came from the maths. The poses file stores rounded quaternions (rotation records), and the angle was computed with <code>acos</code>, which turns tiny rounding into a visible angle near zero. Now the quaternions are normalised and the angle uses <code>atan2</code>. The petals became T0.</p>
+      <p>Move the rounding error: the true angle is always 0.</p>
     </div>
     <figure>
-      <svg class="d" viewBox="0 0 520 210" role="img" aria-label="A slider channel goes through the walker's float maths into four kinds of target: IK solver weight, morph target curve, constraint weight, and driven group channel.">
-        <rect class="bm" x="0" y="82" width="100" height="44" rx="5"/><text x="50" y="102" text-anchor="middle">slider</text><text x="50" y="118" text-anchor="middle" class="s">channel</text>
-        <rect class="bu" x="140" y="82" width="120" height="44" rx="5"/><text x="200" y="102" text-anchor="middle">float maths</text><text x="200" y="118" text-anchor="middle" class="s">from the walker</text>
-        <line class="ln" x1="100" y1="104" x2="137" y2="104" marker-end="url(#arr)"/>
-        <rect class="bu" x="320" y="8" width="200" height="38" rx="5"/><text x="420" y="25" text-anchor="middle">IK solver weight</text><text x="420" y="39" text-anchor="middle" class="s">IK/FK switch</text>
-        <rect class="bu" x="320" y="58" width="200" height="38" rx="5"/><text x="420" y="75" text-anchor="middle">morph target curve</text><text x="420" y="89" text-anchor="middle" class="s">blendshapes</text>
-        <rect class="bu" x="320" y="108" width="200" height="38" rx="5"/><text x="420" y="125" text-anchor="middle">constraint weight</text><text x="420" y="139" text-anchor="middle" class="s">space switching</text>
-        <rect class="bu" x="320" y="158" width="200" height="38" rx="5"/><text x="420" y="175" text-anchor="middle">driven group channel</text><text x="420" y="189" text-anchor="middle" class="s">offset groups (petals)</text>
-        <path class="lu" d="M260,96 C290,96 290,27 317,27" marker-end="url(#arr-u)"/>
-        <path class="lu" d="M260,100 C290,100 290,77 317,77" marker-end="url(#arr-u)"/>
-        <path class="lu" d="M260,108 C290,108 290,127 317,127" marker-end="url(#arr-u)"/>
-        <path class="lu" d="M260,112 C290,112 290,177 317,177" marker-end="url(#arr-u)"/>
+      <svg class="d" id="ac-svg" viewBox="0 0 520 200" role="img" aria-label="Interactive: for a true angle of zero, a tiny quaternion rounding error gives about a tenth of a degree with acos, and zero with normalise plus atan2.">
+        <line class="ln" x1="60" y1="160" x2="500" y2="160"/><line class="ln" x1="60" y1="160" x2="60" y2="20"/>
+                <line class="lg" x1="60" y1="110" x2="500" y2="110"/><text x="496" y="104" text-anchor="end" class="s">0.1°</text>
+        <path id="ac-curve" class="lw" style="stroke-dasharray:none;stroke-width:2"/>
+        <line x1="60" y1="160" x2="500" y2="160" class="lm" style="stroke-width:3"/>
+        <circle id="ac-dot" r="6" class="dot-u"/>
+        <text x="280" y="190" text-anchor="middle" class="s">quaternion rounding error (length off by …)</text>
+        <text id="ac-read1" x="80" y="36" class="c wt"></text>
+        <text id="ac-read2" x="80" y="54" class="c mt"></text>
       </svg>
-      <figcaption>One description language, one Unreal builder (<code>driver_ops.py</code>). A fix to the walker improves all four features at once.</figcaption>
+      <div class="controls"><label for="ac-e">Rounding <input type="range" id="ac-e" min="0" max="100" value="30"> <span class="val" id="ac-ev"></span></label></div>
+      <figcaption>Red: acos(|dot|), the old maths. Teal: normalise then 2·atan2(|v|, |w|), always 0 here. Murakami's quaternions were off by about 3·10⁻⁷.</figcaption>
     </figure>
   </div>
 
   <div class="sol">
     <div>
       <span class="num">SOLUTION 4</span>
-      <h4>Anything else is reported</h4>
-      <p>The Checks tab follows every slider downstream. If it moves a joint or group through a node network we don't transfer, it says so. That's how the petal sliders were found. Now that they're transferred, the warning is gone.</p>
+      <h4>A report that points at the fix</h4>
+      <p>The Output Log ends with a <code>VERDICT</code> line, the module tiers, the five worst controls and what changed since the last run. The full report (HTML and JSON) sits next to the poses file:</p>
+      <ul>
+        <li>worst poses list their three worst joints, so you see where a chain breaks;</li>
+        <li>"controls whose probe breaks the most" names the setup to fix;</li>
+        <li>each module is marked better, WORSE, mixed or same against the previous run;</li>
+        <li>near-straight limbs show raw and unexplained errors side by side.</li>
+      </ul>
     </div>
     <figure>
-      <div class="tool">
-        <div class="bar-t">Checks tab: Head_Settings_Ctrl</div>
-        <div class="row old"><i class="d" style="background:var(--ue)"></i><span>Not transferred</span><span><span class="subj">.Petal_Rotation</span><br><span class="msg">moves 12 transforms through a node network; not transferred</span></span></div>
-        <div class="row"><i class="d" style="background:var(--ok)"></i><span>Controller</span><span><span class="subj">pedal_ctrl_01</span><br>pedal_NULLctrl_01 driven (rotateX ← Petal_Rotation × 8)</span></div>
-      </div>
-      <figcaption>Before (struck through) and now. The warning pointed straight at the next feature to build.</figcaption>
-    </figure>
-  </div>
-
-  <div class="sol">
-    <div>
-      <span class="num">SOLUTION 5</span>
-      <h4>Settings controllers and pose probes</h4>
-      <p>Sliders on controllers that belong to no module are handled by the settings controllers (offset groups, solution 8).</p>
-      <p>The pose check then probes them: every custom slider is moved to its limit, and every enum to each value. Unreal must produce the same joints and the same blendshape weights as Maya. Murakami has 292 test poses.</p>
-    </div>
-    <figure>
-      <svg class="d" viewBox="0 0 520 130" role="img" aria-label="For each custom slider, Maya records a pose at its limit; for each enum, a pose per value; Unreal replays them and the joints and blendshape weights are compared.">
-        <rect class="bm" x="0" y="20" width="150" height="40" rx="5"/><text x="75" y="38" text-anchor="middle" class="s">slider → its limit</text><text x="75" y="52" text-anchor="middle" class="s">enum → each value</text>
-        <rect class="bm" x="180" y="20" width="140" height="40" rx="5"/><text x="250" y="45" text-anchor="middle">Maya records pose</text>
-        <rect class="bu" x="350" y="20" width="170" height="40" rx="5"/><text x="435" y="45" text-anchor="middle">Unreal replays it</text>
-        <line class="ln" x1="150" y1="40" x2="177" y2="40" marker-end="url(#arr)"/><line class="ln" x1="320" y1="40" x2="347" y2="40" marker-end="url(#arr)"/>
-        <rect class="bx" x="180" y="84" width="340" height="36" rx="5"/><text x="350" y="106" text-anchor="middle">compare joints (cm, °) and blendshape weights (± 0.001)</text>
-        <line class="ln" x1="250" y1="60" x2="250" y2="81" marker-end="url(#arr)"/><line class="ln" x1="435" y1="60" x2="435" y2="81" marker-end="url(#arr)"/>
-      </svg>
-      <figcaption>The pose check gets its own section in a later batch.</figcaption>
+      <div class="log">VERDICT: 21/21 module(s) within T1<br>  Spine        T1  0.056 cm  0.05°<br>  L_ArmLeaf    T1  (near-straight: elbow 0.39 cm raw, explained)<br>  PetalPurple  T0<br>vs previous: L_LegLeafToe better</div>
+      <figcaption>Example of the summary's shape (abridged), with values from Murakami's runs. Once blendshapes run in Unreal, a "blendshapes N/M match" line is added. The tagger tool also shows each module's tier next to it.</figcaption>
     </figure>
   </div>
 
   <h3>How we know it works</h3>
   <ul>
-    <li><code>tests/maya_blendshape_drivers_test.py</code>: 12 wiring types (multiply, divide, power, add, reverse, clamp, remap, driven keys, conditions, chains), plus driven rotate and translate channels in centimetre and metre scenes. The walker's description, replayed, gives Maya's value.</li>
-    <li><code>tests/offline_blendshapes_test.py</code>: the Unreal float graph, evaluated with numbers, matches the same reference, including the compare fallback.</li>
-    <li>Maya stores some utility results in 32-bit floats, so the tests allow a 0.0001 difference.</li>
+    <li>Offline tests of the scoring, including a fake 0.3 cm error on a bent arm that still scores 0.299 (the straight-limb allowance doesn't hide real errors).</li>
+    <li>It found every bug in this document's earlier sections; each fix was confirmed by a better pose report.</li>
   </ul>
 
   <h3>Limits</h3>
   <ul>
-    <li><b>Unreal's channels are all floats for now.</b> An enum works by number (0, 1, 2). Its labels are in the manifest and shown in the tool, but not on the Unreal slider. Unreal's integer or enum control types would be the improvement.</li>
-    <li>Bool attributes also become 0–1 float sliders.</li>
+    <li>The Unreal side drives a rig instance from Python; if the engine gives no fresh instance it uses the editor's own, reset before every pose.</li>
+    <li>Evidence so far comes from one character. A second rig would show what still depends on Murakami.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ GRAPH LAYOUT -->
+<section class="feature" id="graph-layout">
+  <h2>Graph layout</h2>
+  <p class="lead">Making the generated Control Rig graph readable: nodes that don't overlap, grouped in named boxes, one per module.</p>
+  <div class="status"><span class="pill ok">Offline: tested</span><span class="pill ok">Unreal: in use</span></div>
+
+  <h3>What it is</h3>
+  <p>The builder creates hundreds of nodes. Without layout they pile up on top of each other, and nobody can find the spine's nodes among the petals'.</p>
+
+  <h3>The challenges</h3>
+  <ol class="challenges">
+    <li><b>Node sizes are unknown.</b> The editor only knows a node's real size once it has been drawn.</li>
+    <li><b>Wires should read left to right</b>, with few crossings.</li>
+    <li><b>Hundreds of modules' worth of nodes</b> must stay findable.</li>
+  </ol>
+
+  <h3>How we solved it</h3>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 1</span>
+      <h4>Columns follow the wiring</h4>
+      <p>Inside a module, a node sits one column to the right of everything that feeds it. A node that only feeds others is pulled right, next to its first consumer, so getters sit beside the node they feed. Inside a column, nodes keep the order of their inputs, which reduces crossing wires.</p>
+      <p>Sizes are estimated from the title length and the number of visible pins, rounded up, with generous gaps, so a slightly short estimate never makes nodes touch.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 200" role="img" aria-label="Before: nodes piled at random with crossing wires. After: nodes in columns following the wiring, left to right.">
+        <text x="120" y="16" text-anchor="middle" class="h wt">Before</text>
+        <rect class="bx" x="40" y="40" width="70" height="30" rx="4"/><rect class="bx" x="80" y="60" width="70" height="30" rx="4" style="fill-opacity:.85"/><rect class="bx" x="60" y="110" width="70" height="30" rx="4"/><rect class="bx" x="120" y="95" width="70" height="30" rx="4" style="fill-opacity:.85"/><rect class="bx" x="30" y="150" width="70" height="30" rx="4"/>
+        <path class="lg" d="M75,70 L155,110 M115,75 L65,165 M95,140 L185,110 M60,150 L150,75"/>
+        <text x="370" y="16" text-anchor="middle" class="h ot">After</text>
+        <rect class="bx" x="250" y="50" width="62" height="28" rx="4"/><text x="281" y="68" text-anchor="middle" class="s">Get</text>
+        <rect class="bx" x="250" y="120" width="62" height="28" rx="4"/><text x="281" y="138" text-anchor="middle" class="s">Get</text>
+        <rect class="bx" x="340" y="50" width="62" height="28" rx="4"/><text x="371" y="68" text-anchor="middle" class="s">Math</text>
+        <rect class="bx" x="340" y="120" width="62" height="28" rx="4"/><text x="371" y="138" text-anchor="middle" class="s">Math</text>
+        <rect class="bu" x="440" y="85" width="72" height="28" rx="4"/><text x="476" y="103" text-anchor="middle" class="s">Set</text>
+        <line class="ln" x1="312" y1="64" x2="337" y2="64" marker-end="url(#arr)"/><line class="ln" x1="312" y1="134" x2="337" y2="134" marker-end="url(#arr)"/>
+        <path class="ln" d="M402,64 C420,64 420,96 437,96" marker-end="url(#arr)"/><path class="ln" d="M402,134 C420,134 420,102 437,102" marker-end="url(#arr)"/>
+        <text x="281" y="180" text-anchor="middle" class="s">col 1</text><text x="371" y="180" text-anchor="middle" class="s">col 2</text><text x="476" y="180" text-anchor="middle" class="s">col 3</text>
+      </svg>
+      <figcaption>Only positions change; every link is kept.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 2</span>
+      <h4>One named, coloured box per module</h4>
+      <p>Each module's nodes are framed by a comment box named after the module (<code>[RB] Spine</code>), coloured by module type. Boxes stack downwards in build order, and a new column starts when the stack gets too tall. Blendshapes and shared nodes get their own boxes.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 210" role="img" aria-label="Comment boxes stacked in build order: Start, Spine (spline IK, blue), L_LegLeaf (IK/FK, orange), Neck (FK, green), Blendshapes (pink); a new column starts when the stack is too tall.">
+        <rect x="10" y="10" width="200" height="30" rx="4" style="fill:rgb(77,77,77);fill-opacity:.35;stroke:none"/><text x="20" y="30" class="c">[RB] Start</text>
+        <rect x="10" y="50" width="200" height="50" rx="4" style="fill:rgb(26,77,166);fill-opacity:.35;stroke:none"/><text x="20" y="70" class="c">[RB] Spine</text><text x="20" y="88" class="s">SplineIK</text>
+        <rect x="10" y="110" width="200" height="40" rx="4" style="fill:rgb(179,97,13);fill-opacity:.35;stroke:none"/><text x="20" y="130" class="c">[RB] L_LegLeaf</text><text x="20" y="144" class="s">IKFKSwitch</text>
+        <rect x="10" y="160" width="200" height="40" rx="4" style="fill:rgb(20,128,102);fill-opacity:.35;stroke:none"/><text x="20" y="180" class="c">[RB] Neck</text><text x="20" y="194" class="s">FKChain</text>
+        <rect x="250" y="10" width="200" height="40" rx="4" style="fill:rgb(20,128,102);fill-opacity:.35;stroke:none"/><text x="260" y="30" class="c">[RB] PetalPurple</text><text x="260" y="44" class="s">FKChain</text>
+        <rect x="250" y="60" width="200" height="40" rx="4" style="fill:rgb(166,51,102);fill-opacity:.35;stroke:none"/><text x="260" y="80" class="c">[RB] Blendshapes</text>
+        <path class="lg" d="M210,190 C230,190 230,20 247,20" marker-end="url(#arr)"/>
+        <text x="350" y="140" text-anchor="middle" class="s">new column when the stack</text><text x="350" y="156" text-anchor="middle" class="s">passes 9000 graph units</text>
+      </svg>
+      <figcaption>Box colours by type: blue spline IK, orange IK/FK, purple IK, green FK, pink blendshapes. Rebuilding removes and redraws every box.</figcaption>
+    </figure>
+  </div>
+
+  <h3>How we know it works</h3>
+  <ul>
+    <li>The layout maths is plain Python, so it runs without Unreal. It was checked that way when written (no overlaps, every node inside its box), but that check was lost with an old scratch folder: there is no test file in <code>tests/</code> for it yet.</li>
+    <li>In Unreal, the generated graph shows one box per module.</li>
+  </ul>
+
+  <h3>Limits</h3>
+  <ul>
+    <li>Sizes are estimates, so spacing is generous rather than tight.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ TAGGER TOOL -->
+<section class="feature" id="tagger-tool">
+  <h2>Tagger tool and Checks</h2>
+  <p class="lead">The Maya window where the artist declares what each part of the rig is, checks what will transfer, and exports.</p>
+  <div class="status"><span class="pill ok">Maya: tested (offscreen UI test)</span></div>
+
+  <h3>What it is in Maya</h3>
+  <p>A window with three tabs, opened from the shelf:</p>
+  <ul>
+    <li><b>Modules</b>: tag joint chains (start and end bone, type, name), see each module's controllers and setup, and export.</li>
+    <li><b>Blendshapes</b>: register blendshape nodes and targets (see <a href="#blendshapes">blendshapes</a>).</li>
+    <li><b>Checks</b>: everything the export will and won't transfer, by severity.</li>
+  </ul>
+
+  <h3>The challenges</h3>
+  <ol class="challenges">
+    <li><b>Meaning can't be guessed reliably.</b> Whether a chain is a limb or a tail is the artist's decision.</li>
+    <li><b>Problems should show before export</b>, not after a long Unreal build.</li>
+    <li><b>Feedback from Unreal</b> should come back to the place where the artist works.</li>
+    <li><b>Maya caches old code</b>: after an update, the shelf button ran the previous version, and no poses file was written.</li>
+  </ol>
+
+  <h3>How we solved it</h3>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 1</span>
+      <h4>The artist declares the meaning; the tool finds the evidence</h4>
+      <p>Tags are plain attributes on the joints (<code>rigTag_moduleType</code>, <code>rigTag_moduleName</code>, <code>rigTag_startBone</code>, <code>rigTag_endBone</code>, <code>rigTag_role</code>…). Everything else (controllers, constraints, spaces, sliders, groups) is found by reading the scene.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 170" role="img" aria-label="The artist provides tags on joints: type, name, start and end bone. The exporter finds the rest from the scene: controllers, constraints, spaces, sliders, groups, materials.">
+        <rect class="bm" x="0" y="20" width="200" height="130" rx="5"/>
+        <text x="100" y="42" text-anchor="middle" class="h">Artist declares</text>
+        <text x="16" y="66" class="c">moduleType</text><text x="16" y="86" class="c">moduleName</text><text x="16" y="106" class="c">startBone / endBone</text><text x="16" y="126" class="c">role</text>
+        <rect class="bu" x="300" y="20" width="220" height="130" rx="5"/>
+        <text x="410" y="42" text-anchor="middle" class="h">Tool finds</text>
+        <text x="316" y="66" class="s">controllers and their pivots</text><text x="316" y="84" class="s">constraints and spaces</text><text x="316" y="102" class="s">sliders and their maths</text><text x="316" y="120" class="s">offset groups, blendshapes</text><text x="316" y="138" class="s">materials, rest pose</text>
+        <line class="ln" x1="200" y1="85" x2="297" y2="85" marker-end="url(#arr)"/><text x="248" y="78" text-anchor="middle" class="s">export</text>
+      </svg>
+      <figcaption>The first principle of the project, applied in the UI: the declaration is small, the evidence is extracted.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 2</span>
+      <h4>Analyze Scene and the Checks tab</h4>
+      <p><b>Analyze Scene</b> runs the same analysis as the export, without exporting. Each module gets a <b>Controllers</b> branch (pivot, shape, space, groups) and a <b>Setup</b> branch (IK/FK switch, pole vector, curve points, constraints, spaces). The <b>Checks</b> tab lists errors, things to review, and notes, each with its reason.</p>
+    </div>
+    <figure>
+      <div class="tool">
+        <div class="bar-t">Checks (Murakami): 0 error(s), 0 to review, 2 note(s)</div>
+        <div class="row"><i class="d" style="background:var(--line-strong)"></i><span>Materials</span><span><span class="subj">6 material(s)</span><br>transferred as flat colours (ACEScg)</span></div>
+        <div class="row"><i class="d" style="background:var(--line-strong)"></i><span>Space switch</span><span><span class="subj">L_FootFKctrl</span><br>IK = L_LegIKctrl, FK = L_LegFKctrl_03</span></div>
+      </div>
+      <figcaption>The summary line is Murakami's current result; the two rows are examples of notes. Severity: red error (export would be wrong), orange review (something won't transfer), grey note (for information).</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 3</span>
+      <h4>Unreal's verdict comes back into the tool</h4>
+      <p>When a pose report exists next to the export, the tool shows each module's tier in a column, the verdict in a label, and blendshape results per target. <b>Open Pose Report</b> opens the HTML. The export fields (rig name, file name, folder) are remembered between sessions, and after export a summary lists modules, blendshape targets, controller shapes and test poses.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 150" role="img" aria-label="Loop: export from the tagger tool, build in Unreal, the pose report is written next to the export, and the tool reads it back and shows tiers per module.">
+        <rect class="bm" x="0" y="50" width="130" height="44" rx="5"/><text x="65" y="69" text-anchor="middle">Tagger tool</text><text x="65" y="85" text-anchor="middle" class="s">export</text>
+        <rect class="bu" x="195" y="50" width="130" height="44" rx="5"/><text x="260" y="69" text-anchor="middle">Unreal build</text><text x="260" y="85" text-anchor="middle" class="s">+ pose check</text>
+        <rect class="bx" x="390" y="50" width="130" height="44" rx="5"/><text x="455" y="69" text-anchor="middle">pose report</text><text x="455" y="85" text-anchor="middle" class="s">next to the FBX</text>
+        <line class="lm" x1="130" y1="72" x2="192" y2="72" marker-end="url(#arr-m)"/>
+        <line class="lu" x1="325" y1="72" x2="387" y2="72" marker-end="url(#arr-u)"/>
+        <path class="ln" d="M455,94 V130 H65 V97" marker-end="url(#arr)"/>
+        <text x="260" y="124" text-anchor="middle" class="s">tiers per module, verdict, blendshape results</text>
+      </svg>
+      <figcaption>The artist sees Unreal's result where they fix the rig.</figcaption>
+    </figure>
+  </div>
+
+  <div class="sol">
+    <div>
+      <span class="num">SOLUTION 4</span>
+      <h4>The shelf button reloads the code</h4>
+      <p>The launcher reloads the tool's modules and clears Python's import caches before opening, so an update is always picked up, including files added after Maya started.</p>
+    </div>
+    <figure>
+      <svg class="d" viewBox="0 0 520 90" role="img" aria-label="Shelf button: invalidate import caches, reload the modules, then open the tool.">
+        <rect class="bm" x="0" y="24" width="110" height="40" rx="5"/><text x="55" y="48" text-anchor="middle">shelf button</text>
+        <rect class="bx" x="140" y="24" width="150" height="40" rx="5"/><text x="215" y="48" text-anchor="middle" class="s">invalidate import caches</text>
+        <rect class="bx" x="320" y="24" width="90" height="40" rx="5"/><text x="365" y="48" text-anchor="middle" class="s">reload modules</text>
+        <rect class="bm" x="440" y="24" width="80" height="40" rx="5"/><text x="480" y="48" text-anchor="middle">open</text>
+        <line class="ln" x1="110" y1="44" x2="137" y2="44" marker-end="url(#arr)"/><line class="ln" x1="290" y1="44" x2="317" y2="44" marker-end="url(#arr)"/><line class="ln" x1="410" y1="44" x2="437" y2="44" marker-end="url(#arr)"/>
+      </svg>
+      <figcaption><code>kotsudo_launcher.launch()</code></figcaption>
+    </figure>
+  </div>
+
+  <h3>How we know it works</h3>
+  <ul>
+    <li><code>tests/maya_tool_ui_test.py</code> builds the real window without a screen on a copy of Murakami and checks the tabs, blendshape registration, Analyze Scene, the Setup rows, the Unreal report column, the export summary and the remembered fields.</li>
+  </ul>
+
+  <h3>Limits</h3>
+  <ul>
+    <li>Tagging is manual. A suggestion feature (proposing modules from the scene) would speed up a new character.</li>
   </ul>
 </section>
 
 <!-- ============================================================ UNREAL TODO -->
 <section class="feature" id="unreal-todo">
   <h2>Not yet run in Unreal</h2>
-  <p class="lead">Everything above is checked against Maya and offline. These Unreal functions are used for the first time.</p>
+  <p class="lead">The modules, constraints, rest correction and layout run in Unreal today (21/21 modules within T1). The newer features are checked against Maya and offline, and these Unreal functions are used for the first time.</p>
   <ul>
     <li>the compare and select nodes;</li>
     <li>the Rotation and Position constraints;</li>
     <li>the quaternion and vector nodes;</li>
-    <li>creating materials and material instances, and assigning slots.</li>
+    <li>creating materials and material instances, and assigning slots;</li>
+    <li>adding morph curves and the Set Curve Value node for blendshapes.</li>
   </ul>
   <p>If one has a different name in Unreal 5.6, the log names it, and that part falls back without breaking the build.</p>
   <div class="box-note">
@@ -1261,6 +2272,7 @@ section[id] { scroll-margin-top: 16px; }
 <footer>
   <p><b>Changelog</b></p>
   <ul>
+    <li>2026-10-22: all features covered: added pipeline and manifest, IK/FK limbs, spline IK, constraints and follow spaces, rest correction, blendshapes, pose check, graph layout, tagger tool. Page reordered from foundations to tools.</li>
     <li>2026-10-22: first batch: the shared walker, space switching, offset / zero groups, materials, custom attributes.</li>
   </ul>
   <p>Source: <code>docs/explainer/kotsudo-explained.html</code> in the Kotsudo repository. Updated whenever a feature changes.</p>
@@ -1511,8 +2523,183 @@ section[id] { scroll-margin-top: 16px; }
     el("path", { d: "M360," + (y + 14) + " C385," + (y + 14) + " 385,115 407,115", class: "lu", "marker-end": "url(#arr-u)" }, rows);
   });
 
+  /* ---------------- manifest explorer ---------------- */
+  const MF = [
+    ["modules", "Each tagged module: type, name, joint chain, and its parameters (IK/FK switch, pole vector, spline CVs and weights, constraints)."],
+    ["bone_controllers", "One record per Maya controller: origin (pivot), offset from its anchor bone in two encodings, orientation, shape id, colour, locked channels, custom attributes, parent controllers, follow space, group stack."],
+    ["rest_pose", "Every joint's rest frame and bind frame, so Unreal can start from Maya's rest (see rest correction)."],
+    ["blendshapes", "Each registered target with its driver slider and the maths in between."],
+    ["settings_controls", "Controllers outside every module whose sliders drive exported things (Head_Settings_Ctrl)."],
+    ["materials", "Each material on an exported mesh with its colour already in Unreal's colour space."],
+    ["module_graph", "The build order and which module hangs under which (the spine before the limbs, the leg before its toe)."],
+    ["control_shapes", "Each controller shape by id: the points of its curves and the tube mesh file made from them."],
+    ["units", "Declares centimetres, degrees and the axis convention (coordinate_system) the whole file uses."]
+  ];
+  const mfPick = $("mf-pick"), mfDet = $("mf-detail");
+  const mfSeg = document.createElement("div"); mfSeg.className = "seg"; mfSeg.style.flexWrap = "wrap"; mfSeg.setAttribute("role", "group"); mfSeg.setAttribute("aria-label", "Manifest part");
+  mfPick.appendChild(mfSeg);
+  MF.forEach((m, i) => {
+    const b = document.createElement("button"); b.type = "button"; b.textContent = m[0]; b.style.fontFamily = "var(--mono)"; b.style.fontSize = "12px";
+    b.setAttribute("aria-pressed", i === 1 ? "true" : "false");
+    b.addEventListener("click", () => { mfSeg.querySelectorAll("button").forEach((o, j) => o.setAttribute("aria-pressed", j === i ? "true" : "false")); mfShow(i); });
+    mfSeg.appendChild(b);
+  });
+  function mfShow(i) { mfDet.innerHTML = '<span class="k">' + MF[i][0] + '</span><span>' + MF[i][1] + "</span>"; }
+  mfShow(1);
+
+  /* ---------------- driver null demo ---------------- */
+  function dnRender() {
+    const a = +$("dn-rot").value, PV = [150, 150];
+    const n = rot([300, 90], PV, a), b = rot([380, 58], PV, a);
+    const arm = $("dn-arm"); arm.setAttribute("x2", n[0]); arm.setAttribute("y2", n[1]);
+    $("dn-null").setAttribute("x", n[0] - 6); $("dn-null").setAttribute("y", n[1] - 6);
+    const bone = $("dn-bone"); bone.setAttribute("x1", n[0]); bone.setAttribute("y1", n[1]); bone.setAttribute("x2", b[0]); bone.setAttribute("y2", b[1]);
+    $("dn-null-t").setAttribute("x", n[0]); $("dn-null-t").setAttribute("y", n[1] + 26);
+  }
+  $("dn-rot").addEventListener("input", dnRender); dnRender();
+
+  /* ---------------- two-bone IK demo ---------------- */
+  const IR = [90, 70], IA = 120, IB = 110;
+  function polar(p, deg, len) { const r = (deg * Math.PI) / 180; return [p[0] + len * Math.cos(r), p[1] + len * Math.sin(r)]; }
+  function ikRender() {
+    const w = +$("ik-w").value, fka = +$("ik-fka").value;
+    let T = [+$("ik-tx").value, +$("ik-ty").value];
+    $("ik-wv").textContent = w.toFixed(2);
+    /* FK: shoulder angle from slider, elbow bent 40 degrees */
+    const fkA = fka, fkB = fka + 40;
+    /* IK: law of cosines, bend toward the pole (downward) */
+    let dx = T[0] - IR[0], dy = T[1] - IR[1], d = Math.hypot(dx, dy);
+    d = Math.min(Math.max(d, Math.abs(IA - IB) + 1), IA + IB - 0.01);
+    const base = (Math.atan2(dy, dx) * 180) / Math.PI;
+    const cA = Math.acos((IA * IA + d * d - IB * IB) / (2 * IA * d)) * 180 / Math.PI;
+    const ikA = base - cA;
+    const m = polar(IR, ikA, IA);
+    const reach = polar(IR, base, d);
+    const ikB = (Math.atan2(reach[1] - m[1], reach[0] - m[0]) * 180) / Math.PI;
+    const lerpAng = (a, b) => { let dd = ((b - a + 540) % 360) - 180; return a + dd * w; };
+    const rA = lerpAng(fkA, ikA), rB = lerpAng(fkB, ikB);
+    const pts = (a1, a2) => { const p1 = polar(IR, a1, IA), p2 = polar(p1, a2, IB); return [IR, p1, p2]; };
+    const str = (ps) => ps.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ");
+    $("ik-fk").setAttribute("points", str(pts(fkA, fkB)));
+    $("ik-ik").setAttribute("points", str(pts(ikA, ikB)));
+    const res = pts(rA, rB);
+    $("ik-res").setAttribute("points", str(res));
+    $("ik-root").setAttribute("cx", IR[0]); $("ik-root").setAttribute("cy", IR[1]);
+    $("ik-mid").setAttribute("cx", res[1][0]); $("ik-mid").setAttribute("cy", res[1][1]);
+    $("ik-target").setAttribute("cx", T[0]); $("ik-target").setAttribute("cy", T[1]);
+    $("ik-target-t").setAttribute("x", T[0]); $("ik-target-t").setAttribute("y", T[1] + 26);
+  }
+  ["ik-w", "ik-fka", "ik-tx", "ik-ty"].forEach((id) => $(id).addEventListener("input", ikRender)); ikRender();
+
+  /* ---------------- straight limb chart ---------------- */
+  const SA = 350, SB = 350, SMAX = 0.05;
+  function hOf(s) { const d = SA + SB - s; const x = (SA * SA - SB * SB + d * d) / (2 * d); return Math.sqrt(Math.max(0, SA * SA - x * x)); }
+  const HMAX = hOf(SMAX) * 1.08;
+  const sx = (s) => 60 + (s / SMAX) * 440, sy = (h) => 190 - (h / HMAX) * 170;
+  (function () {
+    const g = $("sl-ticks");
+    [0, 0.01, 0.02, 0.03, 0.04, 0.05].forEach((s) => { el("line", { x1: sx(s), y1: 190, x2: sx(s), y2: 195, class: "ln" }, g); const t = el("text", { x: sx(s), y: 207, "text-anchor": "middle", class: "s" }, g); t.textContent = s; });
+    [0, 1, 2, 3, 4, 5, 6].forEach((h) => { if (h > HMAX) return; el("line", { x1: 55, y1: sy(h), x2: 60, y2: sy(h), class: "ln" }, g); const t = el("text", { x: 50, y: sy(h) + 4, "text-anchor": "end", class: "s" }, g); t.textContent = h; });
+    let d = ""; for (let i = 0; i <= 200; i++) { const s = (i / 200) * SMAX; d += (i ? " L" : "M") + sx(s).toFixed(1) + "," + sy(hOf(s)).toFixed(1); }
+    $("sl-curve").setAttribute("d", d);
+  })();
+  function slRender() {
+    const s = +$("sl-s").value, h = hOf(s);
+    $("sl-sv").textContent = s.toFixed(4) + " cm";
+    $("sl-dot").setAttribute("cx", sx(s)); $("sl-dot").setAttribute("cy", sy(h));
+    const v = $("sl-v"); v.setAttribute("x1", sx(s)); v.setAttribute("x2", sx(s)); v.setAttribute("y1", 190); v.setAttribute("y2", sy(h));
+    const hh = $("sl-h"); hh.setAttribute("x1", 60); hh.setAttribute("x2", sx(s)); hh.setAttribute("y1", sy(h)); hh.setAttribute("y2", sy(h));
+    $("sl-read").textContent = "slack " + s.toFixed(4) + " cm  →  elbow moves " + h.toFixed(2) + " cm";
+  }
+  $("sl-s").addEventListener("input", slRender); slRender();
+
+  /* ---------------- spline IK demo ---------------- */
+  const SPW = [[1, 0, 0], [0.5, 0.4, 0.1], [0.1, 0.4, 0.5], [0, 0, 1]];
+  const SPC0 = [[260, 250], [260, 150], [260, 50]];
+  const SPCV0 = [[260, 250], [260, 190], [260, 110], [260, 50]];
+  const BONES = [62, 62, 62];
+  function top2(w) { const idx = [0, 1, 2].sort((a, b) => w[b] - w[a]).slice(0, 2); const s = w[idx[0]] + w[idx[1]]; return w.map((v, i) => (idx.includes(i) ? v / s : 0)); }
+  function bez(c, t) { const u = 1 - t; return [0, 1].map((k) => u * u * u * c[0][k] + 3 * u * u * t * c[1][k] + 3 * u * t * t * c[2][k] + t * t * t * c[3][k]); }
+  function fit(c) {
+    const pts = []; for (let i = 0; i <= 300; i++) pts.push(bez(c, i / 300));
+    const out = [pts[0]]; let acc = 0, bi = 0, need = BONES[0];
+    for (let i = 1; i < pts.length && bi < BONES.length; i++) {
+      const seg = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]); acc += seg;
+      if (acc >= need) { out.push(pts[i]); bi++; acc = 0; need = BONES[bi]; }
+    }
+    return { pts, joints: out };
+  }
+  function splRender() {
+    const g = $("spl-g"); while (g.firstChild) g.removeChild(g.firstChild);
+    const cx = +$("spl-c").value, mx = +$("spl-m").value;
+    const C = [SPC0[0], [SPC0[1][0] + mx, SPC0[1][1]], [SPC0[2][0] + cx, SPC0[2][1]]];
+    const delta = C.map((c, i) => [c[0] - SPC0[i][0], c[1] - SPC0[i][1]]);
+    const cvs = (weights) => SPCV0.map((p, i) => { const w = weights[i]; return [p[0] + w[0] * delta[0][0] + w[1] * delta[1][0] + w[2] * delta[2][0], p[1] + w[0] * delta[0][1] + w[1] * delta[1][1] + w[2] * delta[2][1]]; });
+    const showOld = $("spl-old").checked;
+    if (showOld) {
+      const o = fit(cvs(SPW.map(top2)));
+      el("path", { d: "M" + o.pts.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" L"), class: "lw" }, g);
+    }
+    const cv = cvs(SPW), f = fit(cv);
+    el("polyline", { points: cv.map((p) => p.join(",")).join(" "), class: "lg" }, g);
+    el("path", { d: "M" + f.pts.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" L"), class: "lm", style: "stroke-width:2" }, g);
+    el("polyline", { points: f.joints.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" "), class: "ln", style: "stroke-width:6;stroke-linecap:round;stroke-linejoin:round;opacity:.85" }, g);
+    f.joints.forEach((p) => el("circle", { cx: p[0], cy: p[1], r: 4, class: "dot-f" }, g));
+    const names = ["Pelvis_IKctrl", "spine_ctrl_01", "chest_ctrl"];
+    C.forEach((c, i) => { el("rect", { x: c[0] - 9, y: c[1] - 9, width: 18, height: 18, rx: 3, class: "bu", style: "stroke-width:2" }, g); const t = el("text", { x: c[0] + 16, y: c[1] + 4, class: "c ut" }, g); t.textContent = names[i]; });
+    cv.forEach((p, i) => { el("circle", { cx: p[0], cy: p[1], r: 5, class: "dot-m" }, g); const t = el("text", { x: 20, y: 262 - i * 70, class: "s" }, g); t.textContent = "CV" + i + ": " + SPW[i].filter((w) => w > 0).map((w, j) => w.toFixed(1)).join(" + ") ; });
+  }
+  ["spl-c", "spl-m", "spl-old"].forEach((id) => $(id).addEventListener("input", splRender)); splRender();
+
+  /* ---------------- constraint offset demo ---------------- */
+  function coRender() {
+    const a = +$("co-rot").value, PV = [130, 170];
+    const tip = rot([130, 70], PV, a);
+    const p = $("co-parent"); p.setAttribute("x2", tip[0]); p.setAttribute("y2", tip[1]);
+    const target = rot([180, 110], PV, a);
+    $("co-target").setAttribute("cx", target[0]); $("co-target").setAttribute("cy", target[1]);
+    const local = rot([240, 90], PV, a);
+    const world = [target[0] + 60, target[1] - 20];
+    $("co-local").setAttribute("cx", local[0]); $("co-local").setAttribute("cy", local[1]);
+    $("co-world").setAttribute("cx", world[0]); $("co-world").setAttribute("cy", world[1]);
+    const d = $("co-drift"); d.setAttribute("x1", local[0]); d.setAttribute("y1", local[1]); d.setAttribute("x2", world[0]); d.setAttribute("y2", world[1]);
+  }
+  $("co-rot").addEventListener("input", coRender); coRender();
+
+  /* ---------------- blendshape demo ---------------- */
+  function bsRender() {
+    const s = +$("bs-s").value, noMul = $("bs-nomul").checked;
+    const w = Math.min(1, noMul ? s : s * 0.1);
+    const lift = 34 * w, mid = 150 + 18 * w;
+    $("bs-mouth").setAttribute("d", "M95," + (150 - lift).toFixed(1) + " Q140," + mid.toFixed(1) + " 185," + (150 - lift).toFixed(1));
+    $("bs-r1").textContent = "BS_Smile = " + s.toFixed(1) + (noMul ? "  (no multiply)" : "  → × 0.1");
+    $("bs-r2").textContent = "weight = " + w.toFixed(2) + (noMul && s >= 1 ? "  (already full)" : "");
+    $("bs-bar").setAttribute("width", 220 * w);
+  }
+  ["bs-s", "bs-nomul"].forEach((id) => $(id).addEventListener("input", bsRender)); bsRender();
+
+  /* ---------------- acos artifact demo ---------------- */
+  const EMAX = 1e-6;
+  const acDeg = (e) => (2 * Math.acos(Math.max(-1, Math.min(1, 1 - e))) * 180) / Math.PI;
+  const AYMAX = acDeg(EMAX) * 1.1;
+  const ax = (e) => 60 + (e / EMAX) * 440, ay = (d) => 160 - (d / AYMAX) * 140;
+  (function () {
+    let d = ""; for (let i = 0; i <= 200; i++) { const e = (i / 200) * EMAX; d += (i ? " L" : "M") + ax(e).toFixed(1) + "," + ay(acDeg(e)).toFixed(1); }
+    $("ac-curve").setAttribute("d", d);
+    document.querySelector("#ac-svg line.lg").setAttribute("y1", ay(0.1)); document.querySelector("#ac-svg line.lg").setAttribute("y2", ay(0.1));
+    document.querySelector("#ac-svg text.s").setAttribute("y", ay(0.1) - 6);
+  })();
+  function acRender() {
+    const e = (+$("ac-e").value / 100) * EMAX, d = acDeg(e);
+    $("ac-ev").textContent = (e * 1e7).toFixed(1) + "e-7";
+    $("ac-dot").setAttribute("cx", ax(e)); $("ac-dot").setAttribute("cy", ay(d));
+    $("ac-read1").textContent = "acos(|dot|):        " + d.toFixed(3) + "°  (fake)";
+    $("ac-read2").textContent = "normalise + atan2:  0.000°";
+  }
+  $("ac-e").addEventListener("input", acRender); acRender();
+
   /* ---------------- index highlight ---------------- */
-  const links = Array.from(document.querySelectorAll("#toc a"));
+  const links = Array.from(document.querySelectorAll("nav.index a"));
   const secs = links.map((a) => document.querySelector(a.getAttribute("href")));
   function onScroll() {
     let idx = 0;
