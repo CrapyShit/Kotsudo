@@ -1346,6 +1346,7 @@ section[id] { scroll-margin-top: 16px; }
         <li>weights computed live from the enum channel with the shared float nodes. Comparisons use Unreal's compare and select nodes, with a pure-arithmetic fallback.</li>
       </ul>
       <p>Because each null already sits at its measured pose, each space keeps its own offset. That answers challenge 4.</p>
+      <p>The usual setup puts the "Space" enum on the controller itself, but the space null is built before that controller exists. Those weights are therefore wired as soon as the module has created the control and its channels. The channel readers and maths nodes don't depend on execution order, so wiring them late is safe.</p>
     </div>
     <figure>
       <svg class="d" viewBox="0 0 520 240" role="img" aria-label="Unreal: three space nulls, one per target, feed a Parent Constraint; its weights come from the Space channel through float maths; the constraint sets hand_ctrl's parent.">
@@ -2272,6 +2273,7 @@ section[id] { scroll-margin-top: 16px; }
 <footer>
   <p><b>Changelog</b></p>
   <ul>
+    <li>2026-10-23: space switches driven by the controller's own channel are wired after the control is built; Murakami test setups (arm IK spaces, neck curl) in <code>tools/maya/murakami_feature_setup.py</code>.</li>
     <li>2026-10-22: all features covered: added pipeline and manifest, IK/FK limbs, spline IK, constraints and follow spaces, rest correction, blendshapes, pose check, graph layout, tagger tool. Page reordered from foundations to tools.</li>
     <li>2026-10-22: first batch: the shared walker, space switching, offset / zero groups, materials, custom attributes.</li>
   </ul>
