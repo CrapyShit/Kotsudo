@@ -50,6 +50,9 @@ class RigContext:
         self._follow_spaces = {}
         self._pending_follow = {}
         self.bone_owner = {}
+        # Space weights driven by the controller's own channel, wired once
+        # that control exists: [(node, parents_pin_base, weight, controller)].
+        self._pending_space_weights = []
         self._finished_modules = set()
 
         # Solve stages (see begin_stage). When the builder installs a stage
@@ -256,9 +259,12 @@ class RigContext:
             if key is None:
                 return fallback(f"target '{target.get('controller') or target.get('bone') or target.get('node')}'"
                                 " is not in the rig")
-            # Every weight source must already exist (a switch weighting its
-            # own parent group cannot: the control is being created now).
-            if "attr" in weight and self.control_key_for_maya(weight.get("control")) is None:
+            # Every weight source must already exist, except the controller's
+            # own channel (a "Space" enum on the control itself): that control
+            # is created right after its space, so those weights are wired
+            # once its module has built it (wire_pending_space_weights).
+            if "attr" in weight and weight.get("control") != name \
+                    and self.control_key_for_maya(weight.get("control")) is None:
                 return fallback(f"its weight is driven by '{weight.get('control')}', which is not built yet")
             parents.append((key, weight))
         unit = None
@@ -309,6 +315,12 @@ class RigContext:
                 item_name = str(key.name)
             graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Item.Type"], item_type)
             graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Item.Name"], item_name)
+            if "attr" in weight and weight.get("control") == name and self.control_key_for_maya(name) is None:
+                # Until wired, the first space holds the control.
+                graph_utils.set_any_pin(self.graph_controller, self.model, base, ["Weight"],
+                                        "1.0" if index == 0 else "0.0")
+                self._pending_space_weights.append((node, base, weight, name))
+                continue
             try:
                 pin = driver_ops.driver_pin(self, f"{node}_W{index}", weight)
             except Exception as exc:
@@ -426,9 +438,39 @@ class RigContext:
         self._finished_modules.add(module_name)
         for bone in self._pending_follow.pop(module_name, []):
             self._emit_follow_update(bone)
+        self.wire_pending_space_weights()
+
+    def wire_pending_space_weights(self, final=False):
+        """Wire space weights driven by a controller's own channel once that
+        controller exists. Channel getters and float maths are pure nodes, so
+        wiring them after the constraint node was placed is fine. ``final``:
+        warn about the ones whose controller never appeared."""
+        from . import driver_ops, graph_utils
+
+        waiting = []
+        for node, base, weight, controller in self._pending_space_weights:
+            if self.control_key_for_maya(controller) is None:
+                waiting.append((node, base, weight, controller))
+                continue
+            index = base.rsplit(".", 1)[-1]
+            try:
+                pin = driver_ops.driver_pin(self, f"{node}_W{index}", weight)
+            except Exception as exc:
+                self._warn(f"Space weight {index} of '{controller}' could not be wired ({exc}); "
+                           "the first space stays active.")
+                continue
+            if pin:
+                graph_utils.connect_pins(self.graph_controller, self.model, pin, f"{base}.Weight")
+        self._pending_space_weights = waiting
+        if final:
+            for _, base, _, controller in waiting:
+                self._warn(f"Space weight {base.rsplit('.', 1)[-1]} of '{controller}' never wired: "
+                           "the controller was not built; the first space stays active.")
+            self._pending_space_weights = []
 
     def flush_follow_spaces(self):
         """Emit every still-pending update (owner failed or never built)."""
+        self.wire_pending_space_weights(final=True)
         for owner in list(self._pending_follow):
             for bone in self._pending_follow.pop(owner):
                 self._warn(f"Follow space of '{bone}' updated without its module '{owner}'.")
