@@ -1609,9 +1609,13 @@ def build_pole_control(context, parent_key, fallback_name, position, record, col
     hierarchy_controller = context.hierarchy_controller
     name = context.control_name(record, fallback_name)
     shape = control_shapes.pole_vector_shape()
-    scale = control_shapes.builtin_scale_for_size(
-        shape, (record or {}).get("size_unreal"), fallback_scale
-    )
+    size = (record or {}).get("size_unreal")
+    scale = control_shapes.builtin_scale_for_size(shape, size, fallback_scale)
+    measured = control_shapes._builtin_half_extent(shape)
+    print(f"[RigBuilder] Pole vector '{name}': '{shape}' scaled {float(scale[0]):.3f} "
+          f"(Maya size {max(size) if size else 'unknown'} cm, stock half-size "
+          f"{max(measured) if measured else 'unmeasured'})"
+          + ("" if size and measured else "; size from the bone lengths"))
     key = create_control(
         hierarchy, hierarchy_controller, context.resolve_control_parent(record, parent_key),
         name, position, color, scale,

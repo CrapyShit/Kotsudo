@@ -40,6 +40,13 @@ ENABLE_CUSTOM_SHAPE_MESHES = False
 SHAPE_ROOT = "/Game/RigBuilder/Shapes"
 LIBRARY_NAME = "RigBuilder_ShapeLibrary"
 DEFAULT_LIBRARY_PATH = "/ControlRig/Controls/DefaultControlShapeLibrary.DefaultControlShapeLibrary"
+# Other places the engine's stock library has lived; the rig's own
+# shape_libraries list (recorded by prepare_shape_library) is searched first.
+_STOCK_LIBRARY_PATHS = (
+    DEFAULT_LIBRARY_PATH,
+    "/ControlRig/Controls/DefaultControlRigShapeLibrary.DefaultControlRigShapeLibrary",
+)
+_ACTIVE_RIG = [None]
 
 # Stock shape name per descriptor kind (first available wins).
 _BUILTIN_BY_KIND = {
@@ -443,6 +450,37 @@ def _import_shape_file(fbx_path, shape_id):
     return unreal.EditorAssetLibrary.does_asset_exist(expected)
 
 
+def _shape_libraries():
+    """Shape libraries to search for a stock shape: the rig's own list first
+    (what its controls actually draw from), then the known stock paths."""
+    libraries = []
+    rig = _ACTIVE_RIG[0]
+    if rig is not None:
+        try:
+            libraries += [lib for lib in rig.get_editor_property("shape_libraries") or [] if lib is not None]
+        except Exception:
+            pass
+    for path in _STOCK_LIBRARY_PATHS:
+        try:
+            library = unreal.load_asset(path)
+        except Exception:
+            library = None
+        if library is not None and all(library.get_path_name() != l.get_path_name() for l in libraries):
+            libraries.append(library)
+    return libraries
+
+
+def _shape_definition(name):
+    for library in _shape_libraries():
+        try:
+            for definition in library.get_editor_property("shapes") or []:
+                if str(definition.get_editor_property("shape_name")) == name:
+                    return definition
+        except Exception:
+            continue
+    return None
+
+
 def prepare_shape_library(rig, assets, shape_ids, shapes_dir_name=None):
     """Make the exported controller shapes available as Control Rig shapes.
 
@@ -450,6 +488,7 @@ def prepare_shape_library(rig, assets, shape_ids, shapes_dir_name=None):
     and attaches it to the rig. Returns the number of shapes now available.
     Never raises: on any problem the rig still builds with built-in shapes.
     """
+    _ACTIVE_RIG[0] = rig
     _registered.clear()
     shape_ids = sorted(set(shape_ids or []))
     if not shape_ids or not ENABLE_FBX_SHAPES:
@@ -511,8 +550,15 @@ def builtin_scale_for_size(shape_name, size, fallback_scale):
         target = max(float(c) for c in (size or []))
     except ValueError:
         target = 0.0
+    if target <= 1e-6:
+        return fallback_scale
     measured = _builtin_half_extent(shape_name)
-    if target <= 1e-6 or not measured or max(measured) <= 1e-6:
+    if not measured or max(measured) <= 1e-6:
+        _warn_once(
+            f"measure-{shape_name}",
+            f"Could not measure the stock shape '{shape_name}' in the rig's shape libraries; "
+            f"controls using it keep a size from the bone lengths and may not match Maya.",
+        )
         return fallback_scale
     uniform = (target * 0.5) / max(measured)
     return (uniform, uniform, uniform)
@@ -558,26 +604,32 @@ def ensure_custom_shape(rig, shape_id, shape_data):
 # ---------------------------------------------------------------------------
 
 def _builtin_shape_available(name):
-    try:
-        library = unreal.load_asset(DEFAULT_LIBRARY_PATH)
-        shapes = library.get_editor_property("shapes") or []
-        return any(str(s.get_editor_property("shape_name")) == name for s in shapes)
-    except Exception:
-        return True   # cannot inspect the library; assume stock names exist
+    if not _shape_libraries():
+        return True   # cannot inspect the libraries; assume stock names exist
+    return _shape_definition(name) is not None
 
 
 def _builtin_half_extent(name):
-    """Half-size of a stock shape's mesh (x, y, z), or None if unmeasurable."""
+    """Drawn half-size of a stock shape (x, y, z) at shape scale 1, or None.
+
+    The mesh bounds times the library definition's own transform scale:
+    a shape is drawn as mesh x definition transform x control shape transform.
+    """
+    definition = _shape_definition(name)
+    if definition is None:
+        return None
     try:
-        library = unreal.load_asset(DEFAULT_LIBRARY_PATH)
-        for definition in library.get_editor_property("shapes") or []:
-            if str(definition.get_editor_property("shape_name")) == name:
-                mesh = definition.get_editor_property("static_mesh")
-                extent = mesh.get_bounds().box_extent
-                return (float(extent.x), float(extent.y), float(extent.z))
+        mesh = definition.get_editor_property("static_mesh")
+        extent = mesh.get_bounds().box_extent
+        half = [float(extent.x), float(extent.y), float(extent.z)]
+    except Exception:
+        return None
+    try:
+        scale = definition.get_editor_property("transform").scale3d
+        half = [abs(h * float(k)) for h, k in zip(half, (scale.x, scale.y, scale.z))]
     except Exception:
         pass
-    return None
+    return tuple(half)
 
 
 def _builtin_for_descriptor(descriptor, control_rotation, default_scale):
