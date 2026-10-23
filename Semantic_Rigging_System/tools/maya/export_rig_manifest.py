@@ -4470,6 +4470,37 @@ def scene_analysis(rig_name, modules_config):
             check('orange', 'Controller shape', summary['name'],
                   'curve shape could not be exported; Unreal will use a default shape')
 
+    # Skinned joints a controller drives but no module claims: Unreal will
+    # never move them (e.g. a toe tagged on one side only). Helper chains
+    # (IK/FK copies) are driven too but deform nothing, so they are skipped.
+    claimed, module_of = set(), {}
+    for module in manifest.get('modules') or []:
+        for joint in module.get('chain') or []:
+            claimed.add(_short_node_name(joint))
+            module_of[_short_node_name(joint)] = module.get('module_name')
+    skinned = {_short_node_name(j) for cluster in cmds.ls(type='skinCluster') or []
+               for j in cmds.skinCluster(cluster, query=True, influence=True) or []}
+    for joint in _exported_joints():
+        short = _short_node_name(joint)
+        if short in claimed or short not in skinned:
+            continue
+        drivers = []
+        for constraint in sorted(set(cmds.listConnections(joint, type='constraint', source=True,
+                                                          destination=False) or [])):
+            for target in _constraint_targets(constraint):
+                controller = _nearest_controller_transform(target)
+                if controller and _short_node_name(controller) not in drivers:
+                    drivers.append(_short_node_name(controller))
+        if not drivers:
+            continue
+        mirror = None
+        for a, b in (('L_', 'R_'), ('R_', 'L_'), ('Left', 'Right'), ('Right', 'Left')):
+            if short.startswith(a) and module_of.get(b + short[len(a):]):
+                mirror = module_of[b + short[len(a):]]
+        check('orange', 'Untagged joint', short,
+              'driven by {} but in no module: Unreal will not move it. Tag it as a module{}'.format(
+                  ', '.join(drivers), ' (its mirror is in {})'.format(mirror) if mirror else ''))
+
     # Spaces that could not be described (Unreal falls back to a bone).
     noted = set()
     for record in records:
