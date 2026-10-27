@@ -66,3 +66,6 @@ AutodeskMaya/
 
 # Unreal Engine - Ignore UE project files and generated content
 UnrealEngine/
+
+# Generated Maya/Unreal exports (FBX, poses, harness reports)
+Semantic_Rigging_System/FBXs/
